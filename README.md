@@ -9,7 +9,8 @@ A Claude Code mod that grades how good your tests are. It lists every test in th
 The pane opens at session start, or with `/test-grader`. It shows:
 
 - **Every test in the project.** It lists them from the start: tests in files git tracks, ungraded until they are graded.
-- **Tests grouped by file, worst file first.** With several files, each starts closed and opens with a press. Files you open stay open across a reload of the mod or a compaction. A new session starts them closed again.
+- **Tests grouped by folder and file, worst first.** The pane draws the project's folders as a tree. Each folder's row shows the counts for every test beneath it. A folder holding only one subfolder shares its row, as in `gateways/api/`. When tests sit in a single folder, no folder row is drawn, and the list reads flat.
+- **Folders and files start closed among siblings.** One alone at its level starts open. Each opens with a press. What you open stays open across a reload of the mod or a compaction. A new session starts everything closed again.
 - **Go testify suites as their own group.** A suite spread over several files is one group, listing its files. A `Test…` function that only runs the suite is not counted as a test.
 - **A verdict per test.** Each test gets a one-line summary and a one-line reason. Verdicts sit in one column on the first line of the title. Pressing a row shows its details.
 - **A summary line.** It shows the counts of tests, good, weak, useless and new.
@@ -29,14 +30,21 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Regrade all** grades every file again, unchanged ones included.
 - **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates.
 
-The grader is the `haiku` model by default. It reviews up to 10 tests per call, with up to 4 calls at once.
+The grader is the `haiku` model by default. It reviews up to 10 tests per call, with up to 10 calls at once.
+
+#### Grader settings
+
+| Setting | Values | Default | What it does |
+| --- | --- | --- | --- |
+| **Grader model** (`graderModel`) | `haiku`, `sonnet`, `opus` | `haiku` | the model that grades |
+| **Grader workers** (`graderWorkers`) | 1 to 20 | 10 | how many grader calls Grade all tests runs at once |
 
 #### Choosing the grader model
 
 The **Grader model** setting picks the model that grades: `haiku`, `sonnet` or `opus`. It defaults to `haiku`, the fastest and cheapest. Change it in the `/config` menu, or in `~/.claude/settings.json`:
 
 ```json
-{ "pluginConfigs": { "test-grader": { "graderModel": "sonnet" } } }
+{ "pluginConfigs": { "test-grader": { "graderModel": "sonnet", "graderWorkers": 4 } } }
 ```
 
 When the mod is loaded straight from its folder, the key is `test-grader@inline` instead. A change reloads the mod, and every grading after it uses the new model. That includes new tests, regrades, Grade all and evidence.

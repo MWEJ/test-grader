@@ -446,14 +446,14 @@ test('a new looped test becomes one entry per case it generates', async ($, on) 
   expect(tree).not.toContain('unrated')
 })
 
-test('Grade all tests runs up to 4 grader calls at once, and keeps the results in file order', async ($, on) => {
+test('Grade all tests runs up to 10 grader calls at once, and keeps the results in file order', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const cases = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `it('${prefix} ${i}', () => { expect(f(${i})).toBe(${i}) })\n`).join('')
   const held = { calls: 0, release: () => {} }
   const { prompts } = project(
     on,
-    // 3 batches, 2 batches and 1: six calls in all
-    { 'a.test.ts': cases('a', 25) + "it('a shallow one', () => {})\n", 'b.test.ts': cases('b', 15) + "it('b shallow one', () => {})\n", 'c.test.ts': cases('c', 3) },
+    // 6 batches, 5 batches and 1: twelve calls in all
+    { 'a.test.ts': cases('a', 55) + "it('a shallow one', () => {})\n", 'b.test.ts': cases('b', 45) + "it('b shallow one', () => {})\n", 'c.test.ts': cases('c', 3) },
     { held },
   )
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
@@ -461,19 +461,19 @@ test('Grade all tests runs up to 4 grader calls at once, and keeps the results i
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  // four in flight, and no fifth until one of them answers
-  expect(held.calls).toBe(4)
-  expect(prompts).toHaveLength(4)
+  // ten in flight, and no eleventh until one of them answers
+  expect(held.calls).toBe(10)
+  expect(prompts).toHaveLength(10)
   held.release()
   await clock.advance(10)
-  expect(prompts).toHaveLength(6)
+  expect(prompts).toHaveLength(12)
   held.release()
   await clock.advance(10)
 
   await ui.press({ key: 'f:/proj/a.test.ts' })
   await ui.press({ key: 'f:/proj/b.test.ts' })
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('45 tests · 43 good · 2 weak')
+  expect(tree).toContain('105 tests · 103 good · 2 weak')
   expect(tree.indexOf('a shallow one')).toBeLessThan(tree.indexOf('b shallow one'))
 })
 
@@ -1913,4 +1913,113 @@ test('the grader model setting picks the model that grades', { options: { grader
 
 test('a grader model the setting does not offer falls back to haiku', { options: { graderModel: 'gpt-4' } }, async ($, on) => {
   expect(await gradeOnce($, on)).toEqual(['haiku'])
+})
+
+// A project with tests in folders and subfolders: the pane draws its folders as a tree
+const TREE = {
+  'internal/domain/user.test.ts': "it('does nothing', () => {})\n",
+  'internal/gateways/api/api.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\nit('lists clusters', () => { expect(list()).toEqual([1]) })\n",
+  'internal/gateways/api/query.test.ts': "it('parses a query', () => { expect(parse('a=1')).toEqual({ a: '1' }) })\n",
+  'cmd/exporter/exporter.test.ts': "it('another shallow one', () => { expect(g).toBeDefined() })\n",
+  'root.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+}
+// the group rows drawn, folders and files, in drawing order, by key with their labels
+const groupRows = async (ui: { drawn: () => Promise<unknown> }): Promise<[string, string][]> =>
+  [...buttonsOf(await ui.drawn()).entries()].filter(([key]) => /^(d|f|s):/.test(key))
+
+test('tests in folders are grouped by folder, the worst folder first, each with the counts of all beneath it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, TREE)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  // the top level: internal (a useless and a weak beneath it), then cmd/exporter, merged as it
+  // holds nothing but one folder, then the file at the root; several, so each starts closed
+  expect(await groupRows(ui)).toEqual([
+    ['d:internal', '▸ internal/'],
+    ['d:cmd/exporter', '▸ cmd/exporter/'],
+    ['f:/proj/root.test.ts', '▸ root.test.ts'],
+  ])
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('"4 · 2 good · 1 weak · 1 useless"')
+
+  // opened, a folder lists its own folders and files, named from it, worst first
+  await ui.press({ key: 'd:internal' })
+  expect(await groupRows(ui)).toEqual([
+    ['d:internal', '▾ internal/'],
+    ['d:internal/domain', '▸ domain/'],
+    ['d:internal/gateways/api', '▸ gateways/api/'],
+    ['d:cmd/exporter', '▸ cmd/exporter/'],
+    ['f:/proj/root.test.ts', '▸ root.test.ts'],
+  ])
+  await ui.press({ key: 'd:internal/gateways/api' })
+  const rows = await groupRows(ui)
+  expect(rows.slice(2, 5)).toEqual([
+    ['d:internal/gateways/api', '▾ gateways/api/'],
+    ['f:/proj/internal/gateways/api/api.test.ts', '▸ api.test.ts'],
+    ['f:/proj/internal/gateways/api/query.test.ts', '▸ query.test.ts'],
+  ])
+
+  // pressed again, it closes, and what is beneath it goes
+  await ui.press({ key: 'd:internal' })
+  expect((await groupRows(ui)).map(([key]) => key)).toEqual(['d:internal', 'd:cmd/exporter', 'f:/proj/root.test.ts'])
+})
+
+test('a folder alone at its level draws no row of its own: its path leads the names beneath', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, {
+    'internal/gateways/api/api.test.ts': TREE['internal/gateways/api/api.test.ts'],
+    'internal/gateways/api/query.test.ts': TREE['internal/gateways/api/query.test.ts'],
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(await groupRows(ui)).toEqual([
+    ['f:/proj/internal/gateways/api/api.test.ts', '▸ internal/gateways/api/api.test.ts'],
+    ['f:/proj/internal/gateways/api/query.test.ts', '▸ internal/gateways/api/query.test.ts'],
+  ])
+})
+
+test('a folder pressed open stays open when the pane draws again after a grading', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, TREE)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: 'd:internal' })
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10)
+
+  expect((await groupRows(ui)).map(([key, label]) => `${key} ${label}`)).toContain('d:internal ▾ internal/')
+})
+
+// How many grader calls Grade all tests has in flight at once: the graderWorkers setting
+const inFlight = async ($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // 25 batches of 10: more than any setting lets run at once
+  const many = Array.from({ length: 250 }, (_, i) => `it('case ${i}', () => { expect(f(${i})).toBe(${i}) })\n`).join('')
+  const held = { calls: 0, release: () => {} }
+  project(on, { 'a.test.ts': many }, { held })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  return held.calls
+}
+
+test('the grader workers setting sets how many grader calls run at once', { options: { graderWorkers: 3 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(3)
+})
+
+test('a grader workers setting below 1 runs one call at a time', { options: { graderWorkers: 0 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(1)
+})
+
+test('a grader workers setting above 20 runs 20 at a time', { options: { graderWorkers: 50 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(20)
 })

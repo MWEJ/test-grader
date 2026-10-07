@@ -33,8 +33,9 @@ const MAX_BODY = 20_000
 const CELLS = 12
 // Grade all tests: cases per grader call, and how many weak or useless ones are listed
 const BATCH = 10
-// grader calls in flight at once
-const PARALLEL = 4
+// grader calls in flight at once, from the graderWorkers setting (1 to 20), 10 by default
+const MAX_WORKERS = 20
+let parallel = 10
 // a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
 // stand for many cases each
 const MAX_REPLY = 4000
@@ -668,7 +669,7 @@ const existingNote = (results: ExistingTest[], cwd: string): string => {
 }
 
 // Grade all tests: every case of every test file git tracks, BATCH cases a call and
-// PARALLEL calls at once; the results keep file order. A batch the grader fails leaves
+// parallel calls at once; the results keep file order. A batch the grader fails leaves
 // its cases unrated, and the run goes on
 // a file's contents, fingerprinted (FNV-1a), with its length
 export const fingerprint = (text: string): string => {
@@ -778,7 +779,7 @@ const gradeAllNow = async ($: EngineInterface, isFresh: boolean): Promise<void> 
         await update($, existing, s => ({ ...s, done, results: shown() }))
       }
     }
-    await Promise.all(Array.from({ length: Math.min(PARALLEL, jobs.length) }, worker))
+    await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker))
     const results = shown()
     const finishedAt = await $.clock.now()
     const graded = results.length - remembered
@@ -1142,6 +1143,8 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
 export const register: Register = (on, options) => {
   const chosen = options.graderModel
   graderModel = typeof chosen === 'string' && (GRADER_MODELS as readonly string[]).includes(chosen) ? chosen : 'haiku'
+  const workers = options.graderWorkers
+  parallel = typeof workers === 'number' && Number.isFinite(workers) ? Math.min(MAX_WORKERS, Math.max(1, Math.floor(workers))) : 10
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
   on('tool.check', { tool: /^mcp__test-grader__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
   on('tool.call', { tool: /^mcp__test-grader__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
@@ -1341,9 +1344,9 @@ export const register: Register = (on, options) => {
       return Math.max(12, Math.floor(room * (e.surface === 'desktop' ? 1.2 : 1)))
     }
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
-    const drawFile = (key: string, openKey: string, file: string, of: Entry[], indent: number, siblings: number): void => {
+    const drawFile = (key: string, openKey: string, label: string, of: Entry[], indent: number, siblings: number): void => {
       const open = isGroupOpen(openKey, siblings)
-      drawn.push(header(key, shortPath(file, cwd), of, indent, open, flip(openKey, open)))
+      drawn.push(header(key, label, of, indent, open, flip(openKey, open)))
       if (!open) return
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
@@ -1374,18 +1377,64 @@ export const register: Register = (on, options) => {
         )
       }
     }
+    // The groups in a tree of the project's folders. A folder that holds only one folder is
+    // drawn as one row with it (gateways/api/); a level that is only one folder draws no row
+    // for it, its path leading the names below, so tests in one folder read as a flat list
+    type Folder = { path: string; dirs: Map<string, Folder>; groups: Group[] }
+    const root: Folder = { path: '', dirs: new Map(), groups: [] }
     for (const g of groups) {
-      if (g.kind === 'file') {
-        drawFile(`f:${g.file}`, g.file, g.file, g.of, 0, groups.length)
-        continue
+      const dir = g.kind === 'suite' ? g.dir : dirOf(g.file)
+      const rel = dir === cwd ? '' : shortPath(dir, cwd)
+      let at = root
+      for (const part of rel.split('/').filter(Boolean)) {
+        const path = at.path ? `${at.path}/${part}` : part
+        const next = at.dirs.get(part) ?? { path, dirs: new Map(), groups: [] }
+        at.dirs.set(part, next)
+        at = next
       }
-      const key = `s:${g.id}`
-      const open = isGroupOpen(key, groups.length)
-      drawn.push(header(key, labelOf(g), g.of, 0, open, flip(key, open)))
-      if (!open) continue
-      const files = byFile(g.of)
-      for (const { file, of } of files) drawFile(`sf:${g.id}:${file}`, `sf:${g.id}:${file}`, file, of, 2, files.length)
+      at.groups.push(g)
     }
+    const allOf = (f: Folder): Entry[] => [...f.groups.flatMap(g => g.of), ...[...f.dirs.values()].flatMap(allOf)]
+    type Child = { kind: 'dir'; name: string; folder: Folder; of: Entry[] } | { kind: 'group'; group: Group; of: Entry[] }
+    const childrenOf = (f: Folder): Child[] => {
+      const dirs = [...f.dirs.entries()].map(([name, folder]): Child => {
+        while (folder.groups.length === 0 && folder.dirs.size === 1) {
+          const [inner, only] = [...folder.dirs.entries()][0]!
+          name = `${name}/${inner}`
+          folder = only
+        }
+        return { kind: 'dir', name, folder, of: allOf(folder) }
+      })
+      const name = (c: Child): string => (c.kind === 'dir' ? c.name : c.group.kind === 'suite' ? c.group.suite : c.group.file.slice(c.group.file.lastIndexOf('/') + 1))
+      return [...dirs, ...f.groups.map((group): Child => ({ kind: 'group', group, of: group.of }))].sort((a, b) => worse(a.of, b.of) || name(a).localeCompare(name(b)))
+    }
+    const drawLevel = (f: Folder, prefix: string, indent: number): void => {
+      const children = childrenOf(f)
+      const only = children[0]
+      if (children.length === 1 && only?.kind === 'dir') return drawLevel(only.folder, `${prefix}${only.name}/`, indent)
+      for (const c of children) {
+        if (c.kind === 'dir') {
+          const key = `d:${c.folder.path}`
+          const open = isGroupOpen(key, children.length)
+          drawn.push(header(key, `${prefix}${c.name}/`, c.of, indent, open, flip(key, open)))
+          if (open) drawLevel(c.folder, '', indent + 2)
+          continue
+        }
+        const g = c.group
+        if (g.kind === 'file') {
+          drawFile(`f:${g.file}`, g.file, `${prefix}${g.file.slice(g.file.lastIndexOf('/') + 1)}`, g.of, indent, children.length)
+          continue
+        }
+        // a suite names its package's folder where no row above does
+        const key = `s:${g.id}`
+        const open = isGroupOpen(key, children.length)
+        drawn.push(header(key, prefix ? `${g.suite} · ${prefix.slice(0, -1)}` : g.suite, g.of, indent, open, flip(key, open)))
+        if (!open) continue
+        const files = byFile(g.of)
+        for (const { file, of } of files) drawFile(`sf:${g.id}:${file}`, `sf:${g.id}:${file}`, shortPath(file, cwd), of, indent + 2, files.length)
+      }
+    }
+    drawLevel(root, '', 0)
 
     const metrics: [string, number | null][] = cov
       ? [['Lines', cov.lines], ['Statements', cov.statements], ['Branches', cov.branches], ['Functions', cov.functions]]
