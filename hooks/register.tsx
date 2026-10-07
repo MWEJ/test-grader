@@ -14,6 +14,7 @@ const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
 const openError = atom({ plugin: 'test-watch', key: 'openError' } as const, null)
 const seen = atom({ plugin: 'test-watch', key: 'seen' } as const, {})
 const openFor = atom({ plugin: 'test-watch', key: 'openFor' } as const, null)
+const coverWith = atom({ plugin: 'test-watch', key: 'coverWith' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -176,17 +177,32 @@ const parseVerdicts = (text: string): { verdicts: { name: string; summary: strin
 // A note for Claude: a user-role row it reads on its next turn, no turn started. A refusal
 // or a failure is kept for the pane to show, until a note goes through. The debug log has
 // every note, appended or not (a test cannot see a row a mod appends)
-const share = async ($: EngineInterface, text: string): Promise<void> => {
+// A note to Claude. Bare, it is added to the conversation, read in the turn under way: a new
+// test's grade, written by that turn. With a nudge, the result of a run the person started
+// from the pane, it is sent as a prompt ending in the nudge: Claude answers it once idle
+const share = async ($: EngineInterface, text: string, nudge?: string): Promise<void> => {
   let error: string | null = null
+  const way = nudge === undefined ? 'appended' : 'sent as a prompt'
   try {
-    const row = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
-    if (row.deny !== undefined) error = row.deny
+    if (nudge === undefined) {
+      const row = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+      if (row.deny !== undefined) error = row.deny
+    } else {
+      const sent = await $.prompt.submit({ text: `${text}\n${nudge}` })
+      if ('drop' in sent && sent.drop !== undefined) error = String(sent.drop)
+    }
   } catch (err) {
     error = err instanceof Error ? err.message : String(err)
   }
-  $.ui.log(`test-watch: note to Claude (${error === null ? 'appended' : `not appended: ${error}`}): ${text}`, { to: 'debug' })
+  $.ui.log(`test-watch: note to Claude (${error === null ? way : `not ${way}: ${error}`}): ${text}`, { to: 'debug' })
   await update($, noteError, () => error)
 }
+
+// what a run's result asks of Claude
+const GRADE_NUDGE = 'Respond to this now: tell the person what the grading found, and offer to strengthen the weak and useless tests, worst first.'
+const GRADE_CLEAN_NUDGE = 'Respond to this now: tell the person the result in a line.'
+const COVER_NUDGE = 'Respond to this now: tell the person what the figures say about the code being worked on, and where more tests would pay.'
+const COVER_FAILED_NUDGE = 'Respond to this now: tell the person why the run failed, from the output above, and offer to fix it.'
 
 // the weak and useless of a list, the useless first, one line each
 const flaggedLines = (list: { file: string; name: string; verdict?: Verdict; reason?: string }[], cwd: string): string[] =>
@@ -344,18 +360,39 @@ const refreshCoverage = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-const detectCommand = async ($: EngineInterface, cwd: string): Promise<{ argv: string[]; goOutput?: string } | undefined> => {
+// the project's coverage run: its command, and how a note to Claude names it
+type CoverCommand = { argv: string[]; label: string; goOutput?: string }
+const detectCommand = async ($: EngineInterface, cwd: string): Promise<CoverCommand | undefined> => {
   const exists = async (name: string): Promise<boolean> => (await mtime($, `${cwd}/${name}`)) !== null
   if (await exists('package.json')) {
     const pkg = await $.fs.read(`${cwd}/package.json`)
-    if (/"vitest"/.test(pkg)) return { argv: ['npx', 'vitest', 'run', '--coverage', '--coverage.reporter=json-summary', '--coverage.reporter=lcov'] }
-    if (/"jest"/.test(pkg)) return { argv: ['npx', 'jest', '--coverage', '--coverageReporters=json-summary', '--coverageReporters=lcov'] }
+    if (/"vitest"/.test(pkg)) return { argv: ['npx', 'vitest', 'run', '--coverage', '--coverage.reporter=json-summary', '--coverage.reporter=lcov'], label: 'npx vitest run --coverage' }
+    if (/"jest"/.test(pkg)) return { argv: ['npx', 'jest', '--coverage', '--coverageReporters=json-summary', '--coverageReporters=lcov'], label: 'npx jest --coverage' }
   }
   if ((await exists('pytest.ini')) || (await exists('pyproject.toml')) || (await exists('setup.cfg'))) {
-    return { argv: ['python3', '-m', 'pytest', '--cov', '--cov-report=xml'] }
+    return { argv: ['python3', '-m', 'pytest', '--cov', '--cov-report=xml'], label: 'pytest --cov' }
   }
-  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover'], goOutput: '.test-watch-go-coverage.txt' }
+  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover'], label: 'go test ./... -cover', goOutput: '.test-watch-go-coverage.txt' }
   return undefined
+}
+
+// what a finished coverage run tells Claude: the figures it left, or how it failed and
+// the end of what it printed
+const COVER_TAIL = 20
+const coverageNote = (command: CoverCommand, exitCode: number, output: string, cov: Coverage | null): string => {
+  const figures = cov
+    ? ([['lines', cov.lines], ['statements', cov.statements], ['branches', cov.branches], ['functions', cov.functions]] as const)
+        .filter(([, v]) => v !== null)
+        .map(([name, v]) => `${name} ${v}%`)
+        .join(' · ')
+    : ''
+  if (exitCode === 0) {
+    return figures
+      ? `Coverage run (test-watch) finished: ${figures} (${cov!.source}).`
+      : `Coverage run (test-watch) finished, but ${command.label} wrote no report test-watch reads.`
+  }
+  const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
+  return [`Coverage run (test-watch) failed: ${command.label} exited with ${exitCode}. The last ${lines.length} lines it printed:`, ...lines].join('\n')
 }
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
@@ -369,6 +406,11 @@ const runCoverage = async ($: EngineInterface): Promise<void> => {
     if (command.goOutput) await $.fs.write(`${cwd}/${command.goOutput}`, result.stdout)
     await refreshCoverage($)
     await setRun(result.exitCode === 0 ? 'idle' : 'failed', result.exitCode === 0 ? undefined : `Tests exited with ${result.exitCode}.`)
+    await share(
+      $,
+      coverageNote(command, result.exitCode, [result.stdout, result.stderr].join('\n'), await read($, coverage)),
+      result.exitCode === 0 ? COVER_NUDGE : COVER_FAILED_NUDGE,
+    )
   } catch (err) {
     await setRun('failed', err instanceof Error ? err.message : String(err))
   }
@@ -475,7 +517,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
     const graded = results.length - remembered
     await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt, hashes, graded, remembered }))
     await update($, seen, all => ({ ...all, ...hashes }))
-    await share($, existingNote(results, cwd))
+    await share($, existingNote(results, cwd), results.some(t => t.verdict !== 'good') ? GRADE_NUDGE : GRADE_CLEAN_NUDGE)
   } catch (err) {
     await fail(err instanceof Error ? err.message : String(err))
   }
@@ -805,6 +847,9 @@ export const register: Register = on => {
       .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
       .catch(error => $.ui.log(`test-watch: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await refreshCoverage($)
+    // the coverage run this project has, if any: the pane offers it only then
+    const cover = await detectCommand($, await $.session.cwd()).catch(() => undefined)
+    await update($, coverWith, () => cover?.label ?? null)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
     // each session starts with its files at their default, closed when there are several; a
@@ -870,6 +915,9 @@ export const register: Register = on => {
     const list = (await read($, tests)).filter(t => cwd !== '' && t.file.startsWith(`${cwd}/`))
     const cov = await read($, coverage)
     const running = await read($, run)
+    // coverage is shown where the project has a run test-watch knows, or a report to read
+    const coverRun = await read($, coverWith)
+    const hasCoverage = coverRun !== null || cov !== null
     const graded = await read($, existing)
     const noteFailed = await read($, noteError)
     const openFailed = await read($, openError)
@@ -966,6 +1014,12 @@ export const register: Register = on => {
     const drawn: unknown[] = []
     // the verdicts' column, one width for the pane, so every title starts in line
     const verdictWidth = Math.max(...entries.map(t => t.state.length))
+    // the characters a name's line holds: the row's room after its margin, the verdict, the gap
+    // and the marks beside it; a desktop's proportional font fits a fifth more than its cells
+    const nameWidth = (indent: number, t: Entry): number => {
+      const room = columns - indent - 2 - verdictWidth - 1 - (t.isNew ? ' new'.length : 0) - (t.evidence ? ' on evidence'.length : 0)
+      return Math.max(12, Math.floor(room * (e.surface === 'desktop' ? 1.2 : 1)))
+    }
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
     const drawFile = (key: string, openKey: string, file: string, of: Entry[], indent: number, siblings: number): void => {
       const open = isGroupOpen(openKey, siblings)
@@ -981,7 +1035,7 @@ export const register: Register = on => {
                 <Text bold color={stateColor(t.state)}>{t.state}</Text>
               </Box>
               <Box flexDirection="column">
-                {wrapWords(t.name, Math.max(12, columns - indent - verdictWidth - (t.isNew ? 10 : 6))).map((part, i) => (
+                {wrapWords(t.name, nameWidth(indent, t)).map((part, i) => (
                   <Button key={i === 0 ? key : `${key}#${i}`} plain label={part} onPress={() => toggle(key)} />
                 ))}
               </Box>
@@ -1034,39 +1088,45 @@ export const register: Register = on => {
         {openFailed !== null && <Text color={RED}>{openFailed}</Text>}
         {noteFailed !== null && <Text color={RED}>{`Couldn't share the result with Claude: ${noteFailed}`}</Text>}
         <Box flexDirection="column" marginTop={1}>
-          <Box flexDirection="row" justifyContent="space-between">
-            <Text bold>Coverage</Text>
-            <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
-          </Box>
-          {metrics
-            .filter(([, v]) => v !== null)
-            .map(([label, v]) => {
-              const value = v as number
-              const filled = Math.round((Math.min(100, value) / 100) * CELLS)
-              return (
-                <Box key={`cov-${label}`} flexDirection="row" gap={1}>
-                  <Box width={11}>
-                    <Text color={MUTED}>{label}</Text>
-                  </Box>
-                  <Box flexDirection="row" width={CELLS}>
-                    {Array.from({ length: CELLS }, (_, i) => (
-                      <Box key={`c-${label}-${i}`} width={1} backgroundColor={i < filled ? pctColor(value) : TRACK}>
-                        <Text> </Text>
+          {hasCoverage && (
+            <Box flexDirection="column">
+              <Box flexDirection="row" justifyContent="space-between">
+                <Text bold>Coverage</Text>
+                <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
+              </Box>
+              {metrics
+                .filter(([, v]) => v !== null)
+                .map(([label, v]) => {
+                  const value = v as number
+                  const filled = Math.round((Math.min(100, value) / 100) * CELLS)
+                  return (
+                    <Box key={`cov-${label}`} flexDirection="row" gap={1}>
+                      <Box width={11}>
+                        <Text color={MUTED}>{label}</Text>
                       </Box>
-                    ))}
-                  </Box>
-                  <Text bold color={pctColor(value)}>{`${value}%`}</Text>
-                </Box>
-              )
-            })}
-          {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
-          {running.state === 'failed' && <Text color={RED}>{running.message ?? 'Coverage run failed.'}</Text>}
+                      <Box flexDirection="row" width={CELLS}>
+                        {Array.from({ length: CELLS }, (_, i) => (
+                          <Box key={`c-${label}-${i}`} width={1} backgroundColor={i < filled ? pctColor(value) : TRACK}>
+                            <Text> </Text>
+                          </Box>
+                        ))}
+                      </Box>
+                      <Text bold color={pctColor(value)}>{`${value}%`}</Text>
+                    </Box>
+                  )
+                })}
+              {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
+              {running.state === 'failed' && <Text color={RED}>{running.message ?? 'Coverage run failed.'}</Text>}
+            </Box>
+          )}
           <Box flexDirection="row" gap={2} marginTop={1}>
-            <Button
-              key="run"
-              label={running.state === 'running' ? 'Running…' : 'Run coverage'}
-              onPress={() => (running.state === 'running' ? undefined : runCoverage($))}
-            />
+            {coverRun !== null && (
+              <Button
+                key="run"
+                label={running.state === 'running' ? 'Running…' : 'Run coverage'}
+                onPress={() => (running.state === 'running' ? undefined : runCoverage($))}
+              />
+            )}
             <Button
               key="gradeAll"
               label={graded.state === 'running' ? `Grading… ${graded.done}/${graded.total} files done` : 'Grade all tests'}
@@ -1076,7 +1136,6 @@ export const register: Register = on => {
             {graded.state !== 'running' && graded.hashes && Object.keys(graded.hashes).length > 0 && (
               <Button key="regradeAll" label="Regrade all" onPress={() => $.clock.after(1, () => void gradeAll($, true))} />
             )}
-            <Button key="clear" label="Clear list" onPress={() => update($, tests, () => [])} />
           </Box>
         </Box>
       </Box>

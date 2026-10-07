@@ -46,7 +46,8 @@ for (const surface of ['desktop', 'terminal'] as const) {
     expect(tree).toContain('adds numbers')
     expect(tree).toContain('Tautology.')
     expect(tree).toContain('1 useless')
-    expect(tree).toContain('no report found')
+    // no coverage run nor report in this project: no coverage section
+    expect(tree).not.toContain('Coverage')
   })
 }
 
@@ -103,11 +104,11 @@ const mount = ($: Parameters<Parameters<typeof test>[1]>[0], rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => 'good' | 'weak' | 'useless'; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string }
+type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => 'good' | 'weak' | 'useless'; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string }
 // a command's answer: its exit code, or what it printed too
 type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 // env: the variables the mod reads; outside: files by their full path, outside the project
-function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut }: Project = {}) {
+function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -138,8 +139,11 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   // the session's id: a test sets another to start a new session, the same for a reload
   const session = { id: 's1' }
   on('session.id', async () => ({ value: session.id }) as never)
-  on('fs.stat', async () => {
-    throw new Error('missing')
+  // a file the project holds is there, written at the kit's start; any other is missing
+  on('fs.stat', async (_$, e) => {
+    const path = (e as { path: string }).path.replace(/^\/proj\//, '')
+    if (!(path in files)) throw new Error('missing')
+    return { value: { mtimeMs: 1_000_000, size: files[path]!.length, isFile: true, isDirectory: false } } as never
   })
   on('process.run', async (_$, e) => {
     const { argv } = e as { argv: string[] }
@@ -191,7 +195,16 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       },
     } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session }
+  // the notes sent as a prompt, which starts a turn once Claude is idle; a note only added
+  // to the conversation is a row mock.session reads back
+  const asked: string[] = []
+  on('prompt.submit', async (_$, e) => {
+    const { text } = e as { text: string }
+    if (refuse !== undefined) return { drop: refuse } as never
+    asked.push(text)
+    return { text } as never
+  })
+  return { prompts, notes, runs, logs, budgets, tools, session, asked }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -501,14 +514,14 @@ test('a failed run sends nothing', async ($, on) => {
 // the kit answers every append "no implementation": a note that does not go through
 test('a note the session does not take says so in the pane, and why', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  project(on, { 'a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  project(on, { 'a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { refuse: 'the session is closing' })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('1 test ·')
-  expect(tree).toContain("Couldn't share the result with Claude: no implementation for session.append")
+  expect(tree).toContain("Couldn't share the result with Claude: the session is closing")
 })
 
 test('a new test graded weak or useless as it is written leaves a note of those alone', async ($, on) => {
@@ -953,7 +966,7 @@ test('a test name too long for its row wraps onto the next lines, whole', async 
   const labels = [...JSON.stringify(await ui.drawn()).matchAll(/"label":"([^"]*)"/g)].map(m => m[1]!).filter(label => name.includes(label))
   expect(labels.length).toBeGreaterThan(1)
   expect(labels.join(' ')).toBe(name)
-  for (const label of labels) expect(label.length).toBeLessThanOrEqual(80 - 'good'.length - 6)
+  for (const label of labels) expect(label.length).toBeLessThanOrEqual(80 - 2 - 'good'.length - 1)
 })
 
 test('each verdict sits in one column on its title\'s first line, and an opened row\'s details sit under the title', async ($, on) => {
@@ -1133,22 +1146,31 @@ test('a project of one Go suite in one file starts open all the way down', async
   expect(tree).toContain('"TestShallowCheck"')
 })
 
-test('a docked pane narrower than the window wraps names to its own width, not the window\'s', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000_000 })
-  const name = 'a chosen lifetime is set in the variable at once, warming on or off; auto sets nothing'
-  project(on, { 'src/w.test.ts': `it('${name}', () => { expect(band()).toEqual(steady) })\n` })
-  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
-  const ui = await $.ui.mount({
-    plugin: 'test-watch', surface: 'desktop', component: 'Pane', requestId: 'test-watch',
-    props: { title: 'Tests', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
-  } as never)
-  await ui.press({ key: 'gradeAll' })
-  await clock.advance(10)
+for (const [surface, perLine] of [
+  // the terminal: a cell a character, every cell of the room after the margin, verdict and gap
+  ['terminal', 50 - 2 - 'good'.length - 1],
+  // a desktop's proportional font fits a fifth more characters than the pane has cells
+  ['desktop', Math.floor((50 - 2 - 'good'.length - 1) * 1.2)],
+] as const) {
+  test(`on the ${surface} a docked pane wraps names to its own width, not the window's, and uses all of it`, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const name = 'a chosen lifetime is set in the variable at once, warming on or off; auto sets no value at all until it is chosen'
+    project(on, { 'src/w.test.ts': `it('${name}', () => { expect(band()).toEqual(steady) })\n` })
+    await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+    const ui = await $.ui.mount({
+      plugin: 'test-watch', surface, component: 'Pane', requestId: 'test-watch',
+      props: { title: 'Tests', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
+    } as never)
+    await ui.press({ key: 'gradeAll' })
+    await clock.advance(10)
 
-  const labels = [...JSON.stringify(await ui.drawn()).matchAll(/"label":"([^"]*)"/g)].map(m => m[1]!).filter(label => name.includes(label))
-  expect(labels.join(' ')).toBe(name)
-  for (const label of labels) expect(label.length).toBeLessThanOrEqual(50 - 2 - 'good'.length - 1)
-})
+    const labels = [...JSON.stringify(await ui.drawn()).matchAll(/"label":"([^"]*)"/g)].map(m => m[1]!).filter(label => name.includes(label))
+    expect(labels.join(' ')).toBe(name)
+    for (const label of labels) expect(label.length).toBeLessThanOrEqual(perLine)
+    // each line but the last is broken only where the next word would not fit
+    for (const [i, label] of labels.slice(0, -1).entries()) expect(`${label} ${labels[i + 1]!.split(' ')[0]}`.length).toBeGreaterThan(perLine)
+  })
+}
 
 // a test file changed some other way than Claude's Write or Edit: the shell, an editor, a checkout
 const SUM_BEFORE = "it('a shallow check', () => { expect(sum).toBeDefined() })\nit('adds', () => { expect(sum(1, 2)).toBe(3) })\n"
@@ -1341,4 +1363,99 @@ test('a file pressed open stays open when one of its tests is regraded on eviden
   await clock.advance(10)
 
   expect(JSON.stringify(await ui.drawn())).toContain(`"▾ src/e.test.ts"`)
+})
+
+// a jest project, and the summary its coverage run writes
+const JEST_PROJECT = { 'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+const SUMMARY = JSON.stringify({ total: { lines: { pct: 82.5 }, statements: { pct: 80 }, branches: { pct: 61.2 }, functions: { pct: 75 } } })
+
+test('Run coverage shows only in a project with a runner it knows, and the coverage section with it', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  // a project of plugin tests: no jest, vitest, pytest or Go
+  project(on, { 'package.json': '{ "name": "a-mod" }', 'tests/a.test.ts': "test('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).not.toContain('"key":"run"')
+  expect(drawn).not.toContain('Coverage')
+  expect(drawn).toContain('"key":"gradeAll"')
+  await ui.unmount()
+})
+
+test('in a jest project Run coverage shows, and Clear list is gone', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  project(on, JEST_PROJECT)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  const drawn = JSON.stringify(await ui.drawn())
+  expect(drawn).toContain('"key":"run"')
+  expect(drawn).not.toContain('"key":"clear"')
+})
+
+test('a finished coverage run tells Claude its figures', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...JEST_PROJECT }
+  const { notes, runs } = project(on, files, {
+    editor: () => {
+      files['coverage/coverage-summary.json'] = SUMMARY
+      return { stdout: 'Tests: 1 passed, 1 total', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(runs.map(argv => argv.slice(0, 3).join(' '))).toEqual(['npx jest --coverage'])
+  expect(notes).toEqual(['Coverage run (test-watch) finished: lines 82.5% · statements 80% · branches 61.2% · functions 75% (coverage-summary.json).'])
+})
+
+test('a coverage run that fails tells Claude how it exited and the end of what it printed', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const output = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n')
+  const { notes } = project(on, JEST_PROJECT, { editor: () => ({ stdout: output, stderr: 'FAIL src/a.test.ts', exitCode: 1 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(notes).toHaveLength(1)
+  const [head, ...tail] = notes[0]!.split('\n')
+  expect(head).toBe('Coverage run (test-watch) failed: npx jest --coverage exited with 1. The last 20 lines it printed:')
+  expect(tail).toEqual([...Array.from({ length: 19 }, (_, i) => `line ${i + 12}`), 'FAIL src/a.test.ts'])
+})
+
+test('the results of Grade all tests, Regrade all and a coverage run ask Claude to respond; a new test\'s note is only added', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...JEST_PROJECT }
+  const { asked, logs } = project(on, files, {
+    editor: () => {
+      files['coverage/coverage-summary.json'] = SUMMARY
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  // written mid-turn, a weak test's note is read in that turn: no prompt of its own
+  const shallow = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
+  files['src/b.test.ts'] = shallow
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/b.test.ts', content: shallow } as never)
+  await clock.advance(10)
+  expect(asked).toEqual([])
+  // the kit takes no appended row in this build: the mod's debug line says which way a note went
+  const added = () => logs.filter(l => l.startsWith('test-watch: note to Claude (not appended: no implementation for session.append): '))
+  expect(added()).toEqual([expect.stringMatching(/: New tests graded weak or useless/)])
+
+  for (const key of ['gradeAll', 'regradeAll', 'run']) {
+    await ui.press({ key })
+    await clock.advance(10)
+  }
+  expect(asked.map(text => text.split('\n')[0])).toEqual([
+    expect.stringMatching(/^Test grading \(test-watch\) finished: /),
+    expect.stringMatching(/^Test grading \(test-watch\) finished: /),
+    expect.stringMatching(/^Coverage run \(test-watch\) finished: /),
+  ])
+  // each ends asking for a reply about what it found
+  for (const text of asked) expect(text.split('\n').at(-1)).toMatch(/^Respond to this now: /)
+  expect(added()).toHaveLength(1)
 })
