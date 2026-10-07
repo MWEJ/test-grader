@@ -29,7 +29,17 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Regrade all** grades every file again, unchanged ones included.
 - **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates.
 
-The grader is the `haiku` model. It reviews up to 10 tests per call, with up to 4 calls at once.
+The grader is the `haiku` model by default. It reviews up to 10 tests per call, with up to 4 calls at once.
+
+#### Choosing the grader model
+
+The **Grader model** setting picks the model that grades: `haiku`, `sonnet` or `opus`. It defaults to `haiku`, the fastest and cheapest. Change it in the `/config` menu, or in `~/.claude/settings.json`:
+
+```json
+{ "pluginConfigs": { "test-grader": { "graderModel": "sonnet" } } }
+```
+
+When the mod is loaded straight from its folder, the key is `test-grader@inline` instead. A change reloads the mod, and every grading after it uses the new model. That includes new tests, regrades, Grade all and evidence.
 
 #### What the grader reads
 

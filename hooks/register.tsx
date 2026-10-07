@@ -38,6 +38,10 @@ const PARALLEL = 4
 // a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
 // stand for many cases each
 const MAX_REPLY = 4000
+// the model that grades, from the graderModel setting; set as the module loads, and a change
+// to the setting reloads the module
+const GRADER_MODELS = ['haiku', 'sonnet', 'opus'] as const
+let graderModel: string = 'haiku'
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
 // a JS case opens its own line, so one quoted inside a fixture string is not one; its
@@ -355,7 +359,7 @@ type Graded = { name: string; summary: string; verdict: Verdict; reason: string 
 const grade = async ($: EngineInterface, file: string, text: string, names: string[], evidence?: string): Promise<Graded[] | null> => {
   const source = excerptOf(text, names, file)
   const reply = await $.model.complete({
-    model: 'haiku',
+    model: graderModel,
     maxTokens: MAX_REPLY,
     system: 'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
     prompt: [
@@ -1135,7 +1139,9 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}${left}`
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const chosen = options.graderModel
+  graderModel = typeof chosen === 'string' && (GRADER_MODELS as readonly string[]).includes(chosen) ? chosen : 'haiku'
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
   on('tool.check', { tool: /^mcp__test-grader__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
   on('tool.call', { tool: /^mcp__test-grader__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(

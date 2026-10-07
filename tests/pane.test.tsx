@@ -123,6 +123,8 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   const logs: string[] = []
   // each grader call's room for its reply
   const budgets: number[] = []
+  // each grader call's model
+  const models: string[] = []
   on('ui.log', async (_$, e) => {
     const text = String((e as { text?: unknown }).text)
     logs.push(text)
@@ -172,6 +174,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   on('model.complete', async (_$, e) => {
     const prompt = String((e as { prompt?: unknown }).prompt)
     budgets.push(Number((e as { maxTokens?: unknown }).maxTokens))
+    models.push(String((e as { model?: unknown }).model))
     if (gate && prompts.length === 0) {
       prompts.push(prompt)
       await gate()
@@ -216,7 +219,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits }
+  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -1887,4 +1890,27 @@ test('a test Grade all listed weak, edited by Claude, has its new grade sent bac
   expect(asked).toHaveLength(2)
   expect(asked[1]).toContain('- weak · src/a.test.ts · a shallow check — weak because.')
   expect(asked[1]!.split('\n').at(-1)).toBe(ITERATE)
+})
+
+// The grader model is a setting: haiku unless the person picks another
+const gradeOnce = async ($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { models } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  return models
+}
+
+test('with no grader model set, tests are graded by haiku', async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['haiku'])
+})
+
+test('the grader model setting picks the model that grades', { options: { graderModel: 'opus' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['opus'])
+})
+
+test('a grader model the setting does not offer falls back to haiku', { options: { graderModel: 'gpt-4' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['haiku'])
 })
