@@ -9,6 +9,8 @@ export type TrackedTest = {
   summary?: string
   verdict?: Verdict
   reason?: string
+  /** a Go suite test's suite */
+  suite?: string
 }
 
 export type Coverage = {
@@ -21,10 +23,22 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean }
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; suite?: string }
 
 /** Grade all tests: how far a run has got, and what the last one found */
-export type ExistingRun = { state: 'idle' | 'running' | 'failed'; done: number; total: number; message?: string; results: ExistingTest[]; finishedAt?: number }
+// hashes: each graded file's contents, as fingerprinted when its results were made
+// graded, remembered: how many tests the last run sent to the grader, and how many it took from before
+export type ExistingRun = {
+  state: 'idle' | 'running' | 'failed'
+  done: number
+  total: number
+  message?: string
+  results: ExistingTest[]
+  finishedAt?: number
+  hashes?: Record<string, string>
+  graded?: number
+  remembered?: number
+}
 
 export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: string }
 

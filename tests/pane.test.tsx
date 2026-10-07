@@ -209,7 +209,7 @@ test('Grade all tests grades every case of every test file git tracks, in batche
   expect(tree.indexOf('a shallow check')).toBeLessThan(tree.indexOf('case 7'))
 })
 
-test('while grading, the button says how far it has got; pressing again grades afresh', async ($, on) => {
+test('while grading, the button says how far it has got; Regrade all grades afresh', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   let release = () => {}
   const { prompts } = project(
@@ -230,7 +230,7 @@ test('while grading, the button says how far it has got; pressing again grades a
   await clock.advance(10)
   expect(JSON.stringify(await ui.drawn())).toContain('2 tests')
 
-  await ui.press({ key: 'gradeAll' })
+  await ui.press({ key: 'regradeAll' })
   await clock.advance(10)
   expect(prompts).toHaveLength(4)
   expect(JSON.stringify(await ui.drawn())).toContain('2 tests')
@@ -870,4 +870,141 @@ test('a test name too long for its row wraps onto the next lines, whole', async 
   expect(labels.length).toBeGreaterThan(1)
   expect(labels.join(' ')).toBe(name)
   for (const label of labels) expect(label.length).toBeLessThanOrEqual(80 - 'good'.length - 6)
+})
+
+test('Grade all tests again grades only the files changed since their last grading, and remembers the rest across sessions', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+    'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+  }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(2)
+
+  // a later session, one file changed while none watched
+  files['src/a.test.ts'] = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n"
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(3)
+  expect(prompts[2]).toContain('src/a.test.ts')
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('3 tests · 2 good · 1 weak')
+  expect(tree).toContain('2 graded · 1 remembered')
+})
+
+test('Grade all tests again grades a file whose last grading left a test unrated', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'src/u.test.ts': "it('lost', () => { expect(f()).toBe(1) })\n" }, { expand: { lost: [] } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(2)
+})
+
+test('Regrade all grades every file again, remembered or not', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('"Regrade all"')
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(2)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 graded · 0 remembered')
+})
+
+// a testify suite spread over two files, its runner, and a plain test beside it
+const QUOTA_TEST = `package quota
+
+type QuotaSuite struct{ suite.Suite }
+
+func TestQuotaSuite(t *testing.T) {
+	suite.Run(t, new(QuotaSuite))
+}
+
+func (s *QuotaSuite) TestRollover() {
+	s.Equal(5, rollover(4))
+}
+
+func TestPlain(t *testing.T) {
+	if plain() != 1 {
+		t.Fatal("plain")
+	}
+}
+`
+const OTHER_TEST = `package quota
+
+func (s *QuotaSuite) TestShallowCheck() {
+	s.NotNil(New())
+}
+`
+
+test('Go suite methods are graded as tests, and the function that only runs the suite is not', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'pkg/quota/quota_test.go': QUOTA_TEST, 'pkg/quota/other_test.go': OTHER_TEST })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const asked = prompts.map(p => JSON.parse(p.match(/test cases: (\[.*\])/)![1]!) as string[]).flat().sort()
+  expect(asked).toEqual(['TestPlain', 'TestRollover', 'TestShallowCheck'])
+})
+
+test('a Go suite is a top-level group over its files, and the tests outside it stay under their file', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'pkg/quota/quota_test.go': QUOTA_TEST, 'pkg/quota/other_test.go': OTHER_TEST }, { rule: name => (name.includes('Shallow') ? 'weak' : 'good') })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  // two groups at the top, both closed: the suite (weak, so first) and the plain test's file
+  let tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('▸ QuotaSuite · pkg/quota')
+  expect(tree.indexOf('▸ QuotaSuite')).toBeLessThan(tree.indexOf('▸ pkg/quota/quota_test.go'))
+  expect(tree).not.toContain('TestRollover')
+
+  // open, the suite lists its two files, closed; a file opened lists its suite tests only
+  await ui.press({ key: 's:/proj/pkg/quota:QuotaSuite' })
+  tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('"▸ pkg/quota/other_test.go"')
+  await ui.press({ key: 'sf:/proj/pkg/quota:QuotaSuite:/proj/pkg/quota/quota_test.go' })
+  tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('"TestRollover"')
+  expect(tree).not.toContain('"TestPlain"')
+
+  await ui.press({ key: 'f:/proj/pkg/quota/quota_test.go' })
+  expect(JSON.stringify(await ui.drawn())).toContain('"TestPlain"')
+})
+
+test('a project of one Go suite in one file starts open all the way down', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'pkg/quota/other_test.go': OTHER_TEST })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('▾ QuotaSuite · pkg/quota')
+  expect(tree).toContain('"▾ pkg/quota/other_test.go"')
+  expect(tree).toContain('"TestShallowCheck"')
 })
