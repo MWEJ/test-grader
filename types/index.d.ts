@@ -11,6 +11,8 @@ export type TrackedTest = {
   reason?: string
   /** a Go suite test's suite */
   suite?: string
+  /** what the session sent to have it regraded, when its verdict was given on evidence */
+  evidence?: string
 }
 
 export type Coverage = {
@@ -23,7 +25,7 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; suite?: string }
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; suite?: string; evidence?: string }
 
 /** Grade all tests: how far a run has got, and what the last one found */
 // hashes: each graded file's contents, as fingerprinted when its results were made

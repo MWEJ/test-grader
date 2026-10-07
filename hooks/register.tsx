@@ -196,7 +196,7 @@ const flaggedLines = (list: { file: string; name: string; verdict?: Verdict; rea
 type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
 
 // One grader call: these cases of this file, judged; null when the grader gave no answer
-const grade = async ($: EngineInterface, file: string, text: string, names: string[]): Promise<Graded[] | null> => {
+const grade = async ($: EngineInterface, file: string, text: string, names: string[], evidence?: string): Promise<Graded[] | null> => {
   const source = excerptOf(text, names)
   const reply = await $.model.complete({
     model: 'haiku',
@@ -210,6 +210,13 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       'reason: one short sentence justifying the verdict.',
       ...(names.some(isTemplate)
         ? ['A name with ${...} in it is a template for cases generated in a loop: grade each case the loop generates separately, named as the loop expands it.']
+        : []),
+      ...(evidence
+        ? [
+            `The developer's session sent evidence about this test: ${JSON.stringify(evidence)}`,
+            'Weigh it, but check each claim against the source below: you cannot run code. Evidence cannot add an assertion the source does not contain.',
+            'In reason, say which part of the evidence changed your verdict, or why it did not.',
+          ]
         : []),
       'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
       '',
@@ -252,7 +259,7 @@ const evaluate = async ($: EngineInterface, file: string, ids: Map<string, strin
     // the weak and useless among them, told to Claude (the good ones are no news)
     const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
     const lines = flaggedLines(mine, await $.session.cwd())
-    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-watch):', ...lines].join('\n'))
+    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-watch):', ...lines, EVIDENCE_HINT].join('\n'))
   } catch {
     await fail()
   }
@@ -375,7 +382,7 @@ const existingNote = (results: ExistingTest[], cwd: string): string => {
   if (unrated.length > 0) counts.push(`${unrated.length} unrated`)
   const lines = [`Test grading (test-watch) finished: ${counts.join(' · ')}.`]
   const flagged = flaggedLines(results, cwd)
-  if (flagged.length > 0) lines.push('Weak or useless, worst first:', ...flagged)
+  if (flagged.length > 0) lines.push('Weak or useless, worst first:', ...flagged, EVIDENCE_HINT)
   if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
   return lines.join('\n')
 }
@@ -704,9 +711,64 @@ const openInEditor = async ($: EngineInterface, file: string, name: string): Pro
   await update($, openError, () => `Couldn't open ${shortPath(file, cwd)} in an editor: ${why}`)
 }
 
+// the session's tool for evidence that a test is better (or worse) than its verdict
+const EVIDENCE_TOOL = 'test_evidence'
+const EVIDENCE_MAX = 4_000
+const EVIDENCE_HINT =
+  'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.'
+const EVIDENCE_DESCRIPTION =
+  'Send evidence to test-watch that a test deserves a different verdict than it got (good, weak, useless), e.g. a mutation of the code that makes this test fail. ' +
+  'The grader weighs it against the test source and answers with the new verdict and why. It cannot run code: state what you ran and what happened.'
+const EVIDENCE_SCHEMA = {
+  type: 'object',
+  properties: {
+    file: { type: 'string', description: 'The test file, absolute or relative to the project' },
+    test: { type: 'string', description: 'The test name as written (it(...)/test(...)), or as its loop generates it' },
+    evidence: { type: 'string', description: 'What shows the test is better or worse than rated' },
+  },
+  required: ['file', 'test', 'evidence'],
+}
+
+// The test regraded with the session's evidence; its verdict replaces the one in both lists
+const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?: unknown; evidence?: unknown }): Promise<string> => {
+  const cwd = await $.session.cwd()
+  const given = String(input.file ?? '')
+  const file = given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
+  const name = String(input.test ?? '')
+  const evidence = String(input.evidence ?? '').trim().slice(0, EVIDENCE_MAX)
+  if (!evidence) return 'No evidence was given. Nothing was regraded.'
+  const text = await $.fs.read(file).catch(() => null)
+  if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was regraded.`
+  const caseName = [...new Set(caseNames(text))].find(n => fits(n, name))
+  if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was regraded.`
+  const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
+  const verdicts = await grade($, file, text, [caseName], evidence).catch(() => null)
+  const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
+  if (!v) return 'The grader gave no verdict. Nothing was regraded; send it again.'
+  const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence }
+  const suite = suitesOf(text).get(caseName)
+  await update($, existing, r => ({
+    ...r,
+    results: r.results.some(t => t.file === file && t.name === name)
+      ? r.results.map(t => (t.file === file && t.name === name ? { ...t, ...judged, isPending: undefined } : t))
+      : [...r.results, { file, name, ...(suite ? { suite } : {}), ...judged }],
+  }))
+  await update($, tests, list => list.map(t => (t.file === file && t.name === name && t.status !== 'pending' ? { ...t, status: 'done' as const, ...judged } : t)))
+  return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}`
+}
+
 export const register: Register = on => {
+  // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
+  on('tool.check', { tool: /^mcp__test-watch__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: /^mcp__test-watch__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
+    (_$, _e, next) => ({ result: `The evidence tool could not answer (${next.error.kind}). Nothing was regraded; send it again.` }),
+  )
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
+    await $.tool
+      .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
+      .catch(error => $.ui.log(`test-watch: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await refreshCoverage($)
     await prune($).catch(() => undefined)
     // each session starts with its files at their default, closed when there are several
@@ -782,18 +844,18 @@ export const register: Register = on => {
     // One list: the last Grade all tests run and the tests written this session, a test in
     // both once, with the newer verdict; one written this session is marked new
     type State = Verdict | 'unrated' | 'reviewing'
-    type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean; suite?: string }
+    type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean; suite?: string; evidence?: string }
     const merged = new Map<string, Entry>()
     for (const t of graded.results) {
       const state: State = t.isPending ? 'reviewing' : (t.verdict ?? 'unrated')
-      merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false, suite: t.suite })
+      merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false, suite: t.suite, evidence: t.evidence })
     }
     for (const t of list) {
       const key = `${t.file}:${t.name}`
       const prev = merged.get(key)
       const state: State = t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated')
       const isNewer = !prev || graded.finishedAt === undefined || t.at >= graded.finishedAt
-      merged.set(key, isNewer ? { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: true, suite: t.suite ?? prev?.suite } : { ...prev, isNew: true })
+      merged.set(key, isNewer ? { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: true, suite: t.suite ?? prev?.suite, evidence: t.evidence ?? prev?.evidence } : { ...prev, isNew: true })
     }
     const entries = [...merged.values()]
     const tally = (of: Entry[], s: State): number => of.filter(t => t.state === s).length
@@ -878,11 +940,13 @@ export const register: Register = on => {
                 ))}
               </Box>
               {t.isNew && <Text color={VIOLET}>new</Text>}
+              {t.evidence && <Text color={MUTED}>on evidence</Text>}
             </Box>
             {isOpen.has(key) && (
               <Box flexDirection="column" marginLeft={2}>
                 {t.summary && <Text>{t.summary}</Text>}
                 {reason && <Text color={stateColor(t.state)}>{reason}</Text>}
+                {t.evidence && <Text color={MUTED}>{`Evidence: ${t.evidence}`}</Text>}
                 <Button key={`o:${t.file}:${t.name}`} plain label="Open in editor" onPress={() => $.clock.after(1, () => void openInEditor($, t.file, t.name))} />
               </Box>
             )}

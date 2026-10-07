@@ -126,6 +126,12 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
     return { value: undefined } as never
   })
   on('command.register', async () => ({ value: {} }) as never)
+  // the tools the mod registers for the session, by name
+  const tools: string[] = []
+  on('tool.register', async (_$, e) => {
+    tools.push((e as { name: string }).name)
+    return { value: { tool: `mcp__test-watch__${(e as { name: string }).name}` } } as never
+  })
   on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
   on('session.start', async () => ({ cwd: '/proj' }) as never)
   on('session.cwd', async () => ({ value: '/proj' }) as never)
@@ -182,7 +188,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       },
     } as never
   })
-  return { prompts, notes, runs, logs, budgets }
+  return { prompts, notes, runs, logs, budgets, tools }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -380,6 +386,7 @@ test('a finished run leaves Claude a note: the counts, then every weak, useless 
       'Weak or useless, worst first:\n' +
       '- useless · src/math.test.ts · does nothing — useless because.\n' +
       '- weak · src/more.test.ts · a shallow check — weak because.\n' +
+      'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.\n' +
       'Unrated (the grader gave no verdict):\n' +
       '- src/more.test.ts · lost ${x}',
   ])
@@ -453,7 +460,8 @@ test('a new test graded weak or useless as it is written leaves a note of those 
   expect(notes).toEqual([
     'New tests graded weak or useless (test-watch):\n' +
       '- useless · src/a.test.ts · does nothing — useless because.\n' +
-      '- weak · src/a.test.ts · a shallow check — weak because.',
+      '- weak · src/a.test.ts · a shallow check — weak because.\n' +
+      'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   ])
 })
 
@@ -1114,4 +1122,99 @@ test('a grader call has room in its reply for a looped test\'s every case', asyn
   // about 75 tokens a verdict, for 20 cases
   expect(budgets[0]).toBeGreaterThanOrEqual(20 * 75)
   expect(budgets[0]).toBeGreaterThan(1500)
+})
+
+// the session's evidence for a test, sent through the mod's tool; what the tool answers
+const EVIDENCE_TOOL = 'mcp__test-watch__test_evidence'
+const sendEvidence = async ($: Parameters<Parameters<typeof test>[1]>[0], input: { file: string; test: string; evidence: string }) =>
+  String((await $.tool.call({ tool: EVIDENCE_TOOL, ...input } as never)).result)
+const MUTATION = 'Removing the default export of f makes this test fail; no other test fails.'
+// the grader is swayed by the mutation, when it is sent; else a shallow test stays weak
+const swayed = (name: string, prompt: string): 'good' | 'weak' => (name.includes('shallow') && !prompt.includes(MUTATION) ? 'weak' : 'good')
+
+test('evidence the grader accepts turns a weak test good, and the row says it was graded on evidence', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts, tools } = project(on, { 'src/e.test.ts': E_TEST }, { rule: swayed })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  expect(tools).toEqual(['test_evidence'])
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 1 good · 1 weak')
+
+  const answer = await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
+  await clock.advance(10)
+
+  expect(answer).toMatch(/^Now good: /)
+  // the grader saw the evidence, and was told to check it against the source
+  expect(prompts.at(-1)).toContain(MUTATION)
+  expect(prompts.at(-1)).toContain('check each claim against the source')
+  expect(prompts.at(-1)).toContain('Review ONLY these test cases: ["a shallow check"]')
+  await ui.press({ key: `r:${E_FILE}:a shallow check` })
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('2 tests · 2 good · 0 weak')
+  expect(tree).toContain('"on evidence"')
+  expect(tree).toContain(`Evidence: ${MUTATION}`)
+})
+
+test('evidence the grader rejects leaves the verdict, and the tool says why', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/e.test.ts': E_TEST })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const answer = await sendEvidence($, { file: '/proj/src/e.test.ts', test: 'a shallow check', evidence: 'It is fine.' })
+  await clock.advance(10)
+
+  expect(answer).toBe('Still weak: weak because.')
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 1 good · 1 weak')
+})
+
+test('evidence for a test that is not in the file is refused, with no grader call', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'src/e.test.ts': E_TEST })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  const answer = await sendEvidence($, { file: 'src/e.test.ts', test: 'no such test', evidence: MUTATION })
+  await clock.advance(10)
+
+  expect(answer).toBe('There is no test named "no such test" in src/e.test.ts. Nothing was regraded.')
+  expect(prompts).toHaveLength(0)
+})
+
+test('a verdict on evidence holds while the file is unchanged, and goes once it changes', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/e.test.ts': E_TEST }
+  project(on, files, { rule: swayed })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
+  await clock.advance(10)
+
+  // remembered: Grade all again keeps it
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('"on evidence"')
+
+  files['src/e.test.ts'] = E_TEST + "\nit('second', () => { expect(f(2)).toBe(2) })\n"
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).not.toContain('"on evidence"')
+  expect(tree).toContain('3 tests · 2 good · 1 weak')
+})
+
+test('the note on weak tests tells Claude it can send evidence', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { notes } = project(on, { 'src/e.test.ts': E_TEST })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(notes.at(-1)).toContain('test_evidence')
 })
