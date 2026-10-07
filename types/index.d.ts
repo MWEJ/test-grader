@@ -40,6 +40,8 @@ export type ExistingRun = {
   hashes?: Record<string, string>
   graded?: number
   remembered?: number
+  /** while running: a Regrade all, every file graded again */
+  isFresh?: boolean
 }
 
 export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: string }

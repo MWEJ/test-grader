@@ -1539,3 +1539,180 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
   for (const text of asked) expect(text.split('\n').at(-1)).toMatch(/^Respond to this now: /)
   expect(added()).toHaveLength(1)
 })
+
+// Test discovery reads code, not text: a test written inside a string or a comment is a
+// fixture or a note, not one of the file's tests
+const ASKED = (prompts: string[]): string[] => prompts.map(p => JSON.parse(p.match(/test cases: (\[.*\])/)![1]!) as string[]).flat().sort()
+
+test('a test written inside a string or a comment is not one of the file\'s tests', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const js = [
+    "const FIXTURE = `",
+    "it('in a template', () => { expect(true).toBe(true) })",
+    "test(`nested ${`it('in a hole', () => {})`} still text`, () => {})",
+    "`",
+    "const GO = `func TestInGo(t *testing.T) {}`",
+    "// it('in a line comment', () => {})",
+    "/*",
+    "it('in a block comment', () => {})",
+    "*/",
+    "const re = /it\\('in a regex'/",
+    "it('real one', () => { expect(add(1, 2)).toBe(3) })",
+    "it(`real after ${FIXTURE.length} chars`, () => { expect(1).toBe(1) })",
+    "",
+  ].join('\n')
+  const go = "package q\n\nconst src = `\nfunc TestInRaw(t *testing.T) {}\n`\n\n// func TestInComment(t *testing.T) {}\n\nfunc TestRealGo(t *testing.T) {\n\tif add(1, 2) != 3 {\n\t\tt.Fatal(\"func TestInString(t *testing.T) {\")\n\t}\n}\n"
+  const py = 'DOC = """\ndef test_in_docstring():\n    pass\n"""\n\n# def test_in_comment():\n\ndef test_real_py():\n    assert add(1, 2) == 3\n'
+  const swift = 'final class MathTests: XCTestCase {\n  let src = """\n  func testInMultiline() {}\n  """\n  // func testInComment() {}\n  func testRealSwift() {\n    XCTAssertEqual(add(1, 2), 3, "func testInString() {")\n  }\n}\n'
+  const { prompts } = project(on, { 'src/a.test.ts': js, 'q/a_test.go': go, 'test_a.py': py, 'Tests/MathTests.swift': swift })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(ASKED(prompts)).toEqual(['TestRealGo', 'real after ${FIXTURE.length} chars', 'real one', 'testRealSwift', 'test_real_py'])
+})
+
+test('a fixture string an edit adds holding a test is not tracked as a new test', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const added = "const CONTENT = `\nit('fixture case', () => {})\n`\n"
+  const after = `${added}it('real one', () => { expect(add(1, 2)).toBe(3) })\n`
+  const { prompts } = project(on, { 'src/a.test.ts': after })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(0)
+  expect(JSON.stringify(await (await mount($)).drawn())).not.toContain('fixture case')
+})
+
+// A long file reaches the grader as an excerpt that leaves nothing of the cases under review
+// out, and brings the helpers they use from wherever in the file they are declared
+test('in a long file, a long case reaches the grader whole, with the helpers it uses from between other tests', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const old = (from: number) => Array.from({ length: 200 }, (_, i) => `it('old case ${from + i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const helper = "\nconst MOCK_HOME = '/home/someone'\nfunction mockProject(dir: string) {\n  const off = listen(() => {\n    return dir\n  })\n  return { dir, home: MOCK_HOME, off }\n}\n"
+  const unused = "\nconst NEVER_USED = 'left out'\n"
+  const steps = Array.from({ length: 80 }, (_, i) => `  expect(step(p, ${i})).toBe(${i * 2})\n`).join('')
+  const added = `it('a long case', () => {\n  const p = mockProject('/proj')\n${steps}  expect(p.home).toBe('/home/someone') // the last line\n})\n`
+  const content = old(0) + helper + old(200) + unused + old(400) + added
+  expect(added.length).toBeGreaterThan(2_000)
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  const prompt = prompts[0]!
+  expect(prompt).toContain("expect(p.home).toBe('/home/someone') // the last line")
+  // the helper the case calls, and the constant the helper uses in turn
+  expect(prompt).toContain('function mockProject(dir: string) {')
+  expect(prompt).toContain("const MOCK_HOME = '/home/someone'")
+  expect(prompt).not.toContain('NEVER_USED')
+  expect(prompt).not.toContain('old case 450')
+  expect(prompt).toContain('below is an excerpt')
+})
+
+test('a file short enough goes to the grader whole, with no word of an excerpt', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
+  await clock.advance(10)
+
+  expect(prompts[0]).toContain(content.trimEnd())
+  expect(prompts[0]).not.toContain('excerpt')
+})
+
+// A reload of the mod drops the grading under way, and the host keeps its marks: the run left
+// running, its rows reviewing. Here the host holds them as the cut-off load left them: each
+// read answers with them until the mod first writes the value
+function seedState(on: Parameters<Parameters<typeof test>[1]>[1], seeds: Record<string, unknown>) {
+  const written = new Set<string>()
+  on('state.set', async (_$, e, next) => {
+    written.add((e as { key: string }).key)
+    return next(e)
+  })
+  on('state.get', async (_$, e, next) => {
+    const { plugin, key } = e as { plugin: string; key: string }
+    const held = await next(e)
+    if (plugin !== 'test-grader' || !(key in seeds) || written.has(key)) return held
+    // a hook's answer comes wrapped: { value: { value, version } }
+    return { value: { value: seeds[key], version: (held as { value: { version: number } }).value.version } } as never
+  })
+}
+
+test('a Grade all run a reload cut off is started again at the session start, and its rows stop reviewing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  seedState(on, {
+    existing: { state: 'running', done: 0, total: 1, isFresh: true, hashes: { '/proj/src/a.test.ts': 'old' }, results: [{ file: '/proj/src/a.test.ts', name: 'adds', verdict: 'weak', isPending: true }] },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  expect(ASKED(prompts)).toEqual(['adds'])
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).not.toContain('reviewing')
+  expect(tree).not.toContain('Grading…')
+  expect(tree).toContain('Grade all tests')
+})
+
+test('a Regrade all a reload cut off is done again as a Regrade all, its unchanged files graded too', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  // the file's grades stand from before, its fingerprint the one it has now
+  const hash = fingerprint(content)
+  seedState(on, {
+    existing: { state: 'running', done: 0, total: 1, isFresh: true, hashes: { '/proj/src/a.test.ts': hash }, results: [{ file: '/proj/src/a.test.ts', name: 'adds', verdict: 'weak', isPending: true }] },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  expect(ASKED(prompts)).toEqual(['adds'])
+})
+
+test('a regrade a reload cut off is done again, and a new test left pending is graded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('a shallow check', () => { expect(f).toBeDefined() })\n"
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  seedState(on, {
+    existing: { state: 'idle', done: 1, total: 1, results: [{ file: '/proj/src/a.test.ts', name: 'adds', verdict: 'weak', isPending: true }] },
+    tests: [{ id: 't1', file: '/proj/src/a.test.ts', name: 'a shallow check', at: 1, status: 'pending' }],
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  expect(ASKED(prompts)).toEqual(['a shallow check', 'adds'])
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).not.toContain('reviewing')
+})
+
+test('a session start while a run is under way leaves it to finish, with no second run', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const held = { calls: 0, release: () => {} }
+  const { prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { held })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(held.calls).toBe(1)
+
+  // a compaction starts the session again with the run's grader call still out
+  await $.session.start({ source: 'compact', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  held.release()
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  expect(JSON.stringify(await ui.drawn())).not.toContain('Grading…')
+})

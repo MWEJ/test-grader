@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Coverage, ExistingTest, TrackedTest, Verdict } from '../types'
+import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '../types'
 
 const PANE = 'test-grader'
 const tests = atom({ plugin: 'test-grader', key: 'tests' } as const, [])
@@ -24,8 +24,10 @@ const TRACK = '#343848'
 const VIOLET = '#a78bfa'
 const MAX_TESTS = 60
 const MAX_SOURCE = 12_000
-// of a file too long to send whole: at most this much of its head (imports, helpers)
-const MAX_HEAD = 4_000
+// of a file too long to send whole: at most this much of its head (imports, helpers), and of
+// any one case under review
+const MAX_HEAD = 12_000
+const MAX_BODY = 20_000
 const CELLS = 12
 // Grade all tests: cases per grader call, and how many weak or useless ones are listed
 const BATCH = 10
@@ -61,17 +63,117 @@ const shortPath = (file: string, cwd: string): string => (cwd && file.startsWith
 
 const nameOf = (m: RegExpMatchArray): string => (m[2] ?? (m[1] as string)).replace(/\\(.)/g, '$1')
 
-const caseNames = (text: string): string[] => {
-  const runners = new Set([...text.matchAll(GO_SUITE_RUNNER)].map(m => m[1]!))
-  const names: string[] = []
-  for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) names.push(nameOf(m))
+// the families of syntax a test file's strings and comments follow: JS and TS; Go; Python
+// and Ruby; and the C-like rest (Rust, Swift, Kotlin, Java)
+type Lang = 'js' | 'go' | 'py' | 'c'
+const langOf = (file: string): Lang =>
+  /\.[cm]?[jt]sx?$/.test(file) ? 'js' : file.endsWith('.go') ? 'go' : /\.(py|rb)$/.test(file) ? 'py' : 'c'
+
+// Which characters of a source sit inside a string literal or a comment (1) rather than in
+// code (0): a test written out as text, a fixture, is not one of the file's tests
+const quotedMask = (text: string, lang: Lang): Uint8Array => {
+  const n = text.length
+  const mask = new Uint8Array(n)
+  const fill = (from: number, to: number): number => (mask.fill(1, from, to), to)
+  // past a string's opening quote at `from`: where it ends, past its closing quote; one that
+  // may not span lines ends at its line's end
+  const close = (from: number, quote: string, { escapes = true, lines = false } = {}): number => {
+    for (let j = from; j < n; j++) {
+      if (escapes && text[j] === '\\') j++
+      else if (text.startsWith(quote, j)) return j + quote.length
+      else if (text[j] === '\n' && !lines) return j
+    }
+    return n
   }
-  return names.filter(name => !runners.has(name))
+  // JS: the ${…} holes open in templates, innermost last, each with the braces opened in it
+  const holes: number[] = []
+  // a JS template's text from `from` to its close or its next hole
+  const template = (from: number, scan: number): number => {
+    for (let j = scan; j < n; j++) {
+      if (text[j] === '\\') j++
+      else if (text[j] === '`') return fill(from, j + 1)
+      else if (text[j] === '$' && text[j + 1] === '{') return holes.push(0), fill(from, j + 2)
+    }
+    return fill(from, n)
+  }
+  // a JS slash opens a regex where a value is due, not after one
+  const isRegexAt = (at: number): boolean => {
+    let k = at - 1
+    while (k >= 0 && /\s/.test(text[k]!)) k--
+    if (k < 0 || '(,=:[!&|?{};+-*%~^'.includes(text[k]!)) return true
+    return /\b(?:return|typeof|case|in|of|delete|void|throw|new|else|do|yield|await)$/.test(text.slice(Math.max(0, k - 9), k + 1))
+  }
+  const regexEnd = (at: number): number => {
+    let isClass = false
+    for (let j = at + 1; j < n; j++) {
+      const t = text[j]
+      if (t === '\\') j++
+      else if (t === '\n') return j
+      else if (isClass) isClass = t !== ']'
+      else if (t === '[') isClass = true
+      else if (t === '/') return j + 1
+    }
+    return n
+  }
+  const RUST_RAW = /r(#*)"/y
+  let i = 0
+  while (i < n) {
+    const c = text[i]!
+    const d = text[i + 1]
+    if (lang === 'py' ? c === '#' : c === '/' && d === '/') {
+      const end = text.indexOf('\n', i)
+      i = fill(i, end < 0 ? n : end)
+    } else if (lang !== 'py' && c === '/' && d === '*') {
+      const end = text.indexOf('*/', i + 2)
+      i = fill(i, end < 0 ? n : end + 2)
+    } else if (lang === 'js' && c === '`') i = template(i, i + 1)
+    else if (lang === 'js' && holes.length > 0 && (c === '{' || c === '}')) {
+      const top = holes.length - 1
+      if (c === '{') holes[top]! += 1
+      else if (holes[top]! > 0) holes[top]! -= 1
+      else {
+        holes.pop()
+        i = template(i, i + 1)
+        continue
+      }
+      i++
+    } else if (lang === 'js' && c === '/' && isRegexAt(i)) i = fill(i, regexEnd(i))
+    else if (lang === 'go' && c === '`') i = fill(i, close(i + 1, '`', { escapes: false, lines: true }))
+    else if (lang !== 'js' && lang !== 'go' && (text.startsWith('"""', i) || (lang === 'py' && text.startsWith("'''", i)))) {
+      i = fill(i, close(i + 3, text.slice(i, i + 3), { lines: true }))
+    } else if (lang === 'c' && c === 'r' && !/\w/.test(text[i - 1] ?? '') && ((RUST_RAW.lastIndex = i), RUST_RAW.test(text))) {
+      i = fill(i, close(RUST_RAW.lastIndex, `"${text.slice(i + 1, RUST_RAW.lastIndex - 1)}`, { escapes: false, lines: true }))
+    } else if (c === '"' || (c === "'" && lang !== 'c')) i = fill(i, close(i + 1, c))
+    // C-like: a quote opens a char literal ('a', '\n'), not a Rust lifetime ('a)
+    else if (c === "'" && d === '\\') i = fill(i, close(i + 1, "'"))
+    else if (c === "'" && text[i + 2] === "'") i = fill(i, i + 3)
+    else i++
+  }
+  return mask
 }
 
+// where a match's own keyword stands, past the indent a line-anchored pattern takes in
+const opensOf = (m: RegExpMatchArray): number => (m.index ?? 0) + m[0].length - m[0].trimStart().length
+
+// every case a test file declares in its code, in file order: where its match starts (at:
+// for a JS case, its line's start) and where its keyword stands (opens). A Go function that
+// only runs a suite is marked a runner
+const casesIn = (text: string, file: string): { name: string; at: number; opens: number; isRunner: boolean }[] => {
+  const quoted = quotedMask(text, langOf(file))
+  const isCode = (m: RegExpMatchArray): boolean => quoted[opensOf(m)] !== 1
+  const runners = new Set([...text.matchAll(GO_SUITE_RUNNER)].filter(isCode).map(m => m[1]!))
+  return CASE_PATTERNS.flatMap(pattern =>
+    [...text.matchAll(pattern)].filter(isCode).map(m => ({ name: nameOf(m), at: m.index ?? 0, opens: opensOf(m), isRunner: runners.has(nameOf(m)) })),
+  ).sort((a, b) => a.at - b.at)
+}
+
+const caseNames = (text: string, file: string): string[] => casesIn(text, file).flatMap(c => (c.isRunner ? [] : [c.name]))
+
 // each Go suite test's suite, by its name
-const suitesOf = (text: string): Map<string, string> => new Map([...text.matchAll(GO_SUITE_CASE)].map(m => [m[2]!, m[1]!]))
+const suitesOf = (text: string, file: string): Map<string, string> => {
+  const quoted = quotedMask(text, langOf(file))
+  return new Map([...text.matchAll(GO_SUITE_CASE)].filter(m => quoted[opensOf(m)] !== 1).map(m => [m[2]!, m[1]!]))
+}
 
 const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // the lines a text fills at this width, broken between words; a word wider than a line, in pieces
@@ -96,22 +198,27 @@ const wrapWords = (s: string, n: number): string[] => {
 // (a line opening with "})"), so what sits between two cases (a comment, the data a
 // loop runs over, the loop itself) goes with the case below it; failing a close, on
 // the line after the previous case's first
-const caseStarts = (text: string): { name: string; at: number }[] => {
-  const found: { name: string; at: number }[] = []
-  for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) found.push({ name: nameOf(m), at: m.index ?? 0 })
-  }
-  found.sort((a, b) => a.at - b.at)
+const caseStarts = (text: string, file: string): { name: string; at: number; opens: number }[] => {
+  const found = casesIn(text, file)
   return found.map((start, i) => {
     const prev = found[i - 1]
-    if (!prev) return start
-    const between = text.slice(prev.at, start.at)
-    const closes = [...between.matchAll(/\n[ \t]*\}\)[^\n]*\n/g)]
-    const last = closes[closes.length - 1]
-    const after = last ? last.index! + last[0].length : between.indexOf('\n') + 1
-    return after > 0 ? { name: start.name, at: prev.at + after } : start
+    const at = (): number => {
+      if (!prev) return start.at
+      const between = text.slice(prev.at, start.at)
+      // the previous case's own close, at its indent: a helper declared after it keeps its head
+      const indent = text.slice(text.lastIndexOf('\n', prev.opens - 1) + 1, prev.opens)
+      const own = /^[ \t]*$/.test(indent) ? between.match(new RegExp(`\\n${indent}\\}\\)[^\\n]*\\n`)) : null
+      const closes = [...between.matchAll(/\n[ \t]*\}\)[^\n]*\n/g)]
+      const last = own ?? closes[closes.length - 1]
+      const after = last ? last.index! + last[0].length : between.indexOf('\n') + 1
+      return after > 0 ? prev.at + after : start.at
+    }
+    return { name: start.name, at: at(), opens: start.opens }
   })
 }
+
+// a top-level declaration a test can use: a constant, a helper, a type, a fixture
+const DECLARATION = /^(?:export\s+)?(?:declare\s+)?(?:(?:const|let|var|function\*?|async\s+function\*?|class|type|interface|enum|func|def|fn|struct)\s+(\w+)|(\w+)\s*=(?!=))/gm
 
 // A name with ${…} in it is a template: the cases a loop generates. The grader names each
 // case as the loop expands it, and a returned name belongs to the template it fits
@@ -122,17 +229,47 @@ const fits = (template: string, name: string): boolean => {
   return new RegExp(`^${parts.join('[\\s\\S]+?')}$`).test(name)
 }
 
-// What the grader reads: the whole file when it fits, else its head and the new cases
-// themselves, each from its start to the next case's, wherever in the file they sit
-const excerptOf = (source: string, names: string[]): string => {
+// What the grader reads: the whole file when it fits. Else, in file order: its head, the
+// cases under review whole, each from its start to the next case's, and of what sits between
+// the other cases, each piece that declares a name the shown code uses
+const excerptOf = (source: string, names: string[], file: string): string => {
   if (source.length <= MAX_SOURCE) return source
-  const starts = caseStarts(source)
+  const starts = caseStarts(source, file)
   const head = clamp(source.slice(0, starts[0]?.at ?? source.length), MAX_HEAD)
-  const bodies = starts.flatMap((start, i) =>
-    names.includes(start.name) ? [source.slice(start.at, starts[i + 1]?.at ?? source.length).trimEnd()] : [],
-  )
-  const room = Math.max(1_000, Math.floor((MAX_SOURCE - head.length) / Math.max(1, bodies.length)))
-  return [head.trimEnd(), '// … other tests left out …', ...bodies.map(b => clamp(b, room))].join('\n\n')
+  const pieces = starts.map((start, i) => ({
+    isChosen: names.includes(start.name),
+    whole: source.slice(start.at, starts[i + 1]?.at ?? source.length).trimEnd(),
+    // what sits above the case's own line: comments, data, helpers
+    declares: [...source.slice(start.at, start.opens).matchAll(DECLARATION)].map(m => (m[1] ?? m[2])!),
+    gap: source.slice(start.at, start.opens).trimEnd(),
+  }))
+  const extra = new Set<number>()
+  let shown = pieces.filter(p => p.isChosen).map(p => p.whole).join('\n')
+  // a helper the shown code uses can use another, so until nothing more is named
+  for (let isGrowing = true; isGrowing; ) {
+    isGrowing = false
+    pieces.forEach((p, i) => {
+      if (p.isChosen || extra.has(i) || !p.declares.some(name => new RegExp(`\\b${name}\\b`).test(shown))) return
+      extra.add(i)
+      shown += `\n${p.gap}`
+      isGrowing = true
+    })
+  }
+  const note = langOf(file) === 'py' ? '#' : '//'
+  const LEFT_OUT = `${note} … other tests left out …`
+  const out = [head.trimEnd()]
+  pieces.forEach((p, i) => {
+    const piece = p.isChosen
+      ? p.whole.length > MAX_BODY
+        ? `${p.whole.slice(0, MAX_BODY)}\n${note} … the rest of this test is left out: it is too long to send …`
+        : p.whole
+      : extra.has(i)
+        ? p.gap
+        : null
+    if (piece !== null) out.push(piece)
+    else if (out[out.length - 1] !== LEFT_OUT) out.push(LEFT_OUT)
+  })
+  return out.join('\n\n')
 }
 
 // the verdicts in a grader reply; of one cut off before its closing ], each object that
@@ -214,7 +351,7 @@ type Graded = { name: string; summary: string; verdict: Verdict; reason: string 
 
 // One grader call: these cases of this file, judged; null when the grader gave no answer
 const grade = async ($: EngineInterface, file: string, text: string, names: string[], evidence?: string): Promise<Graded[] | null> => {
-  const source = excerptOf(text, names)
+  const source = excerptOf(text, names, file)
   const reply = await $.model.complete({
     model: 'haiku',
     maxTokens: MAX_REPLY,
@@ -235,6 +372,12 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
             'In reason, say which part of the evidence changed your verdict, or why it did not.',
           ]
         : []),
+      ...(source !== text
+        ? [
+            'The file is long, so below is an excerpt: the cases under review whole, the file\'s head, and the declarations they use from elsewhere in it. Other tests are left out.',
+            'Judge each case by what it does. Do not mark one down for code the excerpt leaves out.',
+          ]
+        : []),
       'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
       '',
       '```',
@@ -250,7 +393,28 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   return verdicts
 }
 
-const evaluate = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
+// Grading under way in this load of the module: a Grade all run, a regrade, a new test's
+// grading. The host keeps their marks (a run running, rows reviewing, tests pending) across a
+// reload of this mod, which drops the work itself; at a session's start with none under way
+// here, resume takes the marks left behind for work to do again
+let working = 0
+const busy = async <T,>(work: () => Promise<T>): Promise<T> => {
+  working += 1
+  try {
+    return await work()
+  } finally {
+    working -= 1
+  }
+}
+
+// work started on the next tick, counted as under way from now
+const soon = ($: EngineInterface, work: () => Promise<void>): void => {
+  working += 1
+  void $.clock.after(1, () => void work().catch(() => undefined).finally(() => (working -= 1)))
+}
+
+const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => busy(() => evaluateNow($, file, ids))
+const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
   const fail = (): Promise<void> =>
     update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' } : t)))
   try {
@@ -470,7 +634,8 @@ const loadGrades = async ($: EngineInterface): Promise<void> => {
 }
 
 // isFresh: grade every file again, the remembered ones too
-const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
+const gradeAll = ($: EngineInterface, isFresh = false): Promise<void> => busy(() => gradeAllNow($, isFresh))
+const gradeAllNow = async ($: EngineInterface, isFresh: boolean): Promise<void> => {
   const before = await read($, existing)
   if (before.state === 'running') return
   const cwd = await $.session.cwd()
@@ -479,7 +644,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
     const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
     if (listed.exitCode !== 0) return void (await fail('Not a git repository: there is no list of test files to grade.'))
     const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f))
-    await update($, existing, r => ({ ...r, state: 'running', done: 0, total: files.length }))
+    await update($, existing, r => ({ ...r, state: 'running', done: 0, total: files.length, isFresh }))
     const hashes: Record<string, string> = {}
     // tests whose results stand from before
     let remembered = 0
@@ -494,7 +659,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
       const file = `${cwd}/${rel}`
       const text = await $.fs.read(file)
       hashes[file] = fingerprint(text)
-      const names = [...new Set(caseNames(text))]
+      const names = [...new Set(caseNames(text, file))]
       const entry = { left: 0, slots: [] as Slot[] }
       // unchanged since its last grading, and every test rated: its results stand
       const kept = before.results.filter(t => t.file === file)
@@ -526,7 +691,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
       while (next < jobs.length) {
         const { file, text, batch, slot } = jobs[next++]!
         const verdicts = (await grade($, file, text, batch).catch(() => null)) ?? []
-        const suites = suitesOf(text)
+        const suites = suitesOf(text, file)
         for (const name of batch) {
           const suite = suites.has(name) ? { suite: suites.get(name) } : {}
           const found = verdicts.filter(v => fits(name, v.name))
@@ -555,7 +720,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
 
 const track = async ($: EngineInterface, file: string, names: string[]): Promise<void> => {
   const now = await $.clock.now()
-  const suites = await $.fs.read(file).then(suitesOf, () => new Map<string, string>())
+  const suites = await $.fs.read(file).then(text => suitesOf(text, file), () => new Map<string, string>())
   const ids = new Map<string, string>()
   const entries: TrackedTest[] = names.map((name, i) => {
     const id = `${now}-${i}-${file}`
@@ -563,7 +728,7 @@ const track = async ($: EngineInterface, file: string, names: string[]): Promise
     return { id, file, name, at: now, status: 'pending', ...(suites.has(name) ? { suite: suites.get(name) } : {}) }
   })
   await update($, tests, list => [...list, ...entries].slice(-MAX_TESTS))
-  $.clock.after(1, () => void evaluate($, file, ids))
+  soon($, () => evaluate($, file, ids))
 }
 
 // whether a name the lists hold is still among a file's cases: itself, or a case of a loop
@@ -578,7 +743,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   } catch {
     return
   }
-  const present = caseNames(text)
+  const present = caseNames(text, file)
   const isRedo = (t: { file: string; name: string; verdict?: Verdict }): boolean =>
     t.file === file && t.verdict !== 'good' && among(touched, t.name)
 
@@ -589,7 +754,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
       .filter(t => t.file !== file || t.status === 'pending' || among(present, t.name))
       .map(t => (redoNew.has(t.id) ? { ...t, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
   )
-  if (redoNew.size > 0) $.clock.after(1, () => void evaluate($, file, redoNew))
+  if (redoNew.size > 0) soon($, () => evaluate($, file, redoNew))
 
   const run = await read($, existing)
   const kept = run.results.filter(t => t.file !== file || among(present, t.name))
@@ -601,8 +766,14 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
     results: r.results.filter(t => t.file !== file || among(present, t.name)).map(t => (pick(t) ? { ...t, isPending: true } : t)),
   }))
   if (redo.length === 0) return
-  $.clock.after(1, async () => {
-    const verdicts = await grade($, file, text, redo).catch(() => null)
+  soon($, () => regradeRows($, file, text, redo))
+}
+
+// these rows of a file, as Grade all lists them, graded again, their reviewing marks cleared
+const regradeRows = ($: EngineInterface, file: string, text: string, names: string[]): Promise<void> =>
+  busy(async () => {
+    const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
+    const verdicts = await grade($, file, text, names).catch(() => null)
     await update($, existing, r => ({
       ...r,
       results: r.results.map(t => {
@@ -613,6 +784,31 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
     }))
     await saveGrades($)
   })
+
+// At a session's start, the grading a reload of this mod cut off, started again: a Grade all
+// run (Regrade all again if it was one), rows a regrade left reviewing, new tests left
+// pending. A start with grading under way here (a compaction) leaves it to finish
+const resume = async ($: EngineInterface): Promise<void> => {
+  if (working > 0) return
+  const run = await read($, existing)
+  if (run.state === 'running') {
+    await update($, existing, ({ isFresh: _, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
+    soon($, () => gradeAll($, run.isFresh === true))
+  } else {
+    const byFile = new Map<string, string[]>()
+    for (const t of run.results) if (t.isPending) byFile.set(t.file, [...(byFile.get(t.file) ?? []), t.name])
+    for (const [file, names] of byFile) {
+      const text = await $.fs.read(file).catch(() => null)
+      if (text !== null) soon($, () => regradeRows($, file, text, names))
+      // the file is gone: its rows leave with it at the next listing; unmarked till then
+      else await update($, existing, r => ({ ...r, results: r.results.map(t => (t.file === file ? (({ isPending: _, ...rest }) => rest)(t) : t)) }))
+    }
+  }
+  const pending = new Map<string, Map<string, string>>()
+  for (const t of await read($, tests)) {
+    if (t.status === 'pending') pending.set(t.file, (pending.get(t.file) ?? new Map<string, string>()).set(t.id, t.name))
+  }
+  for (const [file, ids] of pending) soon($, () => evaluate($, file, ids))
 }
 
 // At a turn's end: a listed test file changed since last seen, by the shell, an editor or a
@@ -632,7 +828,7 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
     if (before === now) continue
     await update($, seen, all => ({ ...all, [file]: now }))
     if (before === undefined) continue
-    const names = caseNames(text)
+    const names = caseNames(text, file)
     await refresh($, file, names)
     const known = [...(await read($, tests)).filter(t => t.file === file), ...(await read($, existing)).results.filter(t => t.file === file)].map(t => t.name)
     const fresh = [...new Set(names)].filter(n => !among(known, n) && !known.some(k => fits(n, k)))
@@ -645,7 +841,7 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
 const prune = async ($: EngineInterface): Promise<void> => {
   const files = [...new Set([...(await read($, tests)).map(t => t.file), ...(await read($, existing)).results.map(t => t.file)])]
   const present = new Map<string, string[]>()
-  for (const file of files) present.set(file, await $.fs.read(file).then(caseNames, () => []))
+  for (const file of files) present.set(file, await $.fs.read(file).then(text => caseNames(text, file), () => []))
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
   await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
   await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
@@ -666,8 +862,8 @@ const listAll = async ($: EngineInterface): Promise<void> => {
     const text = await $.fs.read(file).catch(() => null)
     if (text === null) continue
     hashes[file] = fingerprint(text)
-    const suites = suitesOf(text)
-    for (const name of new Set(caseNames(text))) {
+    const suites = suitesOf(text, file)
+    for (const name of new Set(caseNames(text, file))) {
       const had = run.results.filter(t => t.file === file && fits(name, t.name))
       cases.push(...(had.length > 0 ? had : [{ file, name, isUngraded: true, ...(suites.has(name) ? { suite: suites.get(name) } : {}) }]))
     }
@@ -680,13 +876,9 @@ const listAll = async ($: EngineInterface): Promise<void> => {
 }
 
 // the line a case opens on: its own it( or test(, a looped case's the loop's; else the top
-const caseLine = (text: string, name: string): number => {
-  for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) {
-      if (fits(nameOf(m), name)) return text.slice(0, (m.index ?? 0) + m[0].length - m[0].trimStart().length).split('\n').length
-    }
-  }
-  return 1
+const caseLine = (text: string, name: string, file: string): number => {
+  const found = casesIn(text, file).find(c => fits(c.name, name))
+  return found ? text.slice(0, found.opens).split('\n').length : 1
 }
 
 // an editor as the system names it: its program, and on macOS the app it is inside
@@ -805,7 +997,7 @@ const openers = async ($: EngineInterface, file: string, line: number): Promise<
 
 // the editor at the case's line, else the file as the system opens it; why nothing did, in the pane
 const openInEditor = async ($: EngineInterface, file: string, name: string): Promise<void> => {
-  const line = await $.fs.read(file).then(text => caseLine(text, name), () => 1)
+  const line = await $.fs.read(file).then(text => caseLine(text, name, file), () => 1)
   let why = ''
   for (const argv of await openers($, file, line)) {
     try {
@@ -848,14 +1040,14 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   if (!evidence) return 'No evidence was given. Nothing was regraded.'
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was regraded.`
-  const caseName = [...new Set(caseNames(text))].find(n => fits(n, name))
+  const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was regraded.`
   const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
   const verdicts = await grade($, file, text, [caseName], evidence).catch(() => null)
   const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
   if (!v) return 'The grader gave no verdict. Nothing was regraded; send it again.'
   const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence }
-  const suite = suitesOf(text).get(caseName)
+  const suite = suitesOf(text, file).get(caseName)
   await update($, existing, r => ({
     ...r,
     results: r.results.some(t => t.file === file && t.name === name)
@@ -886,6 +1078,7 @@ export const register: Register = on => {
     await loadGrades($).catch(() => undefined)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
+    await resume($).catch(error => $.ui.log(`test-grader: the grading a reload cut off could not be resumed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     // each session starts with its files at their default, closed when there are several; a
     // reload of this mod or a compaction starts the same session again, and keeps them
     const id = await $.session.id().catch(() => null)
@@ -908,7 +1101,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Write' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
-      const names = caseNames(e.content)
+      const names = caseNames(e.content, e.file_path)
       await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(e.content) }))
       await refresh($, e.file_path, names)
       // a file written afresh holds its old cases too: only the ones not tracked yet are new
@@ -923,9 +1116,12 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
-      const before = new Set(caseNames(e.old_string))
-      const touched = caseNames(e.new_string)
       const text = await $.fs.read(e.file_path).catch(() => null)
+      // an edit's two strings are pieces of the file: a name they hold is a case only if the
+      // whole file, read as code, has it as one (not as a fixture's text)
+      const isCase = text === null ? () => true : ((all: Set<string>) => (n: string) => all.has(n))(new Set(caseNames(text, e.file_path)))
+      const before = new Set(caseNames(e.old_string, e.file_path))
+      const touched = caseNames(e.new_string, e.file_path).filter(isCase)
       if (text !== null) await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(text) }))
       await refresh($, e.file_path, touched)
       const names = touched.filter(n => !before.has(n))
@@ -1165,10 +1361,10 @@ export const register: Register = on => {
               key="gradeAll"
               label={graded.state === 'running' ? `Grading… ${graded.done}/${graded.total} files done` : 'Grade all tests'}
               // on a timer: a run outlasts the press that starts it
-              onPress={() => (graded.state === 'running' ? undefined : $.clock.after(1, () => void gradeAll($)))}
+              onPress={() => (graded.state === 'running' ? undefined : soon($, () => gradeAll($)))}
             />
             {graded.state !== 'running' && graded.hashes && Object.keys(graded.hashes).length > 0 && (
-              <Button key="regradeAll" label="Regrade all" onPress={() => $.clock.after(1, () => void gradeAll($, true))} />
+              <Button key="regradeAll" label="Regrade all" onPress={() => soon($, () => gradeAll($, true))} />
             )}
           </Box>
         </Box>
