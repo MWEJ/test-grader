@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Coverage, TrackedTest, Verdict } from '../types'
+import type { Coverage, ExistingTest, TrackedTest, Verdict } from '../types'
 
 const PANE = 'test-watch'
 const tests = atom({ plugin: 'test-watch', key: 'tests' } as const, [])
 const coverage = atom({ plugin: 'test-watch', key: 'coverage' } as const, null)
 const run = atom({ plugin: 'test-watch', key: 'run' } as const, { state: 'idle' })
+const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -19,6 +20,9 @@ const MAX_SOURCE = 12_000
 // of a file too long to send whole: at most this much of its head (imports, helpers)
 const MAX_HEAD = 4_000
 const CELLS = 12
+// Grade all tests: cases per grader call, and how many weak or useless ones are listed
+const BATCH = 10
+const MAX_LISTED = 20
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
 const CASE_PATTERNS = [
@@ -86,31 +90,37 @@ const parseVerdicts = (text: string): { name: string; summary: string; verdict: 
   }
 }
 
+type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
+
+// One grader call: these cases of this file, judged; null when the grader gave no answer
+const grade = async ($: EngineInterface, file: string, text: string, names: string[]): Promise<Graded[] | null> => {
+  const source = excerptOf(text, names)
+  const reply = await $.model.complete({
+    model: 'haiku',
+    maxTokens: 1500,
+    system: 'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
+    prompt: [
+      `Test file: ${file}`,
+      `Review ONLY these test cases: ${JSON.stringify(names)}`,
+      'For each, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
+      'verdict: "good" = asserts meaningful behaviour, covers a real case or edge; "weak" = shallow, happy-path only, over-mocked or brittle; "useless" = no real assertions, tautology, tests the mock, snapshot of nothing, or duplicates another test.',
+      'reason: one short sentence justifying the verdict.',
+      'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
+      '',
+      '```',
+      source,
+      '```',
+    ].join('\n'),
+  })
+  return reply.isAnswered ? parseVerdicts(reply.text) : null
+}
+
 const evaluate = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
   const fail = (): Promise<void> =>
     update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' } : t)))
   try {
-    const names = [...ids.values()]
-    const source = excerptOf(await $.fs.read(file), names)
-    const reply = await $.model.complete({
-      model: 'haiku',
-      maxTokens: 1500,
-      system: 'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
-      prompt: [
-        `Test file: ${file}`,
-        `Review ONLY these newly added test cases: ${JSON.stringify(names)}`,
-        'For each, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
-        'verdict: "good" = asserts meaningful behaviour, covers a real case or edge; "weak" = shallow, happy-path only, over-mocked or brittle; "useless" = no real assertions, tautology, tests the mock, snapshot of nothing, or duplicates another test.',
-        'reason: one short sentence justifying the verdict.',
-        'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
-        '',
-        '```',
-        source,
-        '```',
-      ].join('\n'),
-    })
-    if (!reply.isAnswered) return fail()
-    const verdicts = parseVerdicts(reply.text)
+    const verdicts = await grade($, file, await $.fs.read(file), [...ids.values()])
+    if (verdicts === null) return fail()
     await update($, tests, list =>
       list.map(t => {
         if (!ids.has(t.id)) return t
@@ -231,6 +241,38 @@ const runCoverage = async ($: EngineInterface): Promise<void> => {
   }
 }
 
+// Grade all tests: every case of every test file git tracks, a file at a time and
+// BATCH cases a call. A batch the grader fails leaves its cases unrated, and the run goes on
+const gradeAll = async ($: EngineInterface): Promise<void> => {
+  if ((await read($, existing)).state === 'running') return
+  const cwd = await $.session.cwd()
+  const fail = (message: string) => update($, existing, () => ({ state: 'failed', done: 0, total: 0, message, results: [] }))
+  try {
+    const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
+    if (listed.exitCode !== 0) return void (await fail('Not a git repository: there is no list of test files to grade.'))
+    const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f))
+    await update($, existing, () => ({ state: 'running', done: 0, total: files.length, results: [] }))
+    const results: ExistingTest[] = []
+    for (const [i, rel] of files.entries()) {
+      const file = `${cwd}/${rel}`
+      const text = await $.fs.read(file)
+      const names = [...new Set(caseNames(text))]
+      for (let at = 0; at < names.length; at += BATCH) {
+        const batch = names.slice(at, at + BATCH)
+        const verdicts = (await grade($, file, text, batch).catch(() => null)) ?? []
+        for (const name of batch) {
+          const v = verdicts.find(x => x.name === name)
+          results.push(v ? { file, name, verdict: v.verdict, summary: v.summary, reason: v.reason } : { file, name })
+        }
+      }
+      await update($, existing, s => ({ ...s, done: i + 1 }))
+    }
+    await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results }))
+  } catch (err) {
+    await fail(err instanceof Error ? err.message : String(err))
+  }
+}
+
 const track = async ($: EngineInterface, file: string, names: string[]): Promise<void> => {
   const now = await $.clock.now()
   const ids = new Map<string, string>()
@@ -291,6 +333,7 @@ export const register: Register = on => {
     const list = await read($, tests)
     const cov = await read($, coverage)
     const running = await read($, run)
+    const graded = await read($, existing)
     const cwd = await $.session.cwd()
     const now = await $.clock.now()
 
@@ -331,6 +374,36 @@ export const register: Register = on => {
           ))}
           {list.length > shown.length && <Text color={MUTED}>{`+ ${list.length - shown.length} older`}</Text>}
         </Box>
+        {(graded.state !== 'idle' || graded.results.length > 0) && (() => {
+          const of = (v: Verdict): ExistingTest[] => graded.results.filter(t => t.verdict === v)
+          const unrated = graded.results.filter(t => !t.verdict).length
+          const listed = [...of('useless'), ...of('weak')]
+          return (
+            <Box flexDirection="column" marginTop={1} gap={1}>
+              <Box flexDirection="row" gap={2}>
+                <Text bold>Existing tests</Text>
+                {graded.results.length > 0 && (
+                  <Text color={MUTED}>
+                    {[`${graded.results.length} graded`, `${of('good').length} good`, `${of('weak').length} weak`, `${of('useless').length} useless`, ...(unrated > 0 ? [`${unrated} unrated`] : [])].join(' · ')}
+                  </Text>
+                )}
+              </Box>
+              {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
+              {listed.slice(0, MAX_LISTED).map((t, i) => (
+                <Box key={`e-${i}-${t.file}-${t.name}`} flexDirection="column">
+                  <Box flexDirection="row" gap={1}>
+                    <Text bold color={verdictColor(t.verdict)}>{t.verdict}</Text>
+                    <Text bold>{t.name}</Text>
+                  </Box>
+                  <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
+                  {t.summary && <Text>{t.summary}</Text>}
+                  {t.reason && <Text color={verdictColor(t.verdict)}>{t.reason}</Text>}
+                </Box>
+              ))}
+              {listed.length > MAX_LISTED && <Text color={MUTED}>{`+ ${listed.length - MAX_LISTED} more`}</Text>}
+            </Box>
+          )
+        })()}
         <Box flexDirection="column" marginTop={1}>
           <Box flexDirection="row" justifyContent="space-between">
             <Text bold>Coverage</Text>
@@ -364,6 +437,12 @@ export const register: Register = on => {
               key="run"
               label={running.state === 'running' ? 'Running…' : 'Run coverage'}
               onPress={() => (running.state === 'running' ? undefined : runCoverage($))}
+            />
+            <Button
+              key="gradeAll"
+              label={graded.state === 'running' ? `Grading ${Math.min(graded.done + 1, graded.total)}/${graded.total} files…` : 'Grade all tests'}
+              // on a timer: a run outlasts the press that starts it
+              onPress={() => (graded.state === 'running' ? undefined : $.clock.after(1, () => void gradeAll($)))}
             />
             <Button key="clear" label="Clear list" onPress={() => update($, tests, () => [])} />
           </Box>
