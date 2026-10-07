@@ -61,6 +61,8 @@ declare module 'claude-code' {
       openError: string | null
       /** each listed test file's contents as last seen, fingerprinted: a change since is caught at a turn's end */
       seen: Record<string, string>
+      /** the session the open and closed files are kept for: a new one starts them closed */
+      openFor: string | null
     }
   }
 }

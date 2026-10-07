@@ -13,6 +13,7 @@ const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
 const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
 const openError = atom({ plugin: 'test-watch', key: 'openError' } as const, null)
 const seen = atom({ plugin: 'test-watch', key: 'seen' } as const, {})
+const openFor = atom({ plugin: 'test-watch', key: 'openFor' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -771,8 +772,13 @@ export const register: Register = on => {
       .catch(error => $.ui.log(`test-watch: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await refreshCoverage($)
     await prune($).catch(() => undefined)
-    // each session starts with its files at their default, closed when there are several
-    await update($, fileOpen, () => ({}))
+    // each session starts with its files at their default, closed when there are several; a
+    // reload of this mod or a compaction starts the same session again, and keeps them
+    const id = await $.session.id().catch(() => null)
+    if (id === null || id !== (await read($, openFor))) {
+      await update($, fileOpen, () => ({}))
+      await update($, openFor, () => id)
+    }
     void $.ui.open({ id: PANE, title: 'Tests' })
 
     return next(e)

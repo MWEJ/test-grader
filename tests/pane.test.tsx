@@ -135,6 +135,9 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
   on('session.start', async () => ({ cwd: '/proj' }) as never)
   on('session.cwd', async () => ({ value: '/proj' }) as never)
+  // the session's id: a test sets another to start a new session, the same for a reload
+  const session = { id: 's1' }
+  on('session.id', async () => ({ value: session.id }) as never)
   on('fs.stat', async () => {
     throw new Error('missing')
   })
@@ -188,7 +191,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       },
     } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools }
+  return { prompts, notes, runs, logs, budgets, tools, session }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -688,9 +691,9 @@ test('a session start drops the entries whose test is no longer in its file', as
   expect(tree).not.toContain('"goes"')
 })
 
-test('a file pressed open stays open while the session runs, and every file starts closed again at the next start', async ($, on) => {
+test('a file pressed open stays open while the session runs, a reload included, and every file starts closed again in a new session', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  project(on, {
+  const { session } = project(on, {
     'src/a.test.ts': "it('fine one', () => { expect(f(1)).toBe(1) })\n",
     'src/b.test.ts': "it('a shallow check', () => { expect(g).toBeDefined() })\n",
   })
@@ -702,6 +705,12 @@ test('a file pressed open stays open while the session runs, and every file star
   await ui.press({ key: 'f:/proj/src/a.test.ts' })
   expect(JSON.stringify(await ui.drawn())).toContain('▾ src/a.test.ts')
 
+  // a reload of the mod, or a compaction, starts the same session again: what is open stays
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.session.start({ source: 'compact', cwd: '/proj', surface: null, isInteractive: true } as never)
+  expect(JSON.stringify(await ui.drawn())).toContain('▾ src/a.test.ts')
+
+  session.id = 's2'
   await $.session.start({ source: 'resume', cwd: '/proj', surface: null, isInteractive: true } as never)
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('▸ src/a.test.ts')
@@ -1217,4 +1226,20 @@ test('the note on weak tests tells Claude it can send evidence', async ($, on) =
   await clock.advance(10)
 
   expect(notes.at(-1)).toContain('test_evidence')
+})
+
+test('a file pressed open stays open when one of its tests is regraded on evidence', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/e.test.ts': E_TEST, 'src/z.test.ts': "it('zeroes', () => { expect(z()).toBe(0) })\n" }, { rule: swayed })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: `f:${E_FILE}` })
+  expect(JSON.stringify(await ui.drawn())).toContain(`"▾ src/e.test.ts"`)
+
+  await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
+  await clock.advance(10)
+
+  expect(JSON.stringify(await ui.drawn())).toContain(`"▾ src/e.test.ts"`)
 })
