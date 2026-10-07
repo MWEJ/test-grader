@@ -1,3 +1,4 @@
+import { fingerprint } from '../hooks/register'
 import { expect, mock, test } from 'claude-code/testing'
 
 const FILE = '/proj/src/math.test.ts'
@@ -204,7 +205,15 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
     asked.push(text)
     return { text } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked }
+  // the plugin's store, kept across sessions, as JSON reads it back
+  const store: Record<string, unknown> = {}
+  on('store.get', async (_$, e) => ({ value: store[(e as { key: string }).key] }) as never)
+  on('store.set', async (_$, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store[key] = JSON.parse(JSON.stringify(value))
+    return { value: undefined } as never
+  })
+  return { prompts, notes, runs, logs, budgets, tools, session, asked, store }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -1009,7 +1018,7 @@ test('each verdict sits in one column on its title\'s first line, and an opened 
   expect(details?.props?.marginLeft).toBe(width + 1)
 })
 
-test('Grade all tests again grades only the files changed since their last grading, and remembers the rest across sessions',async ($, on) => {
+test('Grade all tests again grades only the files changed since their last grading, and remembers the rest',async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = {
     'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
@@ -1022,7 +1031,7 @@ test('Grade all tests again grades only the files changed since their last gradi
   await clock.advance(10)
   expect(prompts).toHaveLength(2)
 
-  // a later session, one file changed while none watched
+  // later, one file changed while none watched
   files['src/a.test.ts'] = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n"
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   await ui.press({ key: 'gradeAll' })
@@ -1033,6 +1042,76 @@ test('Grade all tests again grades only the files changed since their last gradi
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('3 tests · 2 good · 1 weak')
   expect(tree).toContain('2 graded · 1 remembered')
+})
+
+test('a finished Grade all tests saves its grades and each file\'s fingerprint under the project', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+    'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+  }
+  const { store } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(Object.keys(store)).toEqual(['grades:/proj'])
+  const saved = store['grades:/proj'] as { results: { file: string; name: string; verdict: string }[]; hashes: Record<string, string> }
+  expect(saved.results.map(t => [t.file, t.name, t.verdict])).toEqual([
+    ['/proj/src/a.test.ts', 'adds', 'good'],
+    ['/proj/src/b.test.ts', 'a shallow check', 'weak'],
+  ])
+  expect(saved.hashes).toEqual({ '/proj/src/a.test.ts': fingerprint(files['src/a.test.ts']!), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) })
+})
+
+test('a new session lists the grades saved for its project, and Grade all tests grades again only the files changed since', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const before = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const files: Record<string, string> = {
+    'src/a.test.ts': before + "it('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n",
+    'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+  }
+  const { prompts, store } = project(on, files)
+  // what an earlier session saved, before a.test.ts gained a test
+  store['grades:/proj'] = {
+    results: [
+      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'good', summary: 'Checks adds.', reason: 'good because.' },
+      { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'weak', summary: 'Checks a shallow check.', reason: 'saved weak.' },
+    ],
+    hashes: { '/proj/src/a.test.ts': fingerprint(before), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) },
+    finishedAt: 500_000,
+  }
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'f:/proj/src/b.test.ts' })
+  await ui.press({ key: 'r:/proj/src/b.test.ts:a shallow check' })
+  let tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('saved weak.')
+  expect(tree).toContain('1 ungraded')
+  expect(prompts).toHaveLength(0)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('src/a.test.ts')
+  tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('2 graded · 1 remembered')
+})
+
+test('a regrade on evidence is kept in the store too', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { store } = project(on, { 'src/e.test.ts': E_TEST }, { rule: swayed })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const verdictOf = () => (store['grades:/proj'] as { results: { name: string; verdict: string }[] }).results.find(t => t.name === 'a shallow check')?.verdict
+  expect(verdictOf()).toBe('weak')
+  await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
+  await clock.advance(10)
+  expect(verdictOf()).toBe('good')
 })
 
 test('Grade all tests again grades a file whose last grading left a test unrated', async ($, on) => {
@@ -1442,8 +1521,9 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/b.test.ts', content: shallow } as never)
   await clock.advance(10)
   expect(asked).toEqual([])
-  // the kit takes no appended row in this build: the mod's debug line says which way a note went
-  const added = () => logs.filter(l => l.startsWith('test-grader: note to Claude (not appended: no implementation for session.append): '))
+  // the mod's debug line says which way a note went: added to the conversation (or, where the
+  // kit takes no appended row, refused for that), not sent as a prompt
+  const added = () => logs.filter(l => /^test-grader: note to Claude \((appended|not appended: no implementation for session\.append)\): /.test(l))
   expect(added()).toEqual([expect.stringMatching(/: New tests graded weak or useless/)])
 
   for (const key of ['gradeAll', 'regradeAll', 'run']) {

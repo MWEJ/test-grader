@@ -434,10 +434,39 @@ const existingNote = (results: ExistingTest[], cwd: string): string => {
 // PARALLEL calls at once; the results keep file order. A batch the grader fails leaves
 // its cases unrated, and the run goes on
 // a file's contents, fingerprinted (FNV-1a), with its length
-const fingerprint = (text: string): string => {
+export const fingerprint = (text: string): string => {
   let hash = 0x811c9dc5
   for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193)
   return `${(hash >>> 0).toString(16)}-${text.length}`
+}
+
+// The project's grades outlive the session: kept in the store under the project's folder,
+// with each graded file's fingerprint, so a later session lists them and Grade all tests
+// grades again only the files changed since. Listed-but-ungraded rows are not kept
+type SavedGrades = { results: ExistingTest[]; hashes: Record<string, string>; finishedAt?: number }
+const gradesKey = (cwd: string): string => `grades:${cwd}`
+
+const saveGrades = async ($: EngineInterface): Promise<void> => {
+  const cwd = await $.session.cwd()
+  if (!cwd) return
+  const run = await read($, existing)
+  const saved: SavedGrades = {
+    results: run.results.filter(t => !t.isUngraded).map(({ isPending: _, ...t }) => t),
+    hashes: run.hashes ?? {},
+    ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
+  }
+  await $.store.set(gradesKey(cwd), saved).catch(error => $.ui.log(`test-grader: the grades could not be saved: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+}
+
+// at a session's start, one that has graded nothing yet takes the project's saved grades
+const loadGrades = async ($: EngineInterface): Promise<void> => {
+  const run = await read($, existing)
+  if (run.hashes || run.results.some(t => !t.isUngraded)) return
+  const cwd = await $.session.cwd()
+  if (!cwd) return
+  const saved = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as SavedGrades | undefined
+  if (!saved || !Array.isArray(saved.results)) return
+  await update($, existing, r => ({ ...r, results: saved.results, hashes: saved.hashes ?? {}, ...(saved.finishedAt === undefined ? {} : { finishedAt: saved.finishedAt }) }))
 }
 
 // isFresh: grade every file again, the remembered ones too
@@ -516,6 +545,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
     const finishedAt = await $.clock.now()
     const graded = results.length - remembered
     await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt, hashes, graded, remembered }))
+    await saveGrades($)
     await update($, seen, all => ({ ...all, ...hashes }))
     await share($, existingNote(results, cwd), results.some(t => t.verdict !== 'good') ? GRADE_NUDGE : GRADE_CLEAN_NUDGE)
   } catch (err) {
@@ -581,6 +611,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
         return { file: t.file, name: t.name, ...(t.suite ? { suite: t.suite } : {}), ...(v ? { verdict: v.verdict, summary: v.summary, reason: v.reason } : {}) }
       }),
     }))
+    await saveGrades($)
   })
 }
 
@@ -618,6 +649,7 @@ const prune = async ($: EngineInterface): Promise<void> => {
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
   await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
   await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
+  await saveGrades($)
 }
 
 // The project's tests as the pane first shows them: every case of every test file git
@@ -831,6 +863,7 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
       : [...r.results, { file, name, ...(suite ? { suite } : {}), ...judged }],
   }))
   await update($, tests, list => list.map(t => (t.file === file && t.name === name && t.status !== 'pending' ? { ...t, status: 'done' as const, ...judged } : t)))
+  await saveGrades($)
   return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}`
 }
 
@@ -842,7 +875,7 @@ export const register: Register = on => {
   )
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'tests', description: 'Open the test-grader pane (new tests, their quality, coverage)' })
+    await $.command.register({ name: 'test-grader', description: 'Open the test-grader pane (new tests, their quality, coverage)' })
     await $.tool
       .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
@@ -850,6 +883,7 @@ export const register: Register = on => {
     // the coverage run this project has, if any: the pane offers it only then
     const cover = await detectCommand($, await $.session.cwd()).catch(() => undefined)
     await update($, coverWith, () => cover?.label ?? null)
+    await loadGrades($).catch(() => undefined)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
     // each session starts with its files at their default, closed when there are several; a
@@ -864,7 +898,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'tests' }, async $ => {
+  on('command.run', { command: 'test-grader' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Tests' })
     await refreshCoverage($)
 
