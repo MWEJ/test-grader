@@ -10,6 +10,7 @@ const run = atom({ plugin: 'test-watch', key: 'run' } as const, { state: 'idle' 
 const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
 const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null)
 const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
+const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -457,6 +458,8 @@ export const register: Register = on => {
     await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
     await refreshCoverage($)
     await prune($).catch(() => undefined)
+    // each session starts with its files at their default, closed when there are several
+    await update($, fileOpen, () => ({}))
     void $.ui.open({ id: PANE, title: 'Tests' })
 
     return next(e)
@@ -515,6 +518,7 @@ export const register: Register = on => {
 
     const columns = e.viewport?.columns ?? 60
     const isOpen = new Set(await read($, opened))
+    const filesOpen = await read($, fileOpen)
     const toggle = (key: string): Promise<void> =>
       update($, opened, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key].slice(-MAX_TESTS)))
 
@@ -563,8 +567,8 @@ export const register: Register = on => {
     const drawn: unknown[] = []
     for (const { file, of } of files) {
       const fileKey = `f:${file}`
-      // one file starts open, several start closed; a press flips it
-      const open = (files.length === 1) !== isOpen.has(fileKey)
+      // one file starts open, several start closed; a press sets it, until the next session
+      const open = filesOpen[file] ?? files.length === 1
       const worst = of[0]!.state
       const fileCounts = [
         `${of.length}`,
@@ -573,7 +577,7 @@ export const register: Register = on => {
       ].join(' · ')
       drawn.push(
         <Box key={`fh-${file}`} flexDirection="row" gap={1}>
-          <Button key={fileKey} plain label={`${open ? '▾' : '▸'} ${clamp(shortPath(file, cwd), Math.max(16, columns - fileCounts.length - 10))}`} onPress={() => toggle(fileKey)} />
+          <Button key={fileKey} plain label={`${open ? '▾' : '▸'} ${clamp(shortPath(file, cwd), Math.max(16, columns - fileCounts.length - 10))}`} onPress={() => update($, fileOpen, all => ({ ...all, [file]: !open }))} />
           <Text color={worst === 'good' ? GREEN : stateColor(worst)}>{fileCounts}</Text>
           {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
         </Box>,

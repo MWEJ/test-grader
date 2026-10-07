@@ -39,6 +39,8 @@ declare module 'claude-code' {
       noteError: string | null
       /** the rows pressed open in the pane, by their key */
       open: string[]
+      /** a file pressed open (true) or closed (false) this session; absent, its default */
+      fileOpen: Record<string, boolean>
     }
   }
 }

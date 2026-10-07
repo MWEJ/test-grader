@@ -656,3 +656,23 @@ test('a session start drops the entries whose test is no longer in its file', as
   expect(tree).toContain('stays')
   expect(tree).not.toContain('"goes"')
 })
+
+test('a file pressed open stays open while the session runs, and every file starts closed again at the next start', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, {
+    'src/a.test.ts': "it('fine one', () => { expect(f(1)).toBe(1) })\n",
+    'src/b.test.ts': "it('a shallow check', () => { expect(g).toBeDefined() })\n",
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  await ui.press({ key: 'f:/proj/src/a.test.ts' })
+  expect(JSON.stringify(await ui.drawn())).toContain('▾ src/a.test.ts')
+
+  await $.session.start({ source: 'resume', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('▸ src/a.test.ts')
+  expect(tree).toContain('▸ src/b.test.ts')
+})
