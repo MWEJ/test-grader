@@ -24,7 +24,7 @@ export type Coverage = {
 export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean }
 
 /** Grade all tests: how far a run has got, and what the last one found */
-export type ExistingRun = { state: 'idle' | 'running' | 'failed'; done: number; total: number; message?: string; results: ExistingTest[] }
+export type ExistingRun = { state: 'idle' | 'running' | 'failed'; done: number; total: number; message?: string; results: ExistingTest[]; finishedAt?: number }
 
 export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: string }
 

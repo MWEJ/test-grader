@@ -26,7 +26,6 @@ const CELLS = 12
 const BATCH = 10
 // grader calls in flight at once
 const PARALLEL = 4
-const MAX_LISTED = 20
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
 // a JS case opens its own line, so one quoted inside a fixture string is not one; its
@@ -374,7 +373,8 @@ const gradeAll = async ($: EngineInterface): Promise<void> => {
     }
     await Promise.all(Array.from({ length: Math.min(PARALLEL, jobs.length) }, worker))
     const results = perFile.flatMap(f => f.slots.flat())
-    await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results }))
+    const finishedAt = await $.clock.now()
+    await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt }))
     await share($, existingNote(results, cwd))
   } catch (err) {
     await fail(err instanceof Error ? err.message : String(err))
@@ -441,10 +441,22 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   })
 }
 
+// At a session's start: an entry whose test is no longer among its file's cases, or whose
+// file is gone, was changed while no session watched it, and leaves both lists
+const prune = async ($: EngineInterface): Promise<void> => {
+  const files = [...new Set([...(await read($, tests)).map(t => t.file), ...(await read($, existing)).results.map(t => t.file)])]
+  const present = new Map<string, string[]>()
+  for (const file of files) present.set(file, await $.fs.read(file).then(caseNames, () => []))
+  const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
+  await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
+  await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
     await refreshCoverage($)
+    await prune($).catch(() => undefined)
     void $.ui.open({ id: PANE, title: 'Tests' })
 
     return next(e)
@@ -492,39 +504,101 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const list = await read($, tests)
+    const cwd = await $.session.cwd()
+    // only this session's folder: a test written elsewhere is graded and told, not listed
+    const list = (await read($, tests)).filter(t => cwd !== '' && t.file.startsWith(`${cwd}/`))
     const cov = await read($, coverage)
     const running = await read($, run)
     const graded = await read($, existing)
     const noteFailed = await read($, noteError)
-    const cwd = await $.session.cwd()
     const now = await $.clock.now()
 
-    const rows = e.viewport?.rows ?? 30
     const columns = e.viewport?.columns ?? 60
-    const room = Math.max(1, rows - 16)
     const isOpen = new Set(await read($, opened))
     const toggle = (key: string): Promise<void> =>
       update($, opened, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key].slice(-MAX_TESTS)))
-    // one line: the verdict, then the name, pressed open for the file, the summary and the reason
-    const row = (key: string, label: string, color: string, t: { file: string; name: string; summary?: string }, reason: string | undefined, reasonColor: string) => (
-      <Box key={`row-${key}`} flexDirection="column">
-        <Box flexDirection="row" gap={1}>
-          <Text bold color={color}>{label}</Text>
-          <Button key={key} plain label={clamp(t.name, Math.max(12, columns - label.length - 4))} onPress={() => toggle(key)} />
-        </Box>
-        {isOpen.has(key) && (
-          <Box flexDirection="column" marginLeft={2}>
-            <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
-            {t.summary && <Text>{t.summary}</Text>}
-            {reason && <Text color={reasonColor}>{reason}</Text>}
-          </Box>
-        )}
-      </Box>
-    )
-    const shown = [...list].reverse().slice(0, room)
-    const count = (v: Verdict): number => list.filter(t => t.verdict === v).length
-    const pending = list.filter(t => t.status === 'pending').length
+
+    // One list: the last Grade all tests run and the tests written this session, a test in
+    // both once, with the newer verdict; one written this session is marked new
+    type State = Verdict | 'unrated' | 'reviewing'
+    type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean }
+    const merged = new Map<string, Entry>()
+    for (const t of graded.results) {
+      const state: State = t.isPending ? 'reviewing' : (t.verdict ?? 'unrated')
+      merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false })
+    }
+    for (const t of list) {
+      const key = `${t.file}:${t.name}`
+      const prev = merged.get(key)
+      const state: State = t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated')
+      const isNewer = !prev || graded.finishedAt === undefined || t.at >= graded.finishedAt
+      merged.set(key, isNewer ? { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: true } : { ...prev, isNew: true })
+    }
+    const entries = [...merged.values()]
+    const tally = (of: Entry[], s: State): number => of.filter(t => t.state === s).length
+
+    // grouped by file, worst file first; in a file the worst test first, the new ahead
+    const RANK: Record<State, number> = { useless: 0, weak: 1, unrated: 2, reviewing: 3, good: 4 }
+    const byFile = new Map<string, Entry[]>()
+    for (const t of entries) byFile.set(t.file, [...(byFile.get(t.file) ?? []), t])
+    const files = [...byFile.entries()]
+      .map(([file, of]) => ({ file, of: [...of].sort((a, b) => RANK[a.state] - RANK[b.state] || Number(b.isNew) - Number(a.isNew)) }))
+      .sort((a, b) =>
+        tally(b.of, 'useless') - tally(a.of, 'useless') || tally(b.of, 'weak') - tally(a.of, 'weak') ||
+        tally(b.of, 'unrated') - tally(a.of, 'unrated') || a.file.localeCompare(b.file))
+    const stateColor = (s: State): string => (s === 'good' || s === 'weak' || s === 'useless' ? verdictColor(s) : MUTED)
+    const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+
+    const counts = [
+      plural(entries.length, 'test'),
+      `${tally(entries, 'good')} good`,
+      `${tally(entries, 'weak')} weak`,
+      `${tally(entries, 'useless')} useless`,
+      ...(tally(entries, 'unrated') > 0 ? [`${tally(entries, 'unrated')} unrated`] : []),
+      ...(tally(entries, 'reviewing') > 0 ? [`${tally(entries, 'reviewing')} reviewing`] : []),
+      ...(list.length > 0 ? [`${new Set(list.map(t => `${t.file}:${t.name}`)).size} new`] : []),
+    ].join(' · ')
+
+    // a file's header line, and when it is open every one of its tests, the pane scrolling
+    const drawn: unknown[] = []
+    for (const { file, of } of files) {
+      const fileKey = `f:${file}`
+      // one file starts open, several start closed; a press flips it
+      const open = (files.length === 1) !== isOpen.has(fileKey)
+      const worst = of[0]!.state
+      const fileCounts = [
+        `${of.length}`,
+        `${tally(of, 'good')} good`,
+        ...(['weak', 'useless', 'unrated', 'reviewing'] as const).filter(s => tally(of, s) > 0).map(s => `${tally(of, s)} ${s}`),
+      ].join(' · ')
+      drawn.push(
+        <Box key={`fh-${file}`} flexDirection="row" gap={1}>
+          <Button key={fileKey} plain label={`${open ? '▾' : '▸'} ${clamp(shortPath(file, cwd), Math.max(16, columns - fileCounts.length - 10))}`} onPress={() => toggle(fileKey)} />
+          <Text color={worst === 'good' ? GREEN : stateColor(worst)}>{fileCounts}</Text>
+          {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
+        </Box>,
+      )
+      if (!open) continue
+      for (const t of of) {
+        const key = `r:${t.file}:${t.name}`
+        const reason = t.state === 'unrated' ? 'The grader gave no verdict for this test. Grade again to retry it.' : t.reason
+        drawn.push(
+          <Box key={`row-${key}`} flexDirection="column" marginLeft={2}>
+            <Box flexDirection="row" gap={1}>
+              <Text bold color={stateColor(t.state)}>{t.state}</Text>
+              <Button key={key} plain label={clamp(t.name, Math.max(12, columns - t.state.length - (t.isNew ? 10 : 6)))} onPress={() => toggle(key)} />
+              {t.isNew && <Text color={VIOLET}>new</Text>}
+            </Box>
+            {isOpen.has(key) && (
+              <Box flexDirection="column" marginLeft={2}>
+                {t.summary && <Text>{t.summary}</Text>}
+                {reason && <Text color={stateColor(t.state)}>{reason}</Text>}
+              </Box>
+            )}
+          </Box>,
+        )
+      }
+    }
 
     const metrics: [string, number | null][] = cov
       ? [['Lines', cov.lines], ['Statements', cov.statements], ['Branches', cov.branches], ['Functions', cov.functions]]
@@ -533,58 +607,14 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" flexGrow={1}>
-        <Box flexDirection="row" gap={2}>
-          <Text bold color={VIOLET}>{`${list.length} new tests`}</Text>
-          <Text color={GREEN}>{`${count('good')} good`}</Text>
-          <Text color={AMBER}>{`${count('weak')} weak`}</Text>
-          <Text color={RED}>{`${count('useless')} useless`}</Text>
-          {pending > 0 && <Text color={MUTED}>{`${pending} reviewing`}</Text>}
-        </Box>
+        <Text bold color={VIOLET}>{counts}</Text>
+        {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
         <Box flexDirection="column" flexGrow={1} marginTop={1}>
-          {list.length === 0 && <Text color={MUTED}>No new tests yet. They show up here as they are written.</Text>}
-          {shown.map(t =>
-            row(
-              `t:${t.file}:${t.name}`,
-              t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated'),
-              verdictColor(t.verdict),
-              t,
-              t.status === 'failed' ? 'The grader gave no verdict for this test.' : t.reason,
-              t.status === 'failed' ? MUTED : verdictColor(t.verdict),
-            ),
+          {entries.length === 0 && (
+            <Text color={MUTED}>No tests yet. New tests show up here as they are written; Grade all tests grades the ones already there.</Text>
           )}
-          {list.length > shown.length && <Text color={MUTED}>{`+ ${list.length - shown.length} older`}</Text>}
+          {drawn as never}
         </Box>
-        {(graded.state !== 'idle' || graded.results.length > 0) && (() => {
-          const of = (v: Verdict): ExistingTest[] => graded.results.filter(t => t.verdict === v)
-          const unrated = graded.results.filter(t => !t.verdict).length
-          const listed = [...of('useless'), ...of('weak'), ...graded.results.filter(t => !t.verdict)]
-          return (
-            <Box flexDirection="column" marginTop={1} gap={1}>
-              <Box flexDirection="row" gap={2}>
-                <Text bold>Existing tests</Text>
-                {graded.results.length > 0 && (
-                  <Text color={MUTED}>
-                    {[`${graded.results.length} graded`, `${of('good').length} good`, `${of('weak').length} weak`, `${of('useless').length} useless`, ...(unrated > 0 ? [`${unrated} unrated`] : [])].join(' · ')}
-                  </Text>
-                )}
-              </Box>
-              {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
-              <Box flexDirection="column">
-                {listed.slice(0, MAX_LISTED).map(t =>
-                  row(
-                    `e:${t.file}:${t.name}`,
-                    t.isPending ? 'reviewing' : (t.verdict ?? 'unrated'),
-                    t.isPending ? MUTED : verdictColor(t.verdict),
-                    t,
-                    t.verdict ? t.reason : 'The grader gave no verdict for this test. Grade again to retry it.',
-                    t.verdict ? verdictColor(t.verdict) : MUTED,
-                  ),
-                )}
-              </Box>
-              {listed.length > MAX_LISTED && <Text color={MUTED}>{`+ ${listed.length - MAX_LISTED} more`}</Text>}
-            </Box>
-          )
-        })()}
         {noteFailed !== null && <Text color={RED}>{`Couldn't share the result with Claude: ${noteFailed}`}</Text>}
         <Box flexDirection="column" marginTop={1}>
           <Box flexDirection="row" justifyContent="space-between">

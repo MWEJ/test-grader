@@ -40,9 +40,9 @@ for (const surface of ['desktop', 'terminal'] as const) {
       requestId: 'test-watch',
       props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
     })
-    await ui.press({ key: `t:${FILE}:does nothing` })
+    await ui.press({ key: `r:${FILE}:does nothing` })
     const tree = JSON.stringify(await ui.drawn())
-    expect(tree).toContain('2 new tests')
+    expect(tree).toContain('2 tests · 1 good · 0 weak · 1 useless · 2 new')
     expect(tree).toContain('adds numbers')
     expect(tree).toContain('Tautology.')
     expect(tree).toContain('1 useless')
@@ -65,7 +65,7 @@ test('a non-test file is ignored', async ($, on) => {
     requestId: 'test-watch',
     props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
   })
-  expect(JSON.stringify(await ui.drawn())).toContain('0 new tests')
+  expect(JSON.stringify(await ui.drawn())).toContain('0 tests · 0 good · 0 weak · 0 useless"')
 })
 
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
@@ -178,21 +178,20 @@ test('Grade all tests grades every case of every test file git tracks, in batche
   // one call for the small file, three (10 + 10 + 4) for the big one
   expect(prompts).toHaveLength(4)
   expect(prompts.every(p => p.includes('Test file: /proj/src/'))).toBe(true)
-  await ui.press({ key: 'e:/proj/src/math.test.ts:does nothing' })
-  await ui.press({ key: 'e:/proj/src/big.test.ts:a shallow check' })
+  // two files, so both start closed
+  await ui.press({ key: 'f:/proj/src/math.test.ts' })
+  await ui.press({ key: 'f:/proj/src/big.test.ts' })
+  await ui.press({ key: 'r:/proj/src/math.test.ts:does nothing' })
+  await ui.press({ key: 'r:/proj/src/big.test.ts:a shallow check' })
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('Existing tests')
-  expect(tree).toContain('26 graded')
-  expect(tree).toContain('24 good')
-  expect(tree).toContain('1 weak')
-  expect(tree).toContain('1 useless')
+  // nothing written this session, so nothing is new
+  expect(tree).toContain('26 tests · 24 good · 1 weak · 1 useless"')
   // listed: the useless before the weak; the good are counted, not listed
   expect(tree).toContain('useless because.')
   expect(tree).toContain('weak because.')
   expect(tree.indexOf('does nothing')).toBeLessThan(tree.indexOf('a shallow check'))
-  expect(tree).not.toContain('case 7')
-  // the new-tests list is untouched
-  expect(tree).toContain('0 new tests')
+  // the good are listed too, after the weak in their file
+  expect(tree.indexOf('a shallow check')).toBeLessThan(tree.indexOf('case 7'))
 })
 
 test('while grading, the button says how far it has got; pressing again grades afresh', async ($, on) => {
@@ -214,12 +213,12 @@ test('while grading, the button says how far it has got; pressing again grades a
   expect(JSON.stringify(await ui.drawn())).toContain('Grading… 1/2 files done')
   release()
   await clock.advance(10)
-  expect(JSON.stringify(await ui.drawn())).toContain('2 graded')
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests')
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   expect(prompts).toHaveLength(4)
-  expect(JSON.stringify(await ui.drawn())).toContain('2 graded')
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests')
 })
 
 test('Grade all tests outside a git repo says so and grades nothing', async ($, on) => {
@@ -262,9 +261,7 @@ test('a test generated in a loop is graded case by case: the loop and its data r
   expect(prompts[0]).toContain('generated in a loop')
   const tree = JSON.stringify(await ui.drawn())
   // first, and the loop's three cases; the stray name is dropped
-  expect(tree).toContain('4 graded')
-  expect(tree).toContain('3 good')
-  expect(tree).toContain('1 weak')
+  expect(tree).toContain('4 tests · 3 good · 1 weak')
   expect(tree).toContain('rounds huge shallow')
   expect(tree).not.toContain('unrated')
   expect(tree).not.toContain('something else')
@@ -304,8 +301,9 @@ test('a new looped test becomes one entry per case it generates', async ($, on) 
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/round.test.ts', content } as never)
   await clock.advance(10)
 
-  const tree = JSON.stringify(await (await mount($)).drawn())
-  expect(tree).toContain('2 new tests')
+  const ui = await mount($)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('· 2 new')
   expect(tree).toContain('rounds tiny')
   expect(tree).toContain('rounds huge')
   expect(tree).not.toContain('unrated')
@@ -335,9 +333,10 @@ test('Grade all tests runs up to 4 grader calls at once, and keeps the results i
   held.release()
   await clock.advance(10)
 
+  await ui.press({ key: 'f:/proj/a.test.ts' })
+  await ui.press({ key: 'f:/proj/b.test.ts' })
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('45 graded')
-  expect(tree).toContain('2 weak')
+  expect(tree).toContain('45 tests · 43 good · 2 weak')
   expect(tree.indexOf('a shallow one')).toBeLessThan(tree.indexOf('b shallow one'))
 })
 
@@ -373,17 +372,17 @@ test('the pane lists an unrated test after the weak, with its file, so it can be
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  await ui.press({ key: 'e:/proj/src/more.test.ts:lost ${x}' })
+  await ui.press({ key: 'r:/proj/src/more.test.ts:lost ${x}' })
 
   const tree = JSON.stringify(await ui.drawn())
   const weakAt = tree.indexOf('"a shallow check"')
   const unratedAt = tree.indexOf('"lost ${x}"')
   expect(weakAt).toBeGreaterThan(-1)
   expect(unratedAt).toBeGreaterThan(weakAt)
-  // under the unrated test's name: its label, its file and why it has no verdict
+  // under its file's header; at its name, its label and why it has no verdict
+  expect(tree.indexOf('▾ src/more.test.ts')).toBeLessThan(unratedAt)
   const entry = tree.slice(unratedAt - 120, unratedAt + 700)
   expect(entry).toContain('"unrated"')
-  expect(entry).toContain('"src/more.test.ts"')
   expect(entry).toContain('The grader gave no verdict for this test.')
 })
 
@@ -416,7 +415,7 @@ test('a note the session does not take says so in the pane, and why', async ($, 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('1 graded')
+  expect(tree).toContain('1 test ·')
   expect(tree).toContain("Couldn't share the result with Claude: no implementation for session.append")
 })
 
@@ -460,7 +459,7 @@ test('a test name with an escaped quote is read whole, so the grader\'s verdict 
 
   expect(prompts[0]).toContain('["the command\'s status"]')
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('1 graded · 1 good · 0 weak · 0 useless')
+  expect(tree).toContain('1 test · 1 good · 0 weak · 0 useless')
   expect(tree).not.toContain('unrated')
 })
 
@@ -474,8 +473,9 @@ test('a test written inside a fixture string is not a test', async ($, on) => {
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/f.test.ts', content } as never)
   await clock.advance(10)
 
-  const tree = JSON.stringify(await (await mount($)).drawn())
-  expect(tree).toContain('1 new tests')
+  const ui = await mount($)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 test · 1 good · 0 weak · 0 useless · 1 new')
   expect(tree).toContain('real one')
   expect(tree).not.toContain('inner fixture')
 })
@@ -493,13 +493,13 @@ test('each test is one line until pressed open, and a second press closes it', a
   expect(closed).not.toContain('weak because.')
   expect(closed).not.toContain('Checks a shallow check.')
 
-  await ui.press({ key: 'e:/proj/src/more.test.ts:a shallow check' })
+  await ui.press({ key: 'r:/proj/src/more.test.ts:a shallow check' })
   const open = JSON.stringify(await ui.drawn())
   expect(open).toContain('src/more.test.ts')
   expect(open).toContain('Checks a shallow check.')
   expect(open).toContain('weak because.')
 
-  await ui.press({ key: 'e:/proj/src/more.test.ts:a shallow check' })
+  await ui.press({ key: 'r:/proj/src/more.test.ts:a shallow check' })
   expect(JSON.stringify(await ui.drawn())).not.toContain('weak because.')
 })
 
@@ -522,8 +522,8 @@ test('a test the session deletes leaves both lists', async ($, on) => {
 
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).not.toContain('a shallow check')
-  expect(tree).toContain('1 new tests')
-  expect(tree).toContain('1 graded · 1 good · 0 weak')
+  // the test written this session and the graded one are the same test, once
+  expect(tree).toContain('1 test · 1 good · 0 weak · 0 useless · 1 new')
 })
 
 test('a weak test the session edits is graded again, and its new verdict replaces the old', async ($, on) => {
@@ -538,7 +538,7 @@ test('a weak test the session edits is graded again, and its new verdict replace
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(JSON.stringify(await ui.drawn())).toContain('1 graded · 0 good · 1 weak')
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 good · 1 weak')
 
   files['src/more.test.ts'] = after
   await $.tool.call({ tool: 'Edit', file_path: '/proj/src/more.test.ts', old_string: before, new_string: after } as never)
@@ -547,7 +547,112 @@ test('a weak test the session edits is graded again, and its new verdict replace
   expect(prompts).toHaveLength(2)
   expect(prompts[1]).toContain('["a shallow check"]')
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('1 graded · 1 good · 0 weak')
   // an edit to a test already there is no new test
-  expect(tree).toContain('0 new tests')
+  expect(tree).toContain('1 test · 1 good · 0 weak · 0 useless"')
+})
+
+test('tests are grouped by file, the worst file first; with several files each starts closed, and a press opens it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, {
+    'src/a.test.ts': "it('fine one', () => { expect(f(1)).toBe(1) })\nit('fine two', () => { expect(f(2)).toBe(2) })\n",
+    'src/b.test.ts': "it('solid', () => { expect(g(1)).toBe(2) })\nit('a shallow check', () => { expect(g).toBeDefined() })\n",
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('4 tests · 3 good · 1 weak · 0 useless')
+  // b has the weak test, so it comes first; both closed, counted on their header lines
+  expect(tree.indexOf('▸ src/b.test.ts')).toBeGreaterThan(-1)
+  expect(tree.indexOf('▸ src/b.test.ts')).toBeLessThan(tree.indexOf('▸ src/a.test.ts'))
+  expect(tree).toContain('2 · 1 good · 1 weak')
+  // an all-good file's counts in green
+  expect(tree).toContain('{"color":"#4ade80"},"children":["2 · 2 good"]')
+  expect(tree).not.toContain('a shallow check')
+  expect(tree).not.toContain('fine one')
+
+  await ui.press({ key: 'f:/proj/src/b.test.ts' })
+  const opened = JSON.stringify(await ui.drawn())
+  expect(opened).toContain('▾ src/b.test.ts')
+  expect(opened.indexOf('a shallow check')).toBeLessThan(opened.indexOf('"solid"'))
+  expect(opened).not.toContain('fine one')
+})
+
+test('a single file starts open, and every one of its tests is listed, however many', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const many = Array.from({ length: 80 }, (_, i) => `it('case ${i}', () => { expect(f(${i})).toBe(${i}) })\n`).join('')
+  project(on, { 'src/big.test.ts': many })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($, 30)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('▾ src/big.test.ts')
+  expect(tree).toContain('"case 0"')
+  expect(tree).toContain('"case 79"')
+  expect(tree).not.toContain('more test')
+})
+
+test('a test written this session and graded again by Grade all tests shows once, marked new, with the newer verdict', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/c.test.ts': "it('a shallow check', () => { expect(h).toBeDefined() })\n" }
+  // weak when written, good by the time Grade all tests reads it
+  let isLater = false
+  project(on, files, { rule: () => (isLater ? 'good' : 'weak') })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/c.test.ts', content: files['src/c.test.ts'] } as never)
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 good · 1 weak · 0 useless · 1 new')
+
+  isLater = true
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 test · 1 good · 0 weak · 0 useless · 1 new')
+  expect(tree.split('"a shallow check"')).toHaveLength(2)
+})
+
+test('a test written outside the session\'s folder is graded but not listed', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
+  const { prompts, notes } = project(on, { '/elsewhere/x.test.ts': content })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/elsewhere/x.test.ts', content } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  expect(notes).toHaveLength(1)
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).not.toContain('a shallow check')
+  expect(tree).toContain('0 tests · 0 good · 0 weak · 0 useless"')
+})
+
+test('a session start drops the entries whose test is no longer in its file', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/s.test.ts': "it('stays', () => { expect(f(1)).toBe(1) })\nit('goes', () => { expect(f(2)).toBe(2) })\n" }
+  project(on, files)
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/s.test.ts', content: files['src/s.test.ts'] } as never)
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests ·')
+
+  // changed while no session watched it
+  files['src/s.test.ts'] = "it('stays', () => { expect(f(1)).toBe(1) })\n"
+  await $.session.start({ source: 'resume', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 test · 1 good')
+  expect(tree).toContain('stays')
+  expect(tree).not.toContain('"goes"')
 })
