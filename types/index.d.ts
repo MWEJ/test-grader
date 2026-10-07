@@ -21,7 +21,7 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string }
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean }
 
 /** Grade all tests: how far a run has got, and what the last one found */
 export type ExistingRun = { state: 'idle' | 'running' | 'failed'; done: number; total: number; message?: string; results: ExistingTest[] }
@@ -37,6 +37,8 @@ declare module 'claude-code' {
       existing: ExistingRun
       /** why the last note to Claude was not added, until one is */
       noteError: string | null
+      /** the rows pressed open in the pane, by their key */
+      open: string[]
     }
   }
 }

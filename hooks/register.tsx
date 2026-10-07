@@ -9,6 +9,7 @@ const coverage = atom({ plugin: 'test-watch', key: 'coverage' } as const, null)
 const run = atom({ plugin: 'test-watch', key: 'run' } as const, { state: 'idle' })
 const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
 const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null)
+const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -28,8 +29,10 @@ const PARALLEL = 4
 const MAX_LISTED = 20
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
+// a JS case opens its own line, so one quoted inside a fixture string is not one; its
+// name runs to the closing quote, past any escaped one
 const CASE_PATTERNS = [
-  /\b(?:it|test)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])(.+?)\1/g,
+  /^[ \t]*(?:it|test)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\\n])+)\1/gm,
   /^\s*(?:async\s+)?def\s+(test_\w+)/gm,
   /\bfunc\s+(Test\w+)\s*\(/g,
   /\bfunc\s+(test\w+)\s*\(/g,
@@ -43,10 +46,12 @@ const pctColor = (p: number): string => (p >= 80 ? GREEN : p >= 50 ? AMBER : RED
 
 const shortPath = (file: string, cwd: string): string => (cwd && file.startsWith(`${cwd}/`) ? file.slice(cwd.length + 1) : file)
 
+const nameOf = (m: RegExpMatchArray): string => (m[2] ?? (m[1] as string)).replace(/\\(.)/g, '$1')
+
 const caseNames = (text: string): string[] => {
   const names: string[] = []
   for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) names.push((m[2] ?? m[1]) as string)
+    for (const m of text.matchAll(pattern)) names.push(nameOf(m))
   }
   return names
 }
@@ -60,7 +65,7 @@ const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n 
 const caseStarts = (text: string): { name: string; at: number }[] => {
   const found: { name: string; at: number }[] = []
   for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) found.push({ name: (m[2] ?? m[1]) as string, at: m.index ?? 0 })
+    for (const m of text.matchAll(pattern)) found.push({ name: nameOf(m), at: m.index ?? 0 })
   }
   found.sort((a, b) => a.at - b.at)
   return found.map((start, i) => {
@@ -388,6 +393,54 @@ const track = async ($: EngineInterface, file: string, names: string[]): Promise
   $.clock.after(1, () => void evaluate($, file, ids))
 }
 
+// whether a name the lists hold is still among a file's cases: itself, or a case of a loop
+const among = (names: string[], name: string): boolean => names.some(n => fits(n, name))
+
+// After the session writes a test file: entries for cases no longer in it leave both lists,
+// and the weak, useless and unrated ones the change touched are graded again
+const refresh = async ($: EngineInterface, file: string, touched: string[]): Promise<void> => {
+  let text: string
+  try {
+    text = await $.fs.read(file)
+  } catch {
+    return
+  }
+  const present = caseNames(text)
+  const isRedo = (t: { file: string; name: string; verdict?: Verdict }): boolean =>
+    t.file === file && t.verdict !== 'good' && among(touched, t.name)
+
+  const now = await read($, tests)
+  const redoNew = new Map(now.filter(t => isRedo(t) && t.status !== 'pending' && among(present, t.name)).map(t => [t.id, t.name]))
+  await update($, tests, list =>
+    list
+      .filter(t => t.file !== file || t.status === 'pending' || among(present, t.name))
+      .map(t => (redoNew.has(t.id) ? { ...t, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
+  )
+  if (redoNew.size > 0) $.clock.after(1, () => void evaluate($, file, redoNew))
+
+  const run = await read($, existing)
+  const kept = run.results.filter(t => t.file !== file || among(present, t.name))
+  const redo = kept.filter(t => isRedo(t) && !t.isPending).map(t => t.name)
+  if (kept.length === run.results.length && redo.length === 0) return
+  const pick = (t: ExistingTest): boolean => t.file === file && redo.includes(t.name)
+  await update($, existing, r => ({
+    ...r,
+    results: r.results.filter(t => t.file !== file || among(present, t.name)).map(t => (pick(t) ? { ...t, isPending: true } : t)),
+  }))
+  if (redo.length === 0) return
+  $.clock.after(1, async () => {
+    const verdicts = await grade($, file, text, redo).catch(() => null)
+    await update($, existing, r => ({
+      ...r,
+      results: r.results.map(t => {
+        if (!pick(t)) return t
+        const v = verdicts?.find(x => x.name === t.name)
+        return { file: t.file, name: t.name, ...(v ? { verdict: v.verdict, summary: v.summary, reason: v.reason } : {}) }
+      }),
+    }))
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
@@ -408,7 +461,11 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const names = caseNames(e.content)
-      if (names.length > 0) await track($, e.file_path, names)
+      await refresh($, e.file_path, names)
+      // a file written afresh holds its old cases too: only the ones not tracked yet are new
+      const known = new Set((await read($, tests)).filter(t => t.file === e.file_path).map(t => t.name))
+      const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
+      if (fresh.length > 0) await track($, e.file_path, fresh)
     }
 
     return ran
@@ -418,7 +475,9 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const before = new Set(caseNames(e.old_string))
-      const names = caseNames(e.new_string).filter(n => !before.has(n))
+      const touched = caseNames(e.new_string)
+      await refresh($, e.file_path, touched)
+      const names = touched.filter(n => !before.has(n))
       if (names.length > 0) await track($, e.file_path, names)
     }
 
@@ -442,7 +501,27 @@ export const register: Register = on => {
     const now = await $.clock.now()
 
     const rows = e.viewport?.rows ?? 30
-    const room = Math.max(1, Math.floor((rows - 12) / 5))
+    const columns = e.viewport?.columns ?? 60
+    const room = Math.max(1, rows - 16)
+    const isOpen = new Set(await read($, opened))
+    const toggle = (key: string): Promise<void> =>
+      update($, opened, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key].slice(-MAX_TESTS)))
+    // one line: the verdict, then the name, pressed open for the file, the summary and the reason
+    const row = (key: string, label: string, color: string, t: { file: string; name: string; summary?: string }, reason: string | undefined, reasonColor: string) => (
+      <Box key={`row-${key}`} flexDirection="column">
+        <Box flexDirection="row" gap={1}>
+          <Text bold color={color}>{label}</Text>
+          <Button key={key} plain label={clamp(t.name, Math.max(12, columns - label.length - 4))} onPress={() => toggle(key)} />
+        </Box>
+        {isOpen.has(key) && (
+          <Box flexDirection="column" marginLeft={2}>
+            <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
+            {t.summary && <Text>{t.summary}</Text>}
+            {reason && <Text color={reasonColor}>{reason}</Text>}
+          </Box>
+        )}
+      </Box>
+    )
     const shown = [...list].reverse().slice(0, room)
     const count = (v: Verdict): number => list.filter(t => t.verdict === v).length
     const pending = list.filter(t => t.status === 'pending').length
@@ -461,21 +540,18 @@ export const register: Register = on => {
           <Text color={RED}>{`${count('useless')} useless`}</Text>
           {pending > 0 && <Text color={MUTED}>{`${pending} reviewing`}</Text>}
         </Box>
-        <Box flexDirection="column" flexGrow={1} marginTop={1} gap={1}>
+        <Box flexDirection="column" flexGrow={1} marginTop={1}>
           {list.length === 0 && <Text color={MUTED}>No new tests yet. They show up here as they are written.</Text>}
-          {shown.map(t => (
-            <Box key={`t-${t.id}`} flexDirection="column">
-              <Box flexDirection="row" gap={1}>
-                <Text bold color={verdictColor(t.verdict)}>
-                  {t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : t.verdict}
-                </Text>
-                <Text bold>{t.name}</Text>
-              </Box>
-              <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
-              {t.summary && <Text>{t.summary}</Text>}
-              {t.reason && <Text color={verdictColor(t.verdict)}>{t.reason}</Text>}
-            </Box>
-          ))}
+          {shown.map(t =>
+            row(
+              `t:${t.file}:${t.name}`,
+              t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated'),
+              verdictColor(t.verdict),
+              t,
+              t.status === 'failed' ? 'The grader gave no verdict for this test.' : t.reason,
+              t.status === 'failed' ? MUTED : verdictColor(t.verdict),
+            ),
+          )}
           {list.length > shown.length && <Text color={MUTED}>{`+ ${list.length - shown.length} older`}</Text>}
         </Box>
         {(graded.state !== 'idle' || graded.results.length > 0) && (() => {
@@ -493,19 +569,18 @@ export const register: Register = on => {
                 )}
               </Box>
               {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
-              {listed.slice(0, MAX_LISTED).map((t, i) => (
-                <Box key={`e-${i}-${t.file}-${t.name}`} flexDirection="column">
-                  <Box flexDirection="row" gap={1}>
-                    <Text bold color={t.verdict ? verdictColor(t.verdict) : MUTED}>{t.verdict ?? 'unrated'}</Text>
-                    <Text bold>{t.name}</Text>
-                  </Box>
-                  <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
-                  {t.summary && <Text>{t.summary}</Text>}
-                  {t.verdict
-                    ? t.reason && <Text color={verdictColor(t.verdict)}>{t.reason}</Text>
-                    : <Text color={MUTED}>The grader gave no verdict for this test. Grade again to retry it.</Text>}
-                </Box>
-              ))}
+              <Box flexDirection="column">
+                {listed.slice(0, MAX_LISTED).map(t =>
+                  row(
+                    `e:${t.file}:${t.name}`,
+                    t.isPending ? 'reviewing' : (t.verdict ?? 'unrated'),
+                    t.isPending ? MUTED : verdictColor(t.verdict),
+                    t,
+                    t.verdict ? t.reason : 'The grader gave no verdict for this test. Grade again to retry it.',
+                    t.verdict ? verdictColor(t.verdict) : MUTED,
+                  ),
+                )}
+              </Box>
               {listed.length > MAX_LISTED && <Text color={MUTED}>{`+ ${listed.length - MAX_LISTED} more`}</Text>}
             </Box>
           )

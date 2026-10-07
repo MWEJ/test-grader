@@ -40,6 +40,7 @@ for (const surface of ['desktop', 'terminal'] as const) {
       requestId: 'test-watch',
       props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
     })
+    await ui.press({ key: `t:${FILE}:does nothing` })
     const tree = JSON.stringify(await ui.drawn())
     expect(tree).toContain('2 new tests')
     expect(tree).toContain('adds numbers')
@@ -101,8 +102,9 @@ const mount = ($: Parameters<Parameters<typeof test>[1]>[0], rows = 60) =>
   $.ui.mount({ plugin: 'test-watch', surface: 'terminal', component: 'Pane', requestId: 'test-watch', props: PANE_PROPS, viewport: { columns: 80, rows } } as never)
 
 // gate: the first grader call waits on it; held: every call waits until it is released
-type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void } }
-function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held }: Project = {}) {
+// rule: a verdict from the name and the prompt, in place of the name-only default
+type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => 'good' | 'weak' | 'useless' }
+function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule }: Project = {}) {
   const prompts: string[] = []
   // the notes for Claude, as the debug log has them: a row a mod appends reaches no test
   // hook (the kit answers it "no implementation"), so the log line is what a test can see
@@ -150,7 +152,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
         usage: {},
         text: JSON.stringify(
           names.flatMap(name => expand[name] ?? [name]).map(name => {
-            const verdict = name.includes('shallow') ? 'weak' : name.includes('nothing') ? 'useless' : 'good'
+            const verdict = rule ? rule(name, prompt) : name.includes('shallow') ? 'weak' : name.includes('nothing') ? 'useless' : 'good'
             return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.` }
           }),
         ),
@@ -176,6 +178,8 @@ test('Grade all tests grades every case of every test file git tracks, in batche
   // one call for the small file, three (10 + 10 + 4) for the big one
   expect(prompts).toHaveLength(4)
   expect(prompts.every(p => p.includes('Test file: /proj/src/'))).toBe(true)
+  await ui.press({ key: 'e:/proj/src/math.test.ts:does nothing' })
+  await ui.press({ key: 'e:/proj/src/big.test.ts:a shallow check' })
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('Existing tests')
   expect(tree).toContain('26 graded')
@@ -369,6 +373,7 @@ test('the pane lists an unrated test after the weak, with its file, so it can be
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
+  await ui.press({ key: 'e:/proj/src/more.test.ts:lost ${x}' })
 
   const tree = JSON.stringify(await ui.drawn())
   const weakAt = tree.indexOf('"a shallow check"')
@@ -376,7 +381,7 @@ test('the pane lists an unrated test after the weak, with its file, so it can be
   expect(weakAt).toBeGreaterThan(-1)
   expect(unratedAt).toBeGreaterThan(weakAt)
   // under the unrated test's name: its label, its file and why it has no verdict
-  const entry = tree.slice(unratedAt - 120, unratedAt + 300)
+  const entry = tree.slice(unratedAt - 120, unratedAt + 700)
   expect(entry).toContain('"unrated"')
   expect(entry).toContain('"src/more.test.ts"')
   expect(entry).toContain('The grader gave no verdict for this test.')
@@ -439,4 +444,110 @@ test('a new test graded good as it is written leaves no note', async ($, on) => 
   await clock.advance(10)
   expect(JSON.stringify(await (await mount($)).drawn())).toContain('1 good')
   expect(notes).toEqual([])
+})
+
+// one line per test, pressed open for the details; names read whole; the lists follow the session's edits
+const ok = { result: {}, text: 'ok', isError: false, isReadOnly: false }
+
+test('a test name with an escaped quote is read whole, so the grader\'s verdict finds it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'src/q.test.ts': "it('the command\\'s status', () => { expect(f()).toBe(1) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(prompts[0]).toContain('["the command\'s status"]')
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 graded · 1 good · 0 weak · 0 useless')
+  expect(tree).not.toContain('unrated')
+})
+
+test('a test written inside a fixture string is not a test', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('real one', () => {\n  const files = { 'a.test.ts': \"it('inner fixture', () => {})\" }\n  expect(run(files)).toBe(1)\n})\n"
+  project(on, { 'src/f.test.ts': content })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/f.test.ts', content } as never)
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).toContain('1 new tests')
+  expect(tree).toContain('real one')
+  expect(tree).not.toContain('inner fixture')
+})
+
+test('each test is one line until pressed open, and a second press closes it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/more.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const closed = JSON.stringify(await ui.drawn())
+  expect(closed).toContain('a shallow check')
+  expect(closed).not.toContain('weak because.')
+  expect(closed).not.toContain('Checks a shallow check.')
+
+  await ui.press({ key: 'e:/proj/src/more.test.ts:a shallow check' })
+  const open = JSON.stringify(await ui.drawn())
+  expect(open).toContain('src/more.test.ts')
+  expect(open).toContain('Checks a shallow check.')
+  expect(open).toContain('weak because.')
+
+  await ui.press({ key: 'e:/proj/src/more.test.ts:a shallow check' })
+  expect(JSON.stringify(await ui.drawn())).not.toContain('weak because.')
+})
+
+test('a test the session deletes leaves both lists', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const shallow = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
+  const files: Record<string, string> = { 'src/more.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" + shallow }
+  project(on, files)
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/more.test.ts', content: files['src/more.test.ts'] } as never)
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('a shallow check')
+
+  files['src/more.test.ts'] = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/more.test.ts', old_string: shallow, new_string: '' } as never)
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).not.toContain('a shallow check')
+  expect(tree).toContain('1 new tests')
+  expect(tree).toContain('1 graded · 1 good · 0 weak')
+})
+
+test('a weak test the session edits is graded again, and its new verdict replaces the old', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const before = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
+  const after = "it('a shallow check', () => { expect(f()).toBe(3) })\n"
+  const files: Record<string, string> = { 'src/more.test.ts': before }
+  // weak while the file still holds the shallow assertion, good once it is gone
+  const { prompts } = project(on, files, { rule: (_name, prompt) => (prompt.includes('toBeDefined()') ? 'weak' : 'good') })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 graded · 0 good · 1 weak')
+
+  files['src/more.test.ts'] = after
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/more.test.ts', old_string: before, new_string: after } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(2)
+  expect(prompts[1]).toContain('["a shallow check"]')
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 graded · 1 good · 0 weak')
+  // an edit to a test already there is no new test
+  expect(tree).toContain('0 new tests')
 })
