@@ -481,7 +481,7 @@ export const register: Register = on => {
         {(graded.state !== 'idle' || graded.results.length > 0) && (() => {
           const of = (v: Verdict): ExistingTest[] => graded.results.filter(t => t.verdict === v)
           const unrated = graded.results.filter(t => !t.verdict).length
-          const listed = [...of('useless'), ...of('weak')]
+          const listed = [...of('useless'), ...of('weak'), ...graded.results.filter(t => !t.verdict)]
           return (
             <Box flexDirection="column" marginTop={1} gap={1}>
               <Box flexDirection="row" gap={2}>
@@ -496,12 +496,14 @@ export const register: Register = on => {
               {listed.slice(0, MAX_LISTED).map((t, i) => (
                 <Box key={`e-${i}-${t.file}-${t.name}`} flexDirection="column">
                   <Box flexDirection="row" gap={1}>
-                    <Text bold color={verdictColor(t.verdict)}>{t.verdict}</Text>
+                    <Text bold color={t.verdict ? verdictColor(t.verdict) : MUTED}>{t.verdict ?? 'unrated'}</Text>
                     <Text bold>{t.name}</Text>
                   </Box>
                   <Text color={MUTED}>{shortPath(t.file, cwd)}</Text>
                   {t.summary && <Text>{t.summary}</Text>}
-                  {t.reason && <Text color={verdictColor(t.verdict)}>{t.reason}</Text>}
+                  {t.verdict
+                    ? t.reason && <Text color={verdictColor(t.verdict)}>{t.reason}</Text>
+                    : <Text color={MUTED}>The grader gave no verdict for this test. Grade again to retry it.</Text>}
                 </Box>
               ))}
               {listed.length > MAX_LISTED && <Text color={MUTED}>{`+ ${listed.length - MAX_LISTED} more`}</Text>}

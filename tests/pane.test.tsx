@@ -359,6 +359,29 @@ test('a finished run leaves Claude a note: the counts, then every weak, useless 
   ])
 })
 
+test('the pane lists an unrated test after the weak, with its file, so it can be found', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, {
+    'src/more.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\nit('lost ${x}', () => {})\n",
+  }, { expand: { 'lost ${x}': [] } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  const weakAt = tree.indexOf('"a shallow check"')
+  const unratedAt = tree.indexOf('"lost ${x}"')
+  expect(weakAt).toBeGreaterThan(-1)
+  expect(unratedAt).toBeGreaterThan(weakAt)
+  // under the unrated test's name: its label, its file and why it has no verdict
+  const entry = tree.slice(unratedAt - 120, unratedAt + 300)
+  expect(entry).toContain('"unrated"')
+  expect(entry).toContain('"src/more.test.ts"')
+  expect(entry).toContain('The grader gave no verdict for this test.')
+})
+
 test('a run with nothing to flag sends the count line alone', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const { notes } = project(on, { 'a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
