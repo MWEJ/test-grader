@@ -1,5 +1,5 @@
 {
-  "name": "test-watch",
+  "name": "test-grader",
   "version": "0.1.0",
   "description": "A side pane that tracks newly written tests, summarises what each does, rates whether it is worth having, and shows test coverage.",
   "types": "./types/index.d.ts"

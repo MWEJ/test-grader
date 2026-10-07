@@ -34,10 +34,10 @@ for (const surface of ['desktop', 'terminal'] as const) {
     await clock.advance(10)
 
     const ui = await $.ui.mount({
-      plugin: 'test-watch',
+      plugin: 'test-grader',
       surface,
       component: 'Pane',
-      requestId: 'test-watch',
+      requestId: 'test-grader',
       props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
     })
     await ui.press({ key: `r:${FILE}:does nothing` })
@@ -60,10 +60,10 @@ test('a non-test file is ignored', async ($, on) => {
   })
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/math.ts', content: "it('x', () => {})" } as never)
   const ui = await $.ui.mount({
-    plugin: 'test-watch',
+    plugin: 'test-grader',
     surface: 'terminal',
     component: 'Pane',
-    requestId: 'test-watch',
+    requestId: 'test-grader',
     props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
   })
   expect(JSON.stringify(await ui.drawn())).toContain('0 tests · 0 good · 0 weak · 0 useless"')
@@ -100,7 +100,7 @@ test('a new test deep in a long file reaches the grader with its body, however f
 // Grade all tests: the project as git tracks it, every case graded, the weak and useless listed
 const PANE_PROPS = { title: 'Tests', isFocused: false, bodyColumns: 80, placement: 'inline' } as never
 const mount = ($: Parameters<Parameters<typeof test>[1]>[0], rows = 60) =>
-  $.ui.mount({ plugin: 'test-watch', surface: 'terminal', component: 'Pane', requestId: 'test-watch', props: PANE_PROPS, viewport: { columns: 80, rows } } as never)
+  $.ui.mount({ plugin: 'test-grader', surface: 'terminal', component: 'Pane', requestId: 'test-grader', props: PANE_PROPS, viewport: { columns: 80, rows } } as never)
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
@@ -123,7 +123,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   on('ui.log', async (_$, e) => {
     const text = String((e as { text?: unknown }).text)
     logs.push(text)
-    if (text.startsWith('test-watch: note to Claude')) notes.push(text.replace(/^[^)]*\): /, ''))
+    if (text.startsWith('test-grader: note to Claude')) notes.push(text.replace(/^[^)]*\): /, ''))
     return { value: undefined } as never
   })
   on('command.register', async () => ({ value: {} }) as never)
@@ -131,7 +131,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   const tools: string[] = []
   on('tool.register', async (_$, e) => {
     tools.push((e as { name: string }).name)
-    return { value: { tool: `mcp__test-watch__${(e as { name: string }).name}` } } as never
+    return { value: { tool: `mcp__test-grader__${(e as { name: string }).name}` } } as never
   })
   on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
   on('session.start', async () => ({ cwd: '/proj' }) as never)
@@ -457,7 +457,7 @@ test('a finished run leaves Claude a note: the counts, then every weak, useless 
   await clock.advance(10)
 
   expect(notes).toEqual([
-    'Test grading (test-watch) finished: 4 graded · 1 good · 1 weak · 1 useless · 1 unrated.\n' +
+    'Test grading (test-grader) finished: 4 graded · 1 good · 1 weak · 1 useless · 1 unrated.\n' +
       'Weak or useless, worst first:\n' +
       '- useless · src/math.test.ts · does nothing — useless because.\n' +
       '- weak · src/more.test.ts · a shallow check — weak because.\n' +
@@ -498,7 +498,7 @@ test('a run with nothing to flag sends the count line alone', async ($, on) => {
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(notes).toEqual(['Test grading (test-watch) finished: 1 graded · 1 good · 0 weak · 0 useless.'])
+  expect(notes).toEqual(['Test grading (test-grader) finished: 1 graded · 1 good · 0 weak · 0 useless.'])
 })
 
 test('a failed run sends nothing', async ($, on) => {
@@ -533,7 +533,7 @@ test('a new test graded weak or useless as it is written leaves a note of those 
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
   await clock.advance(10)
   expect(notes).toEqual([
-    'New tests graded weak or useless (test-watch):\n' +
+    'New tests graded weak or useless (test-grader):\n' +
       '- useless · src/a.test.ts · does nothing — useless because.\n' +
       '- weak · src/a.test.ts · a shallow check — weak because.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
@@ -1158,7 +1158,7 @@ for (const [surface, perLine] of [
     project(on, { 'src/w.test.ts': `it('${name}', () => { expect(band()).toEqual(steady) })\n` })
     await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
     const ui = await $.ui.mount({
-      plugin: 'test-watch', surface, component: 'Pane', requestId: 'test-watch',
+      plugin: 'test-grader', surface, component: 'Pane', requestId: 'test-grader',
       props: { title: 'Tests', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
     } as never)
     await ui.press({ key: 'gradeAll' })
@@ -1237,7 +1237,7 @@ test('a grader reply cut off before its end keeps every verdict that arrived who
   await clock.advance(10)
 
   expect(JSON.stringify(await ui.drawn())).toContain('3 tests · 1 good · 1 weak · 0 useless · 1 unrated')
-  expect(logs.some(line => line.startsWith('test-watch: a grader reply was cut off') && line.includes('src/k.test.ts'))).toBe(true)
+  expect(logs.some(line => line.startsWith('test-grader: a grader reply was cut off') && line.includes('src/k.test.ts'))).toBe(true)
 })
 
 test('a grader call has room in its reply for a looped test\'s every case', async ($, on) => {
@@ -1255,7 +1255,7 @@ test('a grader call has room in its reply for a looped test\'s every case', asyn
 })
 
 // the session's evidence for a test, sent through the mod's tool; what the tool answers
-const EVIDENCE_TOOL = 'mcp__test-watch__test_evidence'
+const EVIDENCE_TOOL = 'mcp__test-grader__test_evidence'
 const sendEvidence = async ($: Parameters<Parameters<typeof test>[1]>[0], input: { file: string; test: string; evidence: string }) =>
   String((await $.tool.call({ tool: EVIDENCE_TOOL, ...input } as never)).result)
 const MUTATION = 'Removing the default export of f makes this test fail; no other test fails.'
@@ -1406,7 +1406,7 @@ test('a finished coverage run tells Claude its figures', async ($, on) => {
   await ui.press({ key: 'run' })
   await clock.advance(10)
   expect(runs.map(argv => argv.slice(0, 3).join(' '))).toEqual(['npx jest --coverage'])
-  expect(notes).toEqual(['Coverage run (test-watch) finished: lines 82.5% · statements 80% · branches 61.2% · functions 75% (coverage-summary.json).'])
+  expect(notes).toEqual(['Coverage run (test-grader) finished: lines 82.5% · statements 80% · branches 61.2% · functions 75% (coverage-summary.json).'])
 })
 
 test('a coverage run that fails tells Claude how it exited and the end of what it printed', async ($, on) => {
@@ -1419,7 +1419,7 @@ test('a coverage run that fails tells Claude how it exited and the end of what i
   await clock.advance(10)
   expect(notes).toHaveLength(1)
   const [head, ...tail] = notes[0]!.split('\n')
-  expect(head).toBe('Coverage run (test-watch) failed: npx jest --coverage exited with 1. The last 20 lines it printed:')
+  expect(head).toBe('Coverage run (test-grader) failed: npx jest --coverage exited with 1. The last 20 lines it printed:')
   expect(tail).toEqual([...Array.from({ length: 19 }, (_, i) => `line ${i + 12}`), 'FAIL src/a.test.ts'])
 })
 
@@ -1443,7 +1443,7 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
   await clock.advance(10)
   expect(asked).toEqual([])
   // the kit takes no appended row in this build: the mod's debug line says which way a note went
-  const added = () => logs.filter(l => l.startsWith('test-watch: note to Claude (not appended: no implementation for session.append): '))
+  const added = () => logs.filter(l => l.startsWith('test-grader: note to Claude (not appended: no implementation for session.append): '))
   expect(added()).toEqual([expect.stringMatching(/: New tests graded weak or useless/)])
 
   for (const key of ['gradeAll', 'regradeAll', 'run']) {
@@ -1451,9 +1451,9 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
     await clock.advance(10)
   }
   expect(asked.map(text => text.split('\n')[0])).toEqual([
-    expect.stringMatching(/^Test grading \(test-watch\) finished: /),
-    expect.stringMatching(/^Test grading \(test-watch\) finished: /),
-    expect.stringMatching(/^Coverage run \(test-watch\) finished: /),
+    expect.stringMatching(/^Test grading \(test-grader\) finished: /),
+    expect.stringMatching(/^Test grading \(test-grader\) finished: /),
+    expect.stringMatching(/^Coverage run \(test-grader\) finished: /),
   ])
   // each ends asking for a reply about what it found
   for (const text of asked) expect(text.split('\n').at(-1)).toMatch(/^Respond to this now: /)

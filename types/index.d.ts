@@ -46,7 +46,7 @@ export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: stri
 
 declare module 'claude-code' {
   interface PluginState {
-    'test-watch': {
+    'test-grader': {
       tests: TrackedTest[]
       coverage: Coverage | null
       run: CoverageRun
@@ -63,7 +63,7 @@ declare module 'claude-code' {
       seen: Record<string, string>
       /** the session the open and closed files are kept for: a new one starts them closed */
       openFor: string | null
-      /** the project's coverage run as a note names it (npx jest --coverage); null: none test-watch knows */
+      /** the project's coverage run as a note names it (npx jest --coverage); null: none test-grader knows */
       coverWith: string | null
     }
   }

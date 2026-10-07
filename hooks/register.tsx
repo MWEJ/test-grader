@@ -3,18 +3,18 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Coverage, ExistingTest, TrackedTest, Verdict } from '../types'
 
-const PANE = 'test-watch'
-const tests = atom({ plugin: 'test-watch', key: 'tests' } as const, [])
-const coverage = atom({ plugin: 'test-watch', key: 'coverage' } as const, null)
-const run = atom({ plugin: 'test-watch', key: 'run' } as const, { state: 'idle' })
-const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
-const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null)
-const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
-const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
-const openError = atom({ plugin: 'test-watch', key: 'openError' } as const, null)
-const seen = atom({ plugin: 'test-watch', key: 'seen' } as const, {})
-const openFor = atom({ plugin: 'test-watch', key: 'openFor' } as const, null)
-const coverWith = atom({ plugin: 'test-watch', key: 'coverWith' } as const, null)
+const PANE = 'test-grader'
+const tests = atom({ plugin: 'test-grader', key: 'tests' } as const, [])
+const coverage = atom({ plugin: 'test-grader', key: 'coverage' } as const, null)
+const run = atom({ plugin: 'test-grader', key: 'run' } as const, { state: 'idle' })
+const existing = atom({ plugin: 'test-grader', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
+const noteError = atom({ plugin: 'test-grader', key: 'noteError' } as const, null)
+const opened = atom({ plugin: 'test-grader', key: 'open' } as const, [])
+const fileOpen = atom({ plugin: 'test-grader', key: 'fileOpen' } as const, {})
+const openError = atom({ plugin: 'test-grader', key: 'openError' } as const, null)
+const seen = atom({ plugin: 'test-grader', key: 'seen' } as const, {})
+const openFor = atom({ plugin: 'test-grader', key: 'openFor' } as const, null)
+const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -194,7 +194,7 @@ const share = async ($: EngineInterface, text: string, nudge?: string): Promise<
   } catch (err) {
     error = err instanceof Error ? err.message : String(err)
   }
-  $.ui.log(`test-watch: note to Claude (${error === null ? way : `not ${way}: ${error}`}): ${text}`, { to: 'debug' })
+  $.ui.log(`test-grader: note to Claude (${error === null ? way : `not ${way}: ${error}`}): ${text}`, { to: 'debug' })
   await update($, noteError, () => error)
 }
 
@@ -245,7 +245,7 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   if (!reply.isAnswered) return null
   const { verdicts, isCut } = parseVerdicts(reply.text)
   if (isCut) {
-    $.ui.log(`test-watch: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
+    $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
   }
   return verdicts
 }
@@ -276,7 +276,7 @@ const evaluate = async ($: EngineInterface, file: string, ids: Map<string, strin
     // the weak and useless among them, told to Claude (the good ones are no news)
     const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
     const lines = flaggedLines(mine, await $.session.cwd())
-    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-watch):', ...lines, EVIDENCE_HINT].join('\n'))
+    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-grader):', ...lines, EVIDENCE_HINT].join('\n'))
   } catch {
     await fail()
   }
@@ -302,7 +302,7 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
   const lcovPath = `${cwd}/coverage/lcov.info`
   const xmlPath = `${cwd}/coverage.xml`
-  const goPath = `${cwd}/.test-watch-go-coverage.txt`
+  const goPath = `${cwd}/.test-grader-go-coverage.txt`
 
   const at = await mtime($, summaryPath)
   if (at !== null) {
@@ -372,7 +372,7 @@ const detectCommand = async ($: EngineInterface, cwd: string): Promise<CoverComm
   if ((await exists('pytest.ini')) || (await exists('pyproject.toml')) || (await exists('setup.cfg'))) {
     return { argv: ['python3', '-m', 'pytest', '--cov', '--cov-report=xml'], label: 'pytest --cov' }
   }
-  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover'], label: 'go test ./... -cover', goOutput: '.test-watch-go-coverage.txt' }
+  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover'], label: 'go test ./... -cover', goOutput: '.test-grader-go-coverage.txt' }
   return undefined
 }
 
@@ -388,11 +388,11 @@ const coverageNote = (command: CoverCommand, exitCode: number, output: string, c
     : ''
   if (exitCode === 0) {
     return figures
-      ? `Coverage run (test-watch) finished: ${figures} (${cov!.source}).`
-      : `Coverage run (test-watch) finished, but ${command.label} wrote no report test-watch reads.`
+      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).`
+      : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
-  return [`Coverage run (test-watch) failed: ${command.label} exited with ${exitCode}. The last ${lines.length} lines it printed:`, ...lines].join('\n')
+  return [`Coverage run (test-grader) failed: ${command.label} exited with ${exitCode}. The last ${lines.length} lines it printed:`, ...lines].join('\n')
 }
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
@@ -423,7 +423,7 @@ const existingNote = (results: ExistingTest[], cwd: string): string => {
   const unrated = results.filter(t => !t.verdict)
   const counts = [`${results.length} graded`, `${count('good')} good`, `${count('weak')} weak`, `${count('useless')} useless`]
   if (unrated.length > 0) counts.push(`${unrated.length} unrated`)
-  const lines = [`Test grading (test-watch) finished: ${counts.join(' · ')}.`]
+  const lines = [`Test grading (test-grader) finished: ${counts.join(' · ')}.`]
   const flagged = flaggedLines(results, cwd)
   if (flagged.length > 0) lines.push('Weak or useless, worst first:', ...flagged, EVIDENCE_HINT)
   if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
@@ -794,7 +794,7 @@ const EVIDENCE_MAX = 4_000
 const EVIDENCE_HINT =
   'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.'
 const EVIDENCE_DESCRIPTION =
-  'Send evidence to test-watch that a test deserves a different verdict than it got (good, weak, useless), e.g. a mutation of the code that makes this test fail. ' +
+  'Send evidence to test-grader that a test deserves a different verdict than it got (good, weak, useless), e.g. a mutation of the code that makes this test fail. ' +
   'The grader weighs it against the test source and answers with the new verdict and why. It cannot run code: state what you ran and what happened.'
 const EVIDENCE_SCHEMA = {
   type: 'object',
@@ -836,16 +836,16 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
 
 export const register: Register = on => {
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
-  on('tool.check', { tool: /^mcp__test-watch__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
-  on('tool.call', { tool: /^mcp__test-watch__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
+  on('tool.check', { tool: /^mcp__test-grader__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: /^mcp__test-grader__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
     (_$, _e, next) => ({ result: `The evidence tool could not answer (${next.error.kind}). Nothing was regraded; send it again.` }),
   )
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
+    await $.command.register({ name: 'tests', description: 'Open the test-grader pane (new tests, their quality, coverage)' })
     await $.tool
       .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
-      .catch(error => $.ui.log(`test-watch: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+      .catch(error => $.ui.log(`test-grader: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await refreshCoverage($)
     // the coverage run this project has, if any: the pane offers it only then
     const cover = await detectCommand($, await $.session.cwd()).catch(() => undefined)
@@ -915,7 +915,7 @@ export const register: Register = on => {
     const list = (await read($, tests)).filter(t => cwd !== '' && t.file.startsWith(`${cwd}/`))
     const cov = await read($, coverage)
     const running = await read($, run)
-    // coverage is shown where the project has a run test-watch knows, or a report to read
+    // coverage is shown where the project has a run test-grader knows, or a report to read
     const coverRun = await read($, coverWith)
     const hasCoverage = coverRun !== null || cov !== null
     const graded = await read($, existing)
