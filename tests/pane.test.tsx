@@ -100,8 +100,18 @@ const PANE_PROPS = { title: 'Tests', isFocused: false, bodyColumns: 80, placemen
 const mount = ($: Parameters<Parameters<typeof test>[1]>[0], rows = 60) =>
   $.ui.mount({ plugin: 'test-watch', surface: 'terminal', component: 'Pane', requestId: 'test-watch', props: PANE_PROPS, viewport: { columns: 80, rows } } as never)
 
-function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, isGit = true, gate?: () => Promise<void>) {
+// gate: the first grader call waits on it; held: every call waits until it is released
+type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void } }
+function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held }: Project = {}) {
   const prompts: string[] = []
+  // the notes for Claude, as the debug log has them: a row a mod appends reaches no test
+  // hook (the kit answers it "no implementation"), so the log line is what a test can see
+  const notes: string[] = []
+  on('ui.log', async (_$, e) => {
+    const text = String((e as { text?: unknown }).text)
+    if (text.startsWith('test-watch: note to Claude')) notes.push(text.replace(/^[^)]*\): /, ''))
+    return { value: undefined } as never
+  })
   on('command.register', async () => ({ value: {} }) as never)
   on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
   on('session.start', async () => ({ cwd: '/proj' }) as never)
@@ -126,13 +136,20 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       prompts.push(prompt)
       await gate()
     } else prompts.push(prompt)
+    if (held) {
+      held.calls += 1
+      await new Promise<void>(r => {
+        const before = held.release
+        held.release = () => (before(), r())
+      })
+    }
     const names = JSON.parse(prompt.match(/test cases: (\[.*\])/)![1]!) as string[]
     return {
       value: {
         isAnswered: true,
         usage: {},
         text: JSON.stringify(
-          names.map(name => {
+          names.flatMap(name => expand[name] ?? [name]).map(name => {
             const verdict = name.includes('shallow') ? 'weak' : name.includes('nothing') ? 'useless' : 'good'
             return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.` }
           }),
@@ -140,7 +157,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       },
     } as never
   })
-  return { prompts }
+  return { prompts, notes }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -183,15 +200,14 @@ test('while grading, the button says how far it has got; pressing again grades a
       'a.test.ts': "it('one', () => { expect(1).toBe(1) })\n",
       'b.test.ts': "it('two', () => { expect(2).toBe(2) })\n",
     },
-    true,
-    () => new Promise<void>(r => (release = r)),
+    { gate: () => new Promise<void>(r => (release = r)) },
   )
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(JSON.stringify(await ui.drawn())).toContain('Grading 1/2 files…')
+  expect(JSON.stringify(await ui.drawn())).toContain('Grading… 1/2 files done')
   release()
   await clock.advance(10)
   expect(JSON.stringify(await ui.drawn())).toContain('2 graded')
@@ -204,7 +220,7 @@ test('while grading, the button says how far it has got; pressing again grades a
 
 test('Grade all tests outside a git repo says so and grades nothing', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const { prompts } = project(on, {}, false)
+  const { prompts } = project(on, {}, { isGit: false })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
 
@@ -212,4 +228,192 @@ test('Grade all tests outside a git repo says so and grades nothing', async ($, 
   await clock.advance(10)
   expect(prompts).toHaveLength(0)
   expect(JSON.stringify(await ui.drawn())).toContain('Not a git repository: there is no list of test files to grade.')
+})
+
+test('a test generated in a loop is graded case by case: the loop and its data reach the grader, and each case counts', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const looped = [
+    "it('first', () => { expect(1).toBe(1) })",
+    '',
+    '// each size, rounded',
+    "const CASES = [['tiny', 1], ['huge shallow', 9], ['middle', 5]]",
+    'for (const [name, n] of CASES) {',
+    '  it(`rounds ${name}`, () => { expect(round(n)).toBe(n) })',
+    '}',
+    '',
+  ].join('\n')
+  const { prompts } = project(
+    on,
+    { 'src/round.test.ts': looped },
+    // the grader names the loop's cases as it expands them, and one name that is not one of them
+    { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge shallow', 'rounds middle', 'something else'] } },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('generated in a loop')
+  const tree = JSON.stringify(await ui.drawn())
+  // first, and the loop's three cases; the stray name is dropped
+  expect(tree).toContain('4 graded')
+  expect(tree).toContain('3 good')
+  expect(tree).toContain('1 weak')
+  expect(tree).toContain('rounds huge shallow')
+  expect(tree).not.toContain('unrated')
+  expect(tree).not.toContain('something else')
+})
+
+test('in a long file, a looped test reaches the grader with the data above it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const added = "\nconst SIZES = [['tiny', 1], ['huge', 9]]\nfor (const [name, n] of SIZES) {\n  it(`rounds ${name}`, () => { expect(round(n)).toBe(n) })\n}\n"
+  const prompts: string[] = []
+  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  on('fs.stat', async () => {
+    throw new Error('missing')
+  })
+  on('fs.read', async () => ({ value: old + added }) as never)
+  on('model.complete', async (_$, e) => {
+    prompts.push(String((e as { prompt?: unknown }).prompt))
+    return { value: { isAnswered: true, usage: {}, text: '[]' } } as never
+  })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts[0]).toContain("const SIZES = [['tiny', 1], ['huge', 9]]")
+  expect(prompts[0]).toContain('for (const [name, n] of SIZES) {')
+  expect(prompts[0]).not.toContain('old case 399')
+})
+
+test('a new looped test becomes one entry per case it generates', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "const SIZES = ['tiny', 'huge']\nfor (const name of SIZES) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBeDefined() })\n}\n"
+  project(on, { 'src/round.test.ts': content }, { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge'] } })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/round.test.ts', content } as never)
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).toContain('2 new tests')
+  expect(tree).toContain('rounds tiny')
+  expect(tree).toContain('rounds huge')
+  expect(tree).not.toContain('unrated')
+})
+
+test('Grade all tests runs up to 4 grader calls at once, and keeps the results in file order', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const cases = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `it('${prefix} ${i}', () => { expect(f(${i})).toBe(${i}) })\n`).join('')
+  const held = { calls: 0, release: () => {} }
+  const { prompts } = project(
+    on,
+    // 3 batches, 2 batches and 1: six calls in all
+    { 'a.test.ts': cases('a', 25) + "it('a shallow one', () => {})\n", 'b.test.ts': cases('b', 15) + "it('b shallow one', () => {})\n", 'c.test.ts': cases('c', 3) },
+    { held },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  // four in flight, and no fifth until one of them answers
+  expect(held.calls).toBe(4)
+  expect(prompts).toHaveLength(4)
+  held.release()
+  await clock.advance(10)
+  expect(prompts).toHaveLength(6)
+  held.release()
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('45 graded')
+  expect(tree).toContain('2 weak')
+  expect(tree.indexOf('a shallow one')).toBeLessThan(tree.indexOf('b shallow one'))
+})
+
+test('a finished run leaves Claude a note: the counts, then every weak, useless and unrated test, none of the good', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { notes } = project(on, {
+    'src/math.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('does nothing', () => { expect(true).toBe(true) })\n",
+    'src/more.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\nit('lost ${x}', () => {})\n",
+  }, { expand: { 'lost ${x}': [] } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(notes).toEqual([
+    'Test grading (test-watch) finished: 4 graded · 1 good · 1 weak · 1 useless · 1 unrated.\n' +
+      'Weak or useless, worst first:\n' +
+      '- useless · src/math.test.ts · does nothing — useless because.\n' +
+      '- weak · src/more.test.ts · a shallow check — weak because.\n' +
+      'Unrated (the grader gave no verdict):\n' +
+      '- src/more.test.ts · lost ${x}',
+  ])
+})
+
+test('a run with nothing to flag sends the count line alone', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { notes } = project(on, { 'a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(notes).toEqual(['Test grading (test-watch) finished: 1 graded · 1 good · 0 weak · 0 useless.'])
+})
+
+test('a failed run sends nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { notes } = project(on, {}, { isGit: false })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(notes).toEqual([])
+})
+
+// the kit answers every append "no implementation": a note that does not go through
+test('a note the session does not take says so in the pane, and why', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 graded')
+  expect(tree).toContain("Couldn't share the result with Claude: no implementation for session.append")
+})
+
+test('a new test graded weak or useless as it is written leaves a note of those alone', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('a shallow check', () => { expect(f).toBeDefined() })\nit('does nothing', () => {})\n"
+  const { notes } = project(on, { 'src/a.test.ts': content })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
+  await clock.advance(10)
+  expect(notes).toEqual([
+    'New tests graded weak or useless (test-watch):\n' +
+      '- useless · src/a.test.ts · does nothing — useless because.\n' +
+      '- weak · src/a.test.ts · a shallow check — weak because.',
+  ])
+})
+
+test('a new test graded good as it is written leaves no note', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { notes } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" } as never)
+  await clock.advance(10)
+  expect(JSON.stringify(await (await mount($)).drawn())).toContain('1 good')
+  expect(notes).toEqual([])
 })

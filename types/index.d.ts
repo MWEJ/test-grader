@@ -35,6 +35,8 @@ declare module 'claude-code' {
       coverage: Coverage | null
       run: CoverageRun
       existing: ExistingRun
+      /** why the last note to Claude was not added, until one is */
+      noteError: string | null
     }
   }
 }

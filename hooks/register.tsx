@@ -8,6 +8,7 @@ const tests = atom({ plugin: 'test-watch', key: 'tests' } as const, [])
 const coverage = atom({ plugin: 'test-watch', key: 'coverage' } as const, null)
 const run = atom({ plugin: 'test-watch', key: 'run' } as const, { state: 'idle' })
 const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
+const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -22,6 +23,8 @@ const MAX_HEAD = 4_000
 const CELLS = 12
 // Grade all tests: cases per grader call, and how many weak or useless ones are listed
 const BATCH = 10
+// grader calls in flight at once
+const PARALLEL = 4
 const MAX_LISTED = 20
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
@@ -50,13 +53,34 @@ const caseNames = (text: string): string[] => {
 
 const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 
-// where each case starts in a file, in file order
+// where each case starts in a file, in file order: right after the previous case closes
+// (a line opening with "})"), so what sits between two cases (a comment, the data a
+// loop runs over, the loop itself) goes with the case below it; failing a close, on
+// the line after the previous case's first
 const caseStarts = (text: string): { name: string; at: number }[] => {
-  const starts: { name: string; at: number }[] = []
+  const found: { name: string; at: number }[] = []
   for (const pattern of CASE_PATTERNS) {
-    for (const m of text.matchAll(pattern)) starts.push({ name: (m[2] ?? m[1]) as string, at: m.index ?? 0 })
+    for (const m of text.matchAll(pattern)) found.push({ name: (m[2] ?? m[1]) as string, at: m.index ?? 0 })
   }
-  return starts.sort((a, b) => a.at - b.at)
+  found.sort((a, b) => a.at - b.at)
+  return found.map((start, i) => {
+    const prev = found[i - 1]
+    if (!prev) return start
+    const between = text.slice(prev.at, start.at)
+    const closes = [...between.matchAll(/\n[ \t]*\}\)[^\n]*\n/g)]
+    const last = closes[closes.length - 1]
+    const after = last ? last.index! + last[0].length : between.indexOf('\n') + 1
+    return after > 0 ? { name: start.name, at: prev.at + after } : start
+  })
+}
+
+// A name with ${…} in it is a template: the cases a loop generates. The grader names each
+// case as the loop expands it, and a returned name belongs to the template it fits
+const isTemplate = (name: string): boolean => /\$\{[^}]*\}/.test(name)
+const fits = (template: string, name: string): boolean => {
+  if (!isTemplate(template)) return template === name
+  const parts = template.split(/\$\{[^}]*\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  return new RegExp(`^${parts.join('[\\s\\S]+?')}$`).test(name)
 }
 
 // What the grader reads: the whole file when it fits, else its head and the new cases
@@ -90,6 +114,27 @@ const parseVerdicts = (text: string): { name: string; summary: string; verdict: 
   }
 }
 
+// A note for Claude: a user-role row it reads on its next turn, no turn started. A refusal
+// or a failure is kept for the pane to show, until a note goes through. The debug log has
+// every note, appended or not (a test cannot see a row a mod appends)
+const share = async ($: EngineInterface, text: string): Promise<void> => {
+  let error: string | null = null
+  try {
+    const row = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+    if (row.deny !== undefined) error = row.deny
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err)
+  }
+  $.ui.log(`test-watch: note to Claude (${error === null ? 'appended' : `not appended: ${error}`}): ${text}`, { to: 'debug' })
+  await update($, noteError, () => error)
+}
+
+// the weak and useless of a list, the useless first, one line each
+const flaggedLines = (list: { file: string; name: string; verdict?: Verdict; reason?: string }[], cwd: string): string[] =>
+  (['useless', 'weak'] as const).flatMap(v =>
+    list.filter(t => t.verdict === v).map(t => `- ${v} · ${shortPath(t.file, cwd)} · ${t.name} — ${t.reason ?? ''}`),
+  )
+
 type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
 
 // One grader call: these cases of this file, judged; null when the grader gave no answer
@@ -105,6 +150,9 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       'For each, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
       'verdict: "good" = asserts meaningful behaviour, covers a real case or edge; "weak" = shallow, happy-path only, over-mocked or brittle; "useless" = no real assertions, tautology, tests the mock, snapshot of nothing, or duplicates another test.',
       'reason: one short sentence justifying the verdict.',
+      ...(names.some(isTemplate)
+        ? ['A name with ${...} in it is a template for cases generated in a loop: grade each case the loop generates separately, named as the loop expands it.']
+        : []),
       'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
       '',
       '```',
@@ -122,12 +170,26 @@ const evaluate = async ($: EngineInterface, file: string, ids: Map<string, strin
     const verdicts = await grade($, file, await $.fs.read(file), [...ids.values()])
     if (verdicts === null) return fail()
     await update($, tests, list =>
-      list.map(t => {
-        if (!ids.has(t.id)) return t
-        const v = verdicts.find(x => x.name === t.name)
-        return v ? { ...t, status: 'done', summary: v.summary, verdict: v.verdict, reason: v.reason } : { ...t, status: 'failed' }
+      // a looped test becomes one entry per case it generates
+      list.flatMap((t): TrackedTest[] => {
+        if (!ids.has(t.id)) return [t]
+        const found = verdicts.filter(v => fits(t.name, v.name))
+        if (found.length === 0) return [{ ...t, status: 'failed' }]
+        return found.map((v, k) => ({
+          ...t,
+          id: k === 0 ? t.id : `${t.id}-${k}`,
+          name: v.name,
+          status: 'done',
+          summary: v.summary,
+          verdict: v.verdict,
+          reason: v.reason,
+        }))
       }),
     )
+    // the weak and useless among them, told to Claude (the good ones are no news)
+    const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
+    const lines = flaggedLines(mine, await $.session.cwd())
+    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-watch):', ...lines].join('\n'))
   } catch {
     await fail()
   }
@@ -241,8 +303,23 @@ const runCoverage = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-// Grade all tests: every case of every test file git tracks, a file at a time and
-// BATCH cases a call. A batch the grader fails leaves its cases unrated, and the run goes on
+// what a finished Grade all tests run tells Claude: the counts, then every weak,
+// useless and unrated test (the good are counted, not listed)
+const existingNote = (results: ExistingTest[], cwd: string): string => {
+  const count = (v: Verdict): number => results.filter(t => t.verdict === v).length
+  const unrated = results.filter(t => !t.verdict)
+  const counts = [`${results.length} graded`, `${count('good')} good`, `${count('weak')} weak`, `${count('useless')} useless`]
+  if (unrated.length > 0) counts.push(`${unrated.length} unrated`)
+  const lines = [`Test grading (test-watch) finished: ${counts.join(' · ')}.`]
+  const flagged = flaggedLines(results, cwd)
+  if (flagged.length > 0) lines.push('Weak or useless, worst first:', ...flagged)
+  if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
+  return lines.join('\n')
+}
+
+// Grade all tests: every case of every test file git tracks, BATCH cases a call and
+// PARALLEL calls at once; the results keep file order. A batch the grader fails leaves
+// its cases unrated, and the run goes on
 const gradeAll = async ($: EngineInterface): Promise<void> => {
   if ((await read($, existing)).state === 'running') return
   const cwd = await $.session.cwd()
@@ -252,22 +329,48 @@ const gradeAll = async ($: EngineInterface): Promise<void> => {
     if (listed.exitCode !== 0) return void (await fail('Not a git repository: there is no list of test files to grade.'))
     const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f))
     await update($, existing, () => ({ state: 'running', done: 0, total: files.length, results: [] }))
-    const results: ExistingTest[] = []
-    for (const [i, rel] of files.entries()) {
+    // every file's batches, in file order; a file is done when its last batch is
+    const jobs: { file: string; text: string; batch: string[]; slot: ExistingTest[][] }[] = []
+    const perFile: { left: number; slots: ExistingTest[][] }[] = []
+    let done = 0
+    for (const rel of files) {
       const file = `${cwd}/${rel}`
       const text = await $.fs.read(file)
       const names = [...new Set(caseNames(text))]
+      const entry = { left: 0, slots: [] as ExistingTest[][] }
       for (let at = 0; at < names.length; at += BATCH) {
-        const batch = names.slice(at, at + BATCH)
+        const slot: ExistingTest[] = []
+        entry.slots.push(slot)
+        entry.left += 1
+        jobs.push({ file, text, batch: names.slice(at, at + BATCH), slot })
+      }
+      perFile.push(entry)
+      if (entry.left === 0) done += 1
+    }
+    await update($, existing, s => ({ ...s, done }))
+    const owner = new Map(perFile.flatMap(f => f.slots.map(slot => [slot, f] as const)))
+    let next = 0
+    const worker = async (): Promise<void> => {
+      while (next < jobs.length) {
+        const { file, text, batch, slot } = jobs[next++]!
         const verdicts = (await grade($, file, text, batch).catch(() => null)) ?? []
         for (const name of batch) {
-          const v = verdicts.find(x => x.name === name)
-          results.push(v ? { file, name, verdict: v.verdict, summary: v.summary, reason: v.reason } : { file, name })
+          const found = verdicts.filter(v => fits(name, v.name))
+          if (found.length === 0) slot.push({ file, name })
+          for (const v of found) slot.push({ file, name: v.name, verdict: v.verdict, summary: v.summary, reason: v.reason })
+        }
+        const entry = owner.get(slot)!
+        entry.left -= 1
+        if (entry.left === 0) {
+          done += 1
+          await update($, existing, s => ({ ...s, done }))
         }
       }
-      await update($, existing, s => ({ ...s, done: i + 1 }))
     }
+    await Promise.all(Array.from({ length: Math.min(PARALLEL, jobs.length) }, worker))
+    const results = perFile.flatMap(f => f.slots.flat())
     await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results }))
+    await share($, existingNote(results, cwd))
   } catch (err) {
     await fail(err instanceof Error ? err.message : String(err))
   }
@@ -334,6 +437,7 @@ export const register: Register = on => {
     const cov = await read($, coverage)
     const running = await read($, run)
     const graded = await read($, existing)
+    const noteFailed = await read($, noteError)
     const cwd = await $.session.cwd()
     const now = await $.clock.now()
 
@@ -404,6 +508,7 @@ export const register: Register = on => {
             </Box>
           )
         })()}
+        {noteFailed !== null && <Text color={RED}>{`Couldn't share the result with Claude: ${noteFailed}`}</Text>}
         <Box flexDirection="column" marginTop={1}>
           <Box flexDirection="row" justifyContent="space-between">
             <Text bold>Coverage</Text>
@@ -440,7 +545,7 @@ export const register: Register = on => {
             />
             <Button
               key="gradeAll"
-              label={graded.state === 'running' ? `Grading ${Math.min(graded.done + 1, graded.total)}/${graded.total} files…` : 'Grade all tests'}
+              label={graded.state === 'running' ? `Grading… ${graded.done}/${graded.total} files done` : 'Grade all tests'}
               // on a timer: a run outlasts the press that starts it
               onPress={() => (graded.state === 'running' ? undefined : $.clock.after(1, () => void gradeAll($)))}
             />
