@@ -226,7 +226,66 @@ test('Grade all tests grades every case of every test file git tracks, in batche
   expect(tree.indexOf('a shallow check')).toBeLessThan(tree.indexOf('case 7'))
 })
 
-test('while grading, the button says how far it has got; Regrade all grades afresh', async ($, on) => {
+// each test row's verdict, as the pane draws it, by the test's name
+const verdictsDrawn = async (ui: { drawn: () => Promise<unknown> }): Promise<Record<string, string>> => {
+  const json = JSON.stringify(await ui.drawn())
+  return Object.fromEntries(
+    [...json.matchAll(/"children":\["(\w+)"\]\}\]\},\{"type":"Box","props":\{"flexDirection":"column"\},"children":\[\{"type":"Button","props":\{"key":"r:[^"]*?:([^"]*)"/g)].map(m => [m[2]!, m[1]!]),
+  )
+}
+
+test('the pane first lists every test the project has: one graded before with its result, the rest ungraded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+    'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+  }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  for (const f of ['a', 'b']) await ui.press({ key: `f:/proj/src/${f}.test.ts` })
+  expect(await verdictsDrawn(ui)).toEqual({ adds: 'ungraded', 'a shallow check': 'ungraded' })
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 0 good · 0 weak · 0 useless · 2 ungraded')
+  expect(prompts).toEqual([])
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  // a later session: a file added since, not graded yet
+  files['src/c.test.ts'] = "it('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n"
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  await ui.press({ key: 'f:/proj/src/c.test.ts' })
+  expect(await verdictsDrawn(ui)).toEqual({ adds: 'good', 'a shallow check': 'weak', subtracts: 'ungraded' })
+  expect(prompts).toHaveLength(2)
+})
+
+test('while Grade all tests runs every test stays listed, the ones the grader has yet to answer as reviewing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  let release = () => {}
+  project(
+    on,
+    {
+      'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+      'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+    },
+    { gate: () => new Promise<void>(r => (release = r)) },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  for (const f of ['a', 'b']) await ui.press({ key: `f:/proj/src/${f}.test.ts` })
+  expect(await verdictsDrawn(ui)).toEqual({ adds: 'ungraded', 'a shallow check': 'ungraded' })
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  // the first file's call waits on the gate; the second has answered
+  expect(await verdictsDrawn(ui)).toEqual({ adds: 'reviewing', 'a shallow check': 'weak' })
+  release()
+  await clock.advance(10)
+  expect(await verdictsDrawn(ui)).toEqual({ adds: 'good', 'a shallow check': 'weak' })
+})
+
+test('while grading, the button says how far it has got; Regrade all grades afresh',async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   let release = () => {}
   const { prompts } = project(
@@ -897,7 +956,47 @@ test('a test name too long for its row wraps onto the next lines, whole', async 
   for (const label of labels) expect(label.length).toBeLessThanOrEqual(80 - 'good'.length - 6)
 })
 
-test('Grade all tests again grades only the files changed since their last grading, and remembers the rest across sessions', async ($, on) => {
+test('each verdict sits in one column on its title\'s first line, and an opened row\'s details sit under the title', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const long = 'keeps the quota band steady while the session compacts and the five hour window rolls over into the next one'
+  project(on, { 'src/v.test.ts': `it('${long}', () => { expect(band()).toEqual(steady) })\nit('a shallow check', () => { expect(f).toBeDefined() })\nit('checks nothing', () => {})\n` })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: 'r:/proj/src/v.test.ts:a shallow check' })
+
+  type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+  const nodes: Node[] = []
+  const walk = (n: unknown) => {
+    if (!n || typeof n !== 'object') return
+    nodes.push(n as Node)
+    for (const c of (n as Node).children ?? []) walk(c)
+  }
+  walk(await ui.drawn())
+  // a test's line: a row whose first child is its verdict's column
+  const lines = nodes.filter(n => n.type === 'Box' && n.props?.flexDirection === 'row' && (n.children?.[0] as Node | undefined)?.props?.width !== undefined)
+  expect(lines).toHaveLength(3)
+  const widths = lines.map(l => (l.children![0] as Node).props!.width)
+  expect(new Set(widths).size).toBe(1)
+  const width = widths[0] as number
+  // as wide as the widest verdict drawn, so no title starts further in than another
+  const verdicts = lines.map(l => JSON.stringify(l.children![0]).match(/"children":\["(\w+)"\]/)![1]!)
+  expect(verdicts.sort()).toEqual(['good', 'useless', 'weak'])
+  expect(width).toBe('useless'.length)
+  for (const l of lines) {
+    // the verdict on the first line of its title, beside the title's first part
+    expect(l.props!.alignItems).toBe('flex-start')
+    const title = l.children![1] as Node
+    expect([long, 'a shallow check', 'checks nothing'].some(n => n.startsWith(String((title.children![0] as Node).props!.label)))).toBe(true)
+  }
+
+  // the opened row's details start where its title does: the column, then the gap
+  const details = nodes.findLast(n => n.type === 'Box' && JSON.stringify(n.children).includes('Open in editor') && n.props?.flexDirection === 'column')
+  expect(details?.props?.marginLeft).toBe(width + 1)
+})
+
+test('Grade all tests again grades only the files changed since their last grading, and remembers the rest across sessions',async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = {
     'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",

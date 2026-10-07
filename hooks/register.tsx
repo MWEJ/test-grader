@@ -403,44 +403,52 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
   const before = await read($, existing)
   if (before.state === 'running') return
   const cwd = await $.session.cwd()
-  const fail = (message: string) => update($, existing, () => ({ state: 'failed', done: 0, total: 0, message, results: [], hashes: before.hashes }))
+  const fail = (message: string) => update($, existing, () => ({ state: 'failed', done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
   try {
     const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
     if (listed.exitCode !== 0) return void (await fail('Not a git repository: there is no list of test files to grade.'))
     const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f))
-    await update($, existing, r => ({ ...r, state: 'running', done: 0, total: files.length, results: [] }))
+    await update($, existing, r => ({ ...r, state: 'running', done: 0, total: files.length }))
     const hashes: Record<string, string> = {}
     // tests whose results stand from before
     let remembered = 0
-    // every file's batches, in file order; a file is done when its last batch is
-    const jobs: { file: string; text: string; batch: string[]; slot: ExistingTest[] }[] = []
-    const perFile: { left: number; slots: ExistingTest[][] }[] = []
+    // every file's batches, in file order; a file is done when its last batch is. Until the
+    // grader answers a batch, its tests are listed as they were, marked reviewing
+    type Slot = { items: ExistingTest[]; waiting: ExistingTest[]; isDone: boolean }
+    const jobs: { file: string; text: string; batch: string[]; slot: Slot }[] = []
+    const perFile: { left: number; slots: Slot[] }[] = []
+    const shown = (): ExistingTest[] => perFile.flatMap(f => f.slots.flatMap(s => (s.isDone ? s.items : s.waiting)))
     let done = 0
     for (const rel of files) {
       const file = `${cwd}/${rel}`
       const text = await $.fs.read(file)
       hashes[file] = fingerprint(text)
       const names = [...new Set(caseNames(text))]
-      const entry = { left: 0, slots: [] as ExistingTest[][] }
+      const entry = { left: 0, slots: [] as Slot[] }
       // unchanged since its last grading, and every test rated: its results stand
       const kept = before.results.filter(t => t.file === file)
       if (!isFresh && before.hashes?.[file] === hashes[file] && kept.length > 0 && kept.every(t => t.verdict !== undefined)) {
-        entry.slots.push(kept)
+        entry.slots.push({ items: kept, waiting: kept, isDone: true })
         perFile.push(entry)
         remembered += kept.length
         done += 1
         continue
       }
       for (let at = 0; at < names.length; at += BATCH) {
-        const slot: ExistingTest[] = []
+        const batch = names.slice(at, at + BATCH)
+        const waiting = batch.flatMap(name => {
+          const had = kept.filter(t => fits(name, t.name))
+          return (had.length > 0 ? had : [{ file, name }]).map(({ isUngraded: _, ...t }) => ({ ...t, isPending: true }))
+        })
+        const slot: Slot = { items: [], waiting, isDone: false }
         entry.slots.push(slot)
         entry.left += 1
-        jobs.push({ file, text, batch: names.slice(at, at + BATCH), slot })
+        jobs.push({ file, text, batch, slot })
       }
       perFile.push(entry)
       if (entry.left === 0) done += 1
     }
-    await update($, existing, s => ({ ...s, done }))
+    await update($, existing, s => ({ ...s, done, results: shown() }))
     const owner = new Map(perFile.flatMap(f => f.slots.map(slot => [slot, f] as const)))
     let next = 0
     const worker = async (): Promise<void> => {
@@ -451,19 +459,18 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
         for (const name of batch) {
           const suite = suites.has(name) ? { suite: suites.get(name) } : {}
           const found = verdicts.filter(v => fits(name, v.name))
-          if (found.length === 0) slot.push({ file, name, ...suite })
-          for (const v of found) slot.push({ file, name: v.name, verdict: v.verdict, summary: v.summary, reason: v.reason, ...suite })
+          if (found.length === 0) slot.items.push({ file, name, ...suite })
+          for (const v of found) slot.items.push({ file, name: v.name, verdict: v.verdict, summary: v.summary, reason: v.reason, ...suite })
         }
+        slot.isDone = true
         const entry = owner.get(slot)!
         entry.left -= 1
-        if (entry.left === 0) {
-          done += 1
-          await update($, existing, s => ({ ...s, done }))
-        }
+        if (entry.left === 0) done += 1
+        await update($, existing, s => ({ ...s, done, results: shown() }))
       }
     }
     await Promise.all(Array.from({ length: Math.min(PARALLEL, jobs.length) }, worker))
-    const results = perFile.flatMap(f => f.slots.flat())
+    const results = shown()
     const finishedAt = await $.clock.now()
     const graded = results.length - remembered
     await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt, hashes, graded, remembered }))
@@ -569,6 +576,33 @@ const prune = async ($: EngineInterface): Promise<void> => {
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
   await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
   await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
+}
+
+// The project's tests as the pane first shows them: every case of every test file git
+// tracks, with its result from before when it has one, ungraded otherwise. No grader call
+const listAll = async ($: EngineInterface): Promise<void> => {
+  const cwd = await $.session.cwd()
+  const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
+  if (listed.exitCode !== 0) return
+  const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f)).map(rel => `${cwd}/${rel}`)
+  const run = await read($, existing)
+  const cases: ExistingTest[] = []
+  const hashes: Record<string, string> = {}
+  for (const file of files) {
+    const text = await $.fs.read(file).catch(() => null)
+    if (text === null) continue
+    hashes[file] = fingerprint(text)
+    const suites = suitesOf(text)
+    for (const name of new Set(caseNames(text))) {
+      const had = run.results.filter(t => t.file === file && fits(name, t.name))
+      cases.push(...(had.length > 0 ? had : [{ file, name, isUngraded: true, ...(suites.has(name) ? { suite: suites.get(name) } : {}) }]))
+    }
+  }
+  const isListed = new Set(Object.keys(hashes))
+  await update($, existing, r => (r.state === 'running' ? r : { ...r, results: [...cases, ...r.results.filter(t => !isListed.has(t.file))] }))
+  // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
+  // fingerprint, so a change made between sessions is still caught at a turn's end
+  await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
 }
 
 // the line a case opens on: its own it( or test(, a looped case's the loop's; else the top
@@ -772,6 +806,7 @@ export const register: Register = on => {
       .catch(error => $.ui.log(`test-watch: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await refreshCoverage($)
     await prune($).catch(() => undefined)
+    $.clock.after(1, () => void listAll($).catch(() => undefined))
     // each session starts with its files at their default, closed when there are several; a
     // reload of this mod or a compaction starts the same session again, and keeps them
     const id = await $.session.id().catch(() => null)
@@ -849,11 +884,11 @@ export const register: Register = on => {
 
     // One list: the last Grade all tests run and the tests written this session, a test in
     // both once, with the newer verdict; one written this session is marked new
-    type State = Verdict | 'unrated' | 'reviewing'
+    type State = Verdict | 'unrated' | 'reviewing' | 'ungraded'
     type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean; suite?: string; evidence?: string }
     const merged = new Map<string, Entry>()
     for (const t of graded.results) {
-      const state: State = t.isPending ? 'reviewing' : (t.verdict ?? 'unrated')
+      const state: State = t.isPending ? 'reviewing' : t.isUngraded ? 'ungraded' : (t.verdict ?? 'unrated')
       merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false, suite: t.suite, evidence: t.evidence })
     }
     for (const t of list) {
@@ -868,7 +903,7 @@ export const register: Register = on => {
 
     // grouped: a Go suite over its files, else by file; the worst group first, and in a
     // file the worst test first, the new ahead
-    const RANK: Record<State, number> = { useless: 0, weak: 1, unrated: 2, reviewing: 3, good: 4 }
+    const RANK: Record<State, number> = { useless: 0, weak: 1, unrated: 2, reviewing: 3, ungraded: 4, good: 5 }
     const worstFirst = (of: Entry[]): Entry[] => [...of].sort((a, b) => RANK[a.state] - RANK[b.state] || Number(b.isNew) - Number(a.isNew))
     const byFile = (of: Entry[]): { file: string; of: Entry[] }[] => {
       const files = new Map<string, Entry[]>()
@@ -902,6 +937,7 @@ export const register: Register = on => {
       `${tally(entries, 'useless')} useless`,
       ...(tally(entries, 'unrated') > 0 ? [`${tally(entries, 'unrated')} unrated`] : []),
       ...(tally(entries, 'reviewing') > 0 ? [`${tally(entries, 'reviewing')} reviewing`] : []),
+      ...(tally(entries, 'ungraded') > 0 ? [`${tally(entries, 'ungraded')} ungraded`] : []),
       ...(list.length > 0 ? [`${new Set(list.map(t => `${t.file}:${t.name}`)).size} new`] : []),
     ].join(' · ')
 
@@ -911,7 +947,7 @@ export const register: Register = on => {
       const groupCounts = [
         `${of.length}`,
         `${tally(of, 'good')} good`,
-        ...(['weak', 'useless', 'unrated', 'reviewing'] as const).filter(s => tally(of, s) > 0).map(s => `${tally(of, s)} ${s}`),
+        ...(['weak', 'useless', 'unrated', 'reviewing', 'ungraded'] as const).filter(s => tally(of, s) > 0).map(s => `${tally(of, s)} ${s}`),
       ].join(' · ')
       return (
         <Box key={`h-${key}`} flexDirection="row" gap={1} marginLeft={indent}>
@@ -928,6 +964,8 @@ export const register: Register = on => {
 
     // a file's header and, open, every one of its tests; the pane scrolling
     const drawn: unknown[] = []
+    // the verdicts' column, one width for the pane, so every title starts in line
+    const verdictWidth = Math.max(...entries.map(t => t.state.length))
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
     const drawFile = (key: string, openKey: string, file: string, of: Entry[], indent: number, siblings: number): void => {
       const open = isGroupOpen(openKey, siblings)
@@ -935,13 +973,15 @@ export const register: Register = on => {
       if (!open) return
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
-        const reason = t.state === 'unrated' ? 'The grader gave no verdict for this test. Grade again to retry it.' : t.reason
+        const reason = t.state === 'unrated' ? 'The grader gave no verdict for this test. Grade again to retry it.' : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
         drawn.push(
           <Box key={`row-${key}`} flexDirection="column" marginLeft={indent + 2}>
-            <Box flexDirection="row" gap={1}>
-              <Text bold color={stateColor(t.state)}>{t.state}</Text>
+            <Box flexDirection="row" gap={1} alignItems="flex-start">
+              <Box width={verdictWidth} flexShrink={0}>
+                <Text bold color={stateColor(t.state)}>{t.state}</Text>
+              </Box>
               <Box flexDirection="column">
-                {wrapWords(t.name, Math.max(12, columns - indent - t.state.length - (t.isNew ? 10 : 6))).map((part, i) => (
+                {wrapWords(t.name, Math.max(12, columns - indent - verdictWidth - (t.isNew ? 10 : 6))).map((part, i) => (
                   <Button key={i === 0 ? key : `${key}#${i}`} plain label={part} onPress={() => toggle(key)} />
                 ))}
               </Box>
@@ -949,7 +989,7 @@ export const register: Register = on => {
               {t.evidence && <Text color={MUTED}>on evidence</Text>}
             </Box>
             {isOpen.has(key) && (
-              <Box flexDirection="column" marginLeft={2}>
+              <Box flexDirection="column" marginLeft={verdictWidth + 1}>
                 {t.summary && <Text>{t.summary}</Text>}
                 {reason && <Text color={stateColor(t.state)}>{reason}</Text>}
                 {t.evidence && <Text color={MUTED}>{`Evidence: ${t.evidence}`}</Text>}
