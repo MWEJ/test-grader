@@ -66,3 +66,31 @@ test('a non-test file is ignored', async ($, on) => {
   })
   expect(JSON.stringify(await ui.drawn())).toContain('0 new tests')
 })
+
+test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const helper = "const helper = (n: number) => n * 2\n"
+  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => { expect(add(${i}, 1)).toBe(${i + 1}) })\n`).join('')
+  const added = "it('subtracts numbers', () => {\n  expect(sub(5, 3)).toBe(2)\n})\n"
+  const content = helper + old + added
+  expect(content.length).toBeGreaterThan(20_000)
+  const prompts: string[] = []
+  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  on('fs.stat', async () => {
+    throw new Error('missing')
+  })
+  on('fs.read', async () => ({ value: content }) as never)
+  on('model.complete', async (_$, e) => {
+    prompts.push(String((e as { prompt?: unknown }).prompt))
+    return { value: { isAnswered: true, usage: {}, text: '[]' } } as never
+  })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  // the new case whole, and the file's head where its helpers live
+  expect(prompts[0]).toContain('expect(sub(5, 3)).toBe(2)')
+  expect(prompts[0]).toContain('const helper = (n: number) => n * 2')
+})

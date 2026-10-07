@@ -16,6 +16,8 @@ const TRACK = '#343848'
 const VIOLET = '#a78bfa'
 const MAX_TESTS = 60
 const MAX_SOURCE = 12_000
+// of a file too long to send whole: at most this much of its head (imports, helpers)
+const MAX_HEAD = 4_000
 const CELLS = 12
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
@@ -44,6 +46,28 @@ const caseNames = (text: string): string[] => {
 
 const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 
+// where each case starts in a file, in file order
+const caseStarts = (text: string): { name: string; at: number }[] => {
+  const starts: { name: string; at: number }[] = []
+  for (const pattern of CASE_PATTERNS) {
+    for (const m of text.matchAll(pattern)) starts.push({ name: (m[2] ?? m[1]) as string, at: m.index ?? 0 })
+  }
+  return starts.sort((a, b) => a.at - b.at)
+}
+
+// What the grader reads: the whole file when it fits, else its head and the new cases
+// themselves, each from its start to the next case's, wherever in the file they sit
+const excerptOf = (source: string, names: string[]): string => {
+  if (source.length <= MAX_SOURCE) return source
+  const starts = caseStarts(source)
+  const head = clamp(source.slice(0, starts[0]?.at ?? source.length), MAX_HEAD)
+  const bodies = starts.flatMap((start, i) =>
+    names.includes(start.name) ? [source.slice(start.at, starts[i + 1]?.at ?? source.length).trimEnd()] : [],
+  )
+  const room = Math.max(1_000, Math.floor((MAX_SOURCE - head.length) / Math.max(1, bodies.length)))
+  return [head.trimEnd(), '// … other tests left out …', ...bodies.map(b => clamp(b, room))].join('\n\n')
+}
+
 const parseVerdicts = (text: string): { name: string; summary: string; verdict: Verdict; reason: string }[] => {
   const start = text.indexOf('[')
   const end = text.lastIndexOf(']')
@@ -66,8 +90,8 @@ const evaluate = async ($: EngineInterface, file: string, ids: Map<string, strin
   const fail = (): Promise<void> =>
     update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' } : t)))
   try {
-    const source = clamp(await $.fs.read(file), MAX_SOURCE)
     const names = [...ids.values()]
+    const source = excerptOf(await $.fs.read(file), names)
     const reply = await $.model.complete({
       model: 'haiku',
       maxTokens: 1500,
