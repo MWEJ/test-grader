@@ -12,6 +12,7 @@ const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null
 const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
 const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
 const openError = atom({ plugin: 'test-watch', key: 'openError' } as const, null)
+const seen = atom({ plugin: 'test-watch', key: 'seen' } as const, {})
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -429,6 +430,7 @@ const gradeAll = async ($: EngineInterface, isFresh = false): Promise<void> => {
     const finishedAt = await $.clock.now()
     const graded = results.length - remembered
     await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt, hashes, graded, remembered }))
+    await update($, seen, all => ({ ...all, ...hashes }))
     await share($, existingNote(results, cwd))
   } catch (err) {
     await fail(err instanceof Error ? err.message : String(err))
@@ -494,6 +496,31 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
       }),
     }))
   })
+}
+
+// At a turn's end: a listed test file changed since last seen, by the shell, an editor or a
+// checkout rather than Claude's Write or Edit, is taken as if Claude had written it whole: its
+// gone tests leave, its weak, useless and unrated ones are graded again, and new ones are added.
+// Last seen: as Write, Edit or Grade all left it, else as its last grading fingerprinted it
+const catchUp = async ($: EngineInterface): Promise<void> => {
+  const cwd = await $.session.cwd()
+  const run = await read($, existing)
+  const files = [...new Set([...(await read($, tests)).map(t => t.file), ...run.results.map(t => t.file)])].filter(f => cwd !== '' && f.startsWith(`${cwd}/`))
+  const last = await read($, seen)
+  for (const file of files) {
+    const text = await $.fs.read(file).catch(() => null)
+    if (text === null) continue
+    const now = fingerprint(text)
+    const before = last[file] ?? run.hashes?.[file]
+    if (before === now) continue
+    await update($, seen, all => ({ ...all, [file]: now }))
+    if (before === undefined) continue
+    const names = caseNames(text)
+    await refresh($, file, names)
+    const known = [...(await read($, tests)).filter(t => t.file === file), ...(await read($, existing)).results.filter(t => t.file === file)].map(t => t.name)
+    const fresh = [...new Set(names)].filter(n => !among(known, n) && !known.some(k => fits(n, k)))
+    if (fresh.length > 0) await track($, file, fresh)
+  }
 }
 
 // At a session's start: an entry whose test is no longer among its file's cases, or whose
@@ -671,6 +698,7 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const names = caseNames(e.content)
+      await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(e.content) }))
       await refresh($, e.file_path, names)
       // a file written afresh holds its old cases too: only the ones not tracked yet are new
       const known = new Set((await read($, tests)).filter(t => t.file === e.file_path).map(t => t.name))
@@ -686,6 +714,8 @@ export const register: Register = on => {
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const before = new Set(caseNames(e.old_string))
       const touched = caseNames(e.new_string)
+      const text = await $.fs.read(e.file_path).catch(() => null)
+      if (text !== null) await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(text) }))
       await refresh($, e.file_path, touched)
       const names = touched.filter(n => !before.has(n))
       if (names.length > 0) await track($, e.file_path, names)
@@ -696,6 +726,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     await refreshCoverage($)
+    await catchUp($).catch(() => undefined)
 
     return next(e)
   })
@@ -712,7 +743,8 @@ export const register: Register = on => {
     const openFailed = await read($, openError)
     const now = await $.clock.now()
 
-    const columns = e.viewport?.columns ?? 60
+    // the pane's own width: docked beside the transcript, it is narrower than the window
+    const columns = (e.props as { bodyColumns?: number }).bodyColumns ?? e.viewport?.columns ?? 60
     const isOpen = new Set(await read($, opened))
     const filesOpen = await read($, fileOpen)
     const toggle = (key: string): Promise<void> =>

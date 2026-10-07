@@ -57,6 +57,8 @@ declare module 'claude-code' {
       fileOpen: Record<string, boolean>
       /** why the last Open in editor opened nothing, until one does */
       openError: string | null
+      /** each listed test file's contents as last seen, fingerprinted: a change since is caught at a turn's end */
+      seen: Record<string, string>
     }
   }
 }

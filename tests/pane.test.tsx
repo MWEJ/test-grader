@@ -1008,3 +1008,71 @@ test('a project of one Go suite in one file starts open all the way down', async
   expect(tree).toContain('"▾ pkg/quota/other_test.go"')
   expect(tree).toContain('"TestShallowCheck"')
 })
+
+test('a docked pane narrower than the window wraps names to its own width, not the window\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const name = 'a chosen lifetime is set in the variable at once, warming on or off; auto sets nothing'
+  project(on, { 'src/w.test.ts': `it('${name}', () => { expect(band()).toEqual(steady) })\n` })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await $.ui.mount({
+    plugin: 'test-watch', surface: 'desktop', component: 'Pane', requestId: 'test-watch',
+    props: { title: 'Tests', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
+  } as never)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const labels = [...JSON.stringify(await ui.drawn()).matchAll(/"label":"([^"]*)"/g)].map(m => m[1]!).filter(label => name.includes(label))
+  expect(labels.join(' ')).toBe(name)
+  for (const label of labels) expect(label.length).toBeLessThanOrEqual(50 - 2 - 'good'.length - 1)
+})
+
+// a test file changed some other way than Claude's Write or Edit: the shell, an editor, a checkout
+const SUM_BEFORE = "it('a shallow check', () => { expect(sum).toBeDefined() })\nit('adds', () => { expect(sum(1, 2)).toBe(3) })\n"
+const SUM_AFTER = "it('checks the sum and the carry', () => { expect(sum(9, 1)).toBe(10) })\nit('adds', () => { expect(sum(1, 2)).toBe(3) })\n"
+const TURN = { answer: 'done', durationMs: 1_000, isAborted: false, turnId: 't1', reason: 'answer' } as never
+
+test('at a turn\'s end, a listed test file changed by other means is updated as an edit would: gone tests leave, new ones are graded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('turn.complete', () => ({ text: '' }) as never)
+  const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('"a shallow check"')
+
+  files['src/c.test.ts'] = SUM_AFTER
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).not.toContain('"a shallow check"')
+  expect(tree).toContain('"checks the sum and the carry"')
+  expect(tree).toContain('2 tests · 2 good · 0 weak · 0 useless · 1 new')
+  expect(prompts.at(-1)).toContain('checks the sum and the carry')
+})
+
+test('at a turn\'s end, unchanged files cost no grader call, nor does one Claude just wrote', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+
+  files['src/c.test.ts'] = SUM_AFTER
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/c.test.ts', content: SUM_AFTER } as never)
+  await clock.advance(10)
+  const afterWrite = prompts.length
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(afterWrite)
+})
