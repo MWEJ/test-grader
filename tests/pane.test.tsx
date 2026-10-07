@@ -113,6 +113,8 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
+  // every git command, as run
+  const gits: string[][] = []
   mock.env(on, env)
   // the notes for Claude, as the debug log has them: a row a mod appends reaches no test
   // hook (the kit answers it "no implementation"), so the log line is what a test can see
@@ -148,6 +150,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   })
   on('process.run', async (_$, e) => {
     const { argv } = e as { argv: string[] }
+    if (argv[0] === 'git') gits.push(argv)
     if (argv[0] !== 'git') {
       if (!editor) throw new Error(`unexpected ${argv.join(' ')}`)
       runs.push(argv)
@@ -213,7 +216,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked, store }
+  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -255,6 +258,24 @@ const verdictsDrawn = async (ui: { drawn: () => Promise<unknown> }): Promise<Rec
     [...json.matchAll(/"children":\["(\w+)"\]\}\]\},\{"type":"Box","props":\{"flexDirection":"column"\},"children":\[\{"type":"Button","props":\{"key":"r:[^"]*?:([^"]*)"/g)].map(m => [m[2]!, m[1]!]),
   )
 }
+
+// the pane's drawing as nodes, every one in drawing order
+type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
+const nodesOf = (tree: unknown): Node[] => {
+  const nodes: Node[] = []
+  const walk = (n: unknown) => {
+    if (!n || typeof n !== 'object') return
+    nodes.push(n as Node)
+    for (const c of (n as Node).children ?? []) walk(c)
+  }
+  walk(tree)
+  return nodes
+}
+// whether a node draws a button with this key, at any depth
+const holdsKey = (n: Node, key: string): boolean => JSON.stringify(n).includes(`"key":${JSON.stringify(key)}`)
+// the buttons drawn, by key, with their labels
+const buttonsOf = (tree: unknown): Map<string, string> =>
+  new Map(nodesOf(tree).filter(n => n.type === 'Button').map(n => [String(n.props?.key), String(n.props?.label)]))
 
 test('the pane first lists every test the project has: one graded before with its result, the rest ungraded', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -488,16 +509,16 @@ test('the pane lists an unrated test after the weak, with its file, so it can be
   await clock.advance(10)
   await ui.press({ key: 'r:/proj/src/more.test.ts:lost ${x}' })
 
-  const tree = JSON.stringify(await ui.drawn())
-  const weakAt = tree.indexOf('"a shallow check"')
-  const unratedAt = tree.indexOf('"lost ${x}"')
-  expect(weakAt).toBeGreaterThan(-1)
-  expect(unratedAt).toBeGreaterThan(weakAt)
-  // under its file's header; at its name, its label and why it has no verdict
-  expect(tree.indexOf('▾ src/more.test.ts')).toBeLessThan(unratedAt)
-  const entry = tree.slice(unratedAt - 300, unratedAt + 700)
-  expect(entry).toContain('"unrated"')
-  expect(entry).toContain('The grader gave no verdict for this test.')
+  const drawn = await ui.drawn()
+  // its verdict column says unrated, and it is listed after the weak one
+  expect(Object.entries(await verdictsDrawn(ui))).toEqual([['a shallow check', 'weak'], ['lost ${x}', 'unrated']])
+  // under its file's header
+  const tree = JSON.stringify(drawn)
+  expect(tree.indexOf('▾ src/more.test.ts')).toBeLessThan(tree.indexOf('"r:/proj/src/more.test.ts:lost ${x}"'))
+  // its own details, the ones its Open in editor sits in, say why it has no verdict
+  const details = nodesOf(drawn).findLast(n => n.type === 'Box' && n.props?.flexDirection === 'column' && holdsKey(n, 'o:/proj/src/more.test.ts:lost ${x}'))
+  expect(JSON.stringify(details)).toContain('The grader gave no verdict for this test.')
+  expect(holdsKey(details!, 'o:/proj/src/more.test.ts:a shallow check')).toBe(false)
 })
 
 test('a run with nothing to flag sends the count line alone', async ($, on) => {
@@ -510,14 +531,24 @@ test('a run with nothing to flag sends the count line alone', async ($, on) => {
   expect(notes).toEqual(['Test grading (test-grader) finished: 1 graded · 1 good · 0 weak · 0 useless.'])
 })
 
-test('a failed run sends nothing', async ($, on) => {
+test('a failed run sends nothing to Claude, and says in the pane why it failed', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const { notes } = project(on, {}, { isGit: false })
+  const { notes, asked, gits, prompts } = project(on, {}, { isGit: false })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
+  // the listing a session start makes, done
+  await clock.advance(10)
+  const before = gits.length
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
+
+  // the run started: it asked git for the files, and git said this is no repository
+  expect(gits.slice(before)).toEqual([['git', 'ls-files']])
+  expect(JSON.stringify(await ui.drawn())).toContain('Not a git repository: there is no list of test files to grade.')
+  // and nothing reached Claude, as a note or a prompt, nor the grader
   expect(notes).toEqual([])
+  expect(asked).toEqual([])
+  expect(prompts).toEqual([])
 })
 
 // the kit answers every append "no implementation": a note that does not go through
@@ -533,16 +564,18 @@ test('a note the session does not take says so in the pane, and why', async ($, 
   expect(tree).toContain("Couldn't share the result with Claude: the session is closing")
 })
 
-test('a new test graded weak or useless as it is written leaves a note of those alone', async ($, on) => {
+test('a new test graded weak or useless as it is written goes to Claude as a prompt of those alone', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('a shallow check', () => { expect(f).toBeDefined() })\nit('does nothing', () => {})\n"
-  const { notes } = project(on, { 'src/a.test.ts': content })
+  const { notes, asked } = project(on, { 'src/a.test.ts': content })
   on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
   await clock.advance(10)
+  expect(asked).toHaveLength(1)
+  expect(asked[0]!.split('\n').at(-1)).toBe(ITERATE)
   expect(notes).toEqual([
-    'New tests graded weak or useless (test-grader):\n' +
+    'Tests graded weak or useless (test-grader):\n' +
       '- useless · src/a.test.ts · does nothing — useless because.\n' +
       '- weak · src/a.test.ts · a shallow check — weak because.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
@@ -988,33 +1021,27 @@ test('each verdict sits in one column on its title\'s first line, and an opened 
   await clock.advance(10)
   await ui.press({ key: 'r:/proj/src/v.test.ts:a shallow check' })
 
-  type Node = { type?: string; props?: Record<string, unknown>; children?: unknown[] }
-  const nodes: Node[] = []
-  const walk = (n: unknown) => {
-    if (!n || typeof n !== 'object') return
-    nodes.push(n as Node)
-    for (const c of (n as Node).children ?? []) walk(c)
-  }
-  walk(await ui.drawn())
-  // a test's line: a row whose first child is its verdict's column
-  const lines = nodes.filter(n => n.type === 'Box' && n.props?.flexDirection === 'row' && (n.children?.[0] as Node | undefined)?.props?.width !== undefined)
-  expect(lines).toHaveLength(3)
-  const widths = lines.map(l => (l.children![0] as Node).props!.width)
-  expect(new Set(widths).size).toBe(1)
-  const width = widths[0] as number
-  // as wide as the widest verdict drawn, so no title starts further in than another
-  const verdicts = lines.map(l => JSON.stringify(l.children![0]).match(/"children":\["(\w+)"\]/)![1]!)
-  expect(verdicts.sort()).toEqual(['good', 'useless', 'weak'])
-  expect(width).toBe('useless'.length)
-  for (const l of lines) {
-    // the verdict on the first line of its title, beside the title's first part
-    expect(l.props!.alignItems).toBe('flex-start')
-    const title = l.children![1] as Node
-    expect([long, 'a shallow check', 'checks nothing'].some(n => n.startsWith(String((title.children![0] as Node).props!.label)))).toBe(true)
+  const nodes = nodesOf(await ui.drawn())
+  const text = (n: unknown): string => [...JSON.stringify(n).matchAll(/"children":\["([^"]*)"\]/g)].map(m => m[1]).join(' ')
+  const width = 'useless'.length
+  for (const [name, verdict] of [[long, 'good'], ['a shallow check', 'weak'], ['checks nothing', 'useless']] as const) {
+    const key = `r:/proj/src/v.test.ts:${name}`
+    // the test's line: the innermost row that holds its title's buttons
+    const line = nodes.findLast(n => n.type === 'Box' && n.props?.flexDirection === 'row' && holdsKey(n, key))!
+    const cells = (line.children ?? []) as Node[]
+    const column = cells.find(c => !holdsKey(c, key))!
+    const title = cells.find(c => holdsKey(c, key))!
+    // the verdict first, in a column as wide as the widest verdict, so every title starts as far in
+    expect(cells.indexOf(column)).toBeLessThan(cells.indexOf(title))
+    expect(text(column)).toBe(verdict)
+    expect(column.props?.width).toBe(width)
+    // beside the title's first line, not centred on a title that wraps
+    expect(line.props?.alignItems).toBe('flex-start')
+    expect(name.startsWith(String(nodesOf(title).find(n => n.type === 'Button')?.props?.label))).toBe(true)
   }
 
   // the opened row's details start where its title does: the column, then the gap
-  const details = nodes.findLast(n => n.type === 'Box' && JSON.stringify(n.children).includes('Open in editor') && n.props?.flexDirection === 'column')
+  const details = nodes.findLast(n => n.type === 'Box' && n.props?.flexDirection === 'column' && holdsKey(n, 'o:/proj/src/v.test.ts:a shallow check'))
   expect(details?.props?.marginLeft).toBe(width + 1)
 })
 
@@ -1116,15 +1143,23 @@ test('a regrade on evidence is kept in the store too', async ($, on) => {
 
 test('Grade all tests again grades a file whose last grading left a test unrated', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const { prompts } = project(on, { 'src/u.test.ts': "it('lost', () => { expect(f()).toBe(1) })\n" }, { expand: { lost: [] } })
+  // the grader gives no verdict for it the first time, and one the second
+  const expand: Record<string, string[]> = { lost: [] }
+  const { prompts } = project(on, { 'src/u.test.ts': "it('lost', () => { expect(f()).toBe(1) })\n" }, { expand })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
+  expect(await verdictsDrawn(ui)).toEqual({ lost: 'unrated' })
+  delete expand.lost
+
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
 
-  expect(prompts).toHaveLength(2)
+  // the unchanged file was sent again, for that test, and its verdict now stands
+  expect(ASKED(prompts.slice(1))).toEqual(['lost'])
+  expect(await verdictsDrawn(ui)).toEqual({ lost: 'good' })
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 good · 0 weak · 0 useless')
 })
 
 test('Regrade all grades every file again, remembered or not', async ($, on) => {
@@ -1322,15 +1357,26 @@ test('a grader reply cut off before its end keeps every verdict that arrived who
 test('a grader call has room in its reply for a looped test\'s every case', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const loop = "for (const name of NAMES) {\n  it(`the lifetime: ${name}`, () => { expect(ttl(name)).toBeDefined() })\n}\n"
-  const { budgets } = project(on, { 'src/l.test.ts': loop }, { expand: { 'the lifetime: ${name}': Array.from({ length: 20 }, (_, i) => `the lifetime: case ${i}`) } })
+  // a grader that writes about 75 tokens a verdict, its reply cut off where its budget ends
+  const budgets: number[] = []
+  const cut = (reply: string): string => {
+    const all = JSON.parse(reply) as unknown[]
+    const room = Math.floor(budgets.at(-1)! / 75)
+    return room >= all.length ? reply : JSON.stringify(all.slice(0, room)).slice(0, -1)
+  }
+  const { budgets: given, logs } = project(on, { 'src/l.test.ts': loop }, { cut, expand: { 'the lifetime: ${name}': Array.from({ length: 20 }, (_, i) => `the lifetime: case ${i}`) } })
+  // the budget of the call under way, as the cut reads it
+  Object.defineProperty(budgets, 'at', { value: (i: number) => given.at(i) })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
 
-  // about 75 tokens a verdict, for 20 cases
-  expect(budgets[0]).toBeGreaterThanOrEqual(20 * 75)
-  expect(budgets[0]).toBeGreaterThan(1500)
+  // every one of the loop's twenty cases came back with its verdict, and no reply was cut off
+  const verdicts = await verdictsDrawn(ui)
+  expect(Object.keys(verdicts)).toHaveLength(20)
+  expect(Object.values(verdicts).every(v => v === 'good')).toBe(true)
+  expect(logs.some(line => line.startsWith('test-grader: a grader reply was cut off'))).toBe(false)
 })
 
 // the session's evidence for a test, sent through the mod's tool; what the tool answers
@@ -1377,7 +1423,7 @@ test('evidence the grader rejects leaves the verdict, and the tool says why', as
   const answer = await sendEvidence($, { file: '/proj/src/e.test.ts', test: 'a shallow check', evidence: 'It is fine.' })
   await clock.advance(10)
 
-  expect(answer).toBe('Still weak: weak because.')
+  expect(answer).toBe('Still weak: weak because. Strengthen it, or send other evidence (round 1 of 3).')
   expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 1 good · 1 weak')
 })
 
@@ -1425,7 +1471,13 @@ test('the note on weak tests tells Claude it can send evidence', async ($, on) =
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
 
-  expect(notes.at(-1)).toContain('test_evidence')
+  // the hint, word for word, right after the weak and useless it is about
+  const lines = notes.at(-1)!.split('\n')
+  const lastFlagged = lines.findLastIndex(l => l.startsWith('- weak ') || l.startsWith('- useless '))
+  expect(lastFlagged).toBeGreaterThan(-1)
+  expect(lines[lastFlagged + 1]).toBe(
+    'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
+  )
 })
 
 test('a file pressed open stays open when one of its tests is regraded on evidence', async ($, on) => {
@@ -1462,13 +1514,18 @@ test('Run coverage shows only in a project with a runner it knows, and the cover
 })
 
 test('in a jest project Run coverage shows, and Clear list is gone', async ($, on) => {
-  mock.clock(on, { now: 1_000_000 })
-  project(on, JEST_PROJECT)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { runs } = project(on, JEST_PROJECT, { editor: () => 0 })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
-  const drawn = JSON.stringify(await ui.drawn())
-  expect(drawn).toContain('"key":"run"')
-  expect(drawn).not.toContain('"key":"clear"')
+  const buttons = buttonsOf(await ui.drawn())
+  expect(buttons.get('run')).toBe('Run coverage')
+  expect([...buttons.values()]).not.toContain('Clear list')
+
+  // the button runs the project's own runner
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(runs.map(argv => argv.slice(0, 3).join(' '))).toEqual(['npx jest --coverage'])
 })
 
 test('a finished coverage run tells Claude its figures', async ($, on) => {
@@ -1502,7 +1559,7 @@ test('a coverage run that fails tells Claude how it exited and the end of what i
   expect(tail).toEqual([...Array.from({ length: 19 }, (_, i) => `line ${i + 12}`), 'FAIL src/a.test.ts'])
 })
 
-test('the results of Grade all tests, Regrade all and a coverage run ask Claude to respond; a new test\'s note is only added', async ($, on) => {
+test('the results of Grade all tests, Regrade all, a coverage run and a weak new test each ask Claude to respond', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...JEST_PROJECT }
   const { asked, logs } = project(on, files, {
@@ -1515,16 +1572,16 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
 
-  // written mid-turn, a weak test's note is read in that turn: no prompt of its own
+  // a weak test written: its grade asks Claude to strengthen it
   const shallow = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
   files['src/b.test.ts'] = shallow
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/b.test.ts', content: shallow } as never)
   await clock.advance(10)
-  expect(asked).toEqual([])
-  // the mod's debug line says which way a note went: added to the conversation (or, where the
-  // kit takes no appended row, refused for that), not sent as a prompt
+  expect(asked.map(text => text.split('\n')[0])).toEqual(['Tests graded weak or useless (test-grader):'])
+  asked.length = 0
+  // the mod's debug line says which way a note went; none was only added
   const added = () => logs.filter(l => /^test-grader: note to Claude \((appended|not appended: no implementation for session\.append)\): /.test(l))
-  expect(added()).toEqual([expect.stringMatching(/: New tests graded weak or useless/)])
+  expect(added()).toEqual([])
 
   for (const key of ['gradeAll', 'regradeAll', 'run']) {
     await ui.press({ key })
@@ -1537,7 +1594,7 @@ test('the results of Grade all tests, Regrade all and a coverage run ask Claude 
   ])
   // each ends asking for a reply about what it found
   for (const text of asked) expect(text.split('\n').at(-1)).toMatch(/^Respond to this now: /)
-  expect(added()).toHaveLength(1)
+  expect(added()).toEqual([])
 })
 
 // Test discovery reads code, not text: a test written inside a string or a comment is a
@@ -1715,4 +1772,119 @@ test('a session start while a run is under way leaves it to finish, with no seco
 
   expect(prompts).toHaveLength(1)
   expect(JSON.stringify(await ui.drawn())).not.toContain('Grading…')
+})
+
+// A weak or useless grade on a test Claude wrote or edited goes back to Claude as a prompt, so it
+// strengthens the test or sends evidence with nobody passing the grade on; each new grade comes
+// back the same way, until the test is good or has had three rounds
+const ITERATE = 'Respond to this now: strengthen each test above graded weak or useless, or, where one is better than rated, send your evidence with the test_evidence tool. Each new grade comes back to you, until the test is graded good or it has had 3 rounds.'
+// a turn of Claude's, its start and end as the engine raises them
+const turns = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  on('turn.start', async (_$, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
+  on('turn.complete', async () => ({ text: 'done' }) as never)
+}
+const turnStart = ($: Parameters<Parameters<typeof test>[1]>[0], turnId: string) => $.turn.start({ text: '', turnId } as never)
+const turnEnd = ($: Parameters<Parameters<typeof test>[1]>[0], turnId: string) => $.turn.complete({ turnId, reason: 'answer', text: 'done' } as never)
+
+test('weak tests graded in a turn, over several files, go to Claude as one prompt when the turn ends', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const a = "it('a shallow check', () => { expect(f).toBeDefined() })\nit('does nothing', () => {})\n"
+  const b = "it('another shallow one', () => { expect(g).toBeDefined() })\n"
+  const { asked } = project(on, { 'src/a.test.ts': a, 'src/b.test.ts': b })
+  turns(on)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await turnStart($, 't1')
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: a } as never)
+  await clock.advance(10)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/b.test.ts', content: b } as never)
+  await clock.advance(10)
+  // graded, but held while the turn runs
+  expect(asked).toEqual([])
+
+  await turnEnd($, 't1')
+  expect(asked).toHaveLength(1)
+  const lines = asked[0]!.split('\n')
+  expect(lines.filter(l => l.startsWith('- '))).toEqual([
+    '- useless · src/a.test.ts · does nothing — useless because.',
+    '- weak · src/a.test.ts · a shallow check — weak because.',
+    '- weak · src/b.test.ts · another shallow one — weak because.',
+  ])
+  expect(lines.at(-1)).toBe(ITERATE)
+})
+
+test('a weak test edited and graded weak again comes back as the next round; graded good, it is told as accepted with no prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  // weak until its body asserts a value
+  const { asked, notes } = project(on, files, { rule: (_name, prompt) => (prompt.includes('toBe(42)') ? 'good' : 'weak') })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const edit = async (body: string) => {
+    const before = files['src/a.test.ts']!
+    files['src/a.test.ts'] = `it('a shallow check', () => { ${body} })\n`
+    await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: before, new_string: files['src/a.test.ts'] } as never)
+    await clock.advance(10)
+  }
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  expect(asked).toHaveLength(1)
+
+  await edit('expect(f()).toBeTruthy()')
+  expect(asked).toHaveLength(2)
+  expect(asked[1]).toContain('- weak · src/a.test.ts · a shallow check')
+  expect(asked[1]!.split('\n').at(-1)).toBe(ITERATE)
+
+  await edit('expect(f()).toBe(42)')
+  // no third prompt: the good grade is only added for Claude to read
+  expect(asked).toHaveLength(2)
+  expect(notes.at(-1)).toBe('Now graded good (test-grader):\n- good · src/a.test.ts · a shallow check')
+})
+
+test('a test still weak after three rounds is told once, asking Claude to tell the person, and then no more', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  const { asked } = project(on, files)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  for (let i = 0; i < 4; i++) {
+    const before = files['src/a.test.ts']!
+    files['src/a.test.ts'] = `it('a shallow check', () => { expect(f${i}).toBeDefined() })\n`
+    await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: before, new_string: files['src/a.test.ts'] } as never)
+    await clock.advance(10)
+  }
+
+  // rounds one to three ask for a fix, the fourth weak grade asks Claude to tell the person, the fifth nothing
+  expect(asked.map(text => text.split('\n').at(-1))).toEqual([
+    ITERATE,
+    ITERATE,
+    ITERATE,
+    'Respond to this now: tell the person which tests are still weak or useless and why; test-grader has stopped asking about them.',
+  ])
+  expect(asked[3]).toContain('Still weak or useless after 3 rounds')
+})
+
+test('a test Grade all listed weak, edited by Claude, has its new grade sent back too', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  const { asked } = project(on, files)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(asked).toHaveLength(1)
+
+  const before = files['src/a.test.ts']!
+  files['src/a.test.ts'] = "it('a shallow check', () => { expect(f()).toBeTruthy() })\n"
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: before, new_string: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+
+  expect(asked).toHaveLength(2)
+  expect(asked[1]).toContain('- weak · src/a.test.ts · a shallow check — weak because.')
+  expect(asked[1]!.split('\n').at(-1)).toBe(ITERATE)
 })

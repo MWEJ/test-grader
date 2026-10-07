@@ -14,6 +14,8 @@ const fileOpen = atom({ plugin: 'test-grader', key: 'fileOpen' } as const, {})
 const openError = atom({ plugin: 'test-grader', key: 'openError' } as const, null)
 const seen = atom({ plugin: 'test-grader', key: 'seen' } as const, {})
 const openFor = atom({ plugin: 'test-grader', key: 'openFor' } as const, null)
+const rounds = atom({ plugin: 'test-grader', key: 'rounds' } as const, {})
+const outbox = atom({ plugin: 'test-grader', key: 'outbox' } as const, { accepted: [], going: [], spent: [] })
 const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
 
 const GREEN = '#4ade80'
@@ -393,27 +395,96 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   return verdicts
 }
 
+// A test Claude wrote or edited, graded weak or useless, goes back to Claude as a prompt, so it
+// strengthens the test or sends evidence without the person passing the grade on; each new grade
+// comes back the same way. A test graded good again after that is told as accepted. Each test
+// gets MAX_ROUNDS such rounds; past them Claude is asked once to tell the person what is left
+const MAX_ROUNDS = 3
+const roundKey = (file: string, name: string): string => `${file}::${name}`
+const ITERATE_NUDGE = `Respond to this now: strengthen each test above graded weak or useless, or, where one is better than rated, send your evidence with the test_evidence tool. Each new grade comes back to you, until the test is graded good or it has had ${MAX_ROUNDS} rounds.`
+const SPENT_NUDGE = 'Respond to this now: tell the person which tests are still weak or useless and why; test-grader has stopped asking about them.'
+
+// the round a test is on now: one more for a weak or useless grade, none once it is good
+const countRound = async ($: EngineInterface, file: string, name: string, verdict: Verdict | undefined): Promise<{ round: number; wasRetried: boolean }> => {
+  const key = roundKey(file, name)
+  const before = (await read($, rounds))[key] ?? 0
+  const round = verdict === 'weak' || verdict === 'useless' ? before + 1 : 0
+  if (round !== before) await update($, rounds, all => (({ [key]: _, ...rest }) => (round > 0 ? { ...rest, [key]: round } : rest))(all))
+  return { round, wasRetried: before > 0 }
+}
+
+// Grades wait in the outbox while grading is under way or a turn of Claude's runs, then go
+// as one prompt: several weak tests, or several files graded, are one round, not one prompt each.
+// A test graded again before then is listed once, at its latest grade
+type Report = { file: string; name: string; verdict?: Verdict; reason?: string }
+const reportGrades = async ($: EngineInterface, graded: Report[]): Promise<void> => {
+  for (const t of graded) {
+    // a test waiting in the outbox is in a round already counted (one edit graded on both
+    // lists): its entry takes this grade's words and keeps its place
+    const isSame = (o: Report): boolean => roundKey(o.file, o.name) === roundKey(t.file, t.name)
+    const box = await read($, outbox)
+    if ([...box.accepted, ...box.going, ...box.spent].some(isSame)) {
+      const take = (list: Report[]) => list.map(o => (isSame(o) ? { ...o, reason: t.reason ?? o.reason } : o))
+      await update($, outbox, b => ({ accepted: take(b.accepted), going: take(b.going), spent: take(b.spent) }))
+      continue
+    }
+    const { round, wasRetried } = await countRound($, t.file, t.name, t.verdict)
+    const kind = round === 0 && wasRetried ? 'accepted' : round > 0 && round <= MAX_ROUNDS ? 'going' : round === MAX_ROUNDS + 1 ? 'spent' : null
+    await update($, outbox, box => {
+      const key = roundKey(t.file, t.name)
+      const others = (list: Report[]) => list.filter(o => roundKey(o.file, o.name) !== key)
+      const next = { accepted: others(box.accepted), going: others(box.going), spent: others(box.spent) }
+      return kind === null ? next : { ...next, [kind]: [...next[kind], t] }
+    })
+  }
+  await flush($)
+}
+
+// a turn of Claude's under way: its grades wait for its end
+let isTurnRunning = false
+
+const flush = async ($: EngineInterface): Promise<void> => {
+  if (working > 0 || isTurnRunning) return
+  const box = await read($, outbox)
+  const { accepted, going, spent } = box
+  if (accepted.length + going.length + spent.length === 0) return
+  await update($, outbox, () => ({ accepted: [], going: [], spent: [] }))
+  const cwd = await $.session.cwd()
+  const lines = [
+    ...(accepted.length > 0 ? ['Now graded good (test-grader):', ...accepted.map(t => `- good · ${shortPath(t.file, cwd)} · ${t.name}`)] : []),
+    ...(going.length > 0 ? ['Tests graded weak or useless (test-grader):', ...flaggedLines(going, cwd), EVIDENCE_HINT] : []),
+    ...(spent.length > 0 ? [`Still weak or useless after ${MAX_ROUNDS} rounds (test-grader stops asking about these):`, ...flaggedLines(spent, cwd)] : []),
+  ]
+  // accepted alone needs nothing of Claude: added to the conversation, no turn started
+  await share($, lines.join('\n'), going.length > 0 ? ITERATE_NUDGE : spent.length > 0 ? SPENT_NUDGE : undefined)
+}
+
 // Grading under way in this load of the module: a Grade all run, a regrade, a new test's
 // grading. The host keeps their marks (a run running, rows reviewing, tests pending) across a
 // reload of this mod, which drops the work itself; at a session's start with none under way
 // here, resume takes the marks left behind for work to do again
 let working = 0
-const busy = async <T,>(work: () => Promise<T>): Promise<T> => {
+// the last grading under way done: the grades it left go to Claude
+const finishWork = async ($: EngineInterface): Promise<void> => {
+  working -= 1
+  if (working === 0) await flush($).catch(() => undefined)
+}
+const busy = async <T,>($: EngineInterface, work: () => Promise<T>): Promise<T> => {
   working += 1
   try {
     return await work()
   } finally {
-    working -= 1
+    await finishWork($)
   }
 }
 
 // work started on the next tick, counted as under way from now
 const soon = ($: EngineInterface, work: () => Promise<void>): void => {
   working += 1
-  void $.clock.after(1, () => void work().catch(() => undefined).finally(() => (working -= 1)))
+  void $.clock.after(1, () => void work().catch(() => undefined).finally(() => finishWork($)))
 }
 
-const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => busy(() => evaluateNow($, file, ids))
+const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => busy($, () => evaluateNow($, file, ids))
 const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
   const fail = (): Promise<void> =>
     update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' } : t)))
@@ -437,10 +508,8 @@ const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, st
         }))
       }),
     )
-    // the weak and useless among them, told to Claude (the good ones are no news)
     const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
-    const lines = flaggedLines(mine, await $.session.cwd())
-    if (lines.length > 0) await share($, ['New tests graded weak or useless (test-grader):', ...lines, EVIDENCE_HINT].join('\n'))
+    await reportGrades($, mine)
   } catch {
     await fail()
   }
@@ -634,7 +703,7 @@ const loadGrades = async ($: EngineInterface): Promise<void> => {
 }
 
 // isFresh: grade every file again, the remembered ones too
-const gradeAll = ($: EngineInterface, isFresh = false): Promise<void> => busy(() => gradeAllNow($, isFresh))
+const gradeAll = ($: EngineInterface, isFresh = false): Promise<void> => busy($, () => gradeAllNow($, isFresh))
 const gradeAllNow = async ($: EngineInterface, isFresh: boolean): Promise<void> => {
   const before = await read($, existing)
   if (before.state === 'running') return
@@ -771,9 +840,13 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
 
 // these rows of a file, as Grade all lists them, graded again, their reviewing marks cleared
 const regradeRows = ($: EngineInterface, file: string, text: string, names: string[]): Promise<void> =>
-  busy(async () => {
+  busy($, async () => {
     const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
     const verdicts = await grade($, file, text, names).catch(() => null)
+    await reportGrades($, names.flatMap(name => {
+      const v = verdicts?.find(x => x.name === name)
+      return v ? [{ file, name, verdict: v.verdict, reason: v.reason }] : []
+    }))
     await update($, existing, r => ({
       ...r,
       results: r.results.map(t => {
@@ -1056,7 +1129,10 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   }))
   await update($, tests, list => list.map(t => (t.file === file && t.name === name && t.status !== 'pending' ? { ...t, status: 'done' as const, ...judged } : t)))
   await saveGrades($)
-  return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}`
+  const { round } = await countRound($, file, name, v.verdict)
+  const left =
+    round === 0 ? '' : round <= MAX_ROUNDS ? ` Strengthen it, or send other evidence (round ${round} of ${MAX_ROUNDS}).` : ' test-grader has stopped asking about this test: tell the person what is left.'
+  return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}${left}`
 }
 
 export const register: Register = on => {
@@ -1131,9 +1207,17 @@ export const register: Register = on => {
     return ran
   })
 
+  on('turn.start', async ($, e, next) => {
+    isTurnRunning = true
+
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
+    isTurnRunning = false
     await refreshCoverage($)
     await catchUp($).catch(() => undefined)
+    await flush($).catch(() => undefined)
 
     return next(e)
   })

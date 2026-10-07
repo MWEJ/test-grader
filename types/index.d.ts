@@ -44,6 +44,9 @@ export type ExistingRun = {
   isFresh?: boolean
 }
 
+/** a test's grade as Claude is told it */
+export type GradeReport = { file: string; name: string; verdict?: Verdict; reason?: string }
+
 export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: string }
 
 declare module 'claude-code' {
@@ -67,6 +70,10 @@ declare module 'claude-code' {
       openFor: string | null
       /** the project's coverage run as a note names it (npx jest --coverage); null: none test-grader knows */
       coverWith: string | null
+      /** how many weak or useless grades in a row each test Claude wrote or edited has had, by file::name; a good one leaves */
+      rounds: Record<string, number>
+      /** grades waiting to go to Claude as one prompt, once no grading or turn is under way */
+      outbox: { accepted: GradeReport[]; going: GradeReport[]; spent: GradeReport[] }
     }
   }
 }

@@ -18,8 +18,12 @@ The pane opens at session start, or with `/test-grader`. It shows:
 
 ### Grading
 
-- **New tests are graded as they are written.** When Claude writes or edits a test file, each new test is sent to the grader and tracked in the pane as new. Claude is told about the weak and useless ones in the conversation.
-- **Edits regrade weak tests.** Editing a test rated weak or useless grades it again. A test that is deleted leaves the pane.
+- **New tests are graded as they are written.** When Claude writes or edits a test file, each new test is sent to the grader and tracked in the pane as new.
+- **Edits regrade weak tests.** Editing a test rated weak or useless grades it again, whether it was written this session or listed by Grade all tests. A test that is deleted leaves the pane.
+- **Claude keeps going until the test is good.** A weak or useless grade on a test Claude wrote or edited goes back to Claude as a prompt. Claude then strengthens the test or sends evidence. Each new grade comes back the same way, so nobody has to pass grades on.
+- **One prompt per round.** Grades wait while grading or a turn of Claude's is still running, then go out together as one prompt. A test graded twice before then is listed once, with its latest grade.
+- **Accepted tests are told, not prompted.** When a test that was weak is graded good, Claude is told in the conversation, and no new turn starts.
+- **Three rounds per test.** A test still weak or useless after three rounds is reported once more, asking Claude to tell you what is left. After that, test-grader stops asking about it. Evidence the grader rejects counts as a round too.
 - **Changes made outside Claude are caught.** At the end of each turn, test files that changed since they were last seen are checked for new and removed tests.
 - **Grade all tests** grades the whole project. It grades only the files that changed since their last grading. Rows waiting for the grader are marked *reviewing*. When the run finishes, Claude is asked to report the result and offer to strengthen the weak and useless tests, worst first.
 - **Regrade all** grades every file again, unchanged ones included.
