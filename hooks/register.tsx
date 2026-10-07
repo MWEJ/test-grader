@@ -11,6 +11,7 @@ const existing = atom({ plugin: 'test-watch', key: 'existing' } as const, { stat
 const noteError = atom({ plugin: 'test-watch', key: 'noteError' } as const, null)
 const opened = atom({ plugin: 'test-watch', key: 'open' } as const, [])
 const fileOpen = atom({ plugin: 'test-watch', key: 'fileOpen' } as const, {})
+const openError = atom({ plugin: 'test-watch', key: 'openError' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -57,6 +58,23 @@ const caseNames = (text: string): string[] => {
 }
 
 const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+// the lines a text fills at this width, broken between words; a word wider than a line, in pieces
+const wrapWords = (s: string, n: number): string[] => {
+  const lines: string[] = []
+  let line = ''
+  for (const word of s.split(' ')) {
+    for (let rest = word; ; ) {
+      const room = line ? n - line.length - 1 : n
+      if (rest.length <= room) {
+        line = line ? `${line} ${rest}` : rest
+        break
+      }
+      if (line) lines.push(line), (line = '')
+      else lines.push(rest.slice(0, n)), (rest = rest.slice(n))
+    }
+  }
+  return [...lines, line]
+}
 
 // where each case starts in a file, in file order: right after the previous case closes
 // (a line opening with "})"), so what sits between two cases (a comment, the data a
@@ -453,6 +471,147 @@ const prune = async ($: EngineInterface): Promise<void> => {
   await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
 }
 
+// the line a case opens on: its own it( or test(, a looped case's the loop's; else the top
+const caseLine = (text: string, name: string): number => {
+  for (const pattern of CASE_PATTERNS) {
+    for (const m of text.matchAll(pattern)) {
+      if (fits(nameOf(m), name)) return text.slice(0, (m.index ?? 0) + m[0].length - m[0].trimStart().length).split('\n').length
+    }
+  }
+  return 1
+}
+
+// an editor as the system names it: its program, and on macOS the app it is inside
+type Editor = { exe: string; app?: string; id?: string }
+
+// macOS: the app a double-click opens the file in, as JSON, or nothing
+const MAC_DEFAULT = `ObjC.import('AppKit')
+function run(argv) {
+  const url = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.fileURLWithPath(argv[0]))
+  if (url.isNil()) return ''
+  const bundle = $.NSBundle.bundleWithURL(url)
+  return JSON.stringify({ app: url.path.js, id: bundle.bundleIdentifier.js, exe: bundle.executablePath.js })
+}`
+
+// editors that go to a line, by program name: VS Code and its forks, Zed, Sublime Text, JetBrains
+const VSCODES = /^(code|code-insiders|codium|vscodium|cursor|windsurf|antigravity|antigravity-ide)$/
+const ZEDS = /^(zed|zeditor|zed-preview)$/
+const SUBLIMES = /^(subl|sublime_text)$/
+const JETBRAINS = /^(idea|webstorm|pycharm|phpstorm|goland|rider|clion|rubymine|rustrover|datagrip|studio)(64)?$/
+
+const ran = async ($: EngineInterface, argv: string[]): Promise<{ stdout: string; isOk: boolean }> =>
+  $.process.run(argv, { timeoutMs: 30_000 }).then(
+    r => ({ stdout: r.stdout, isOk: r.exitCode === 0 }),
+    () => ({ stdout: '', isOk: false }),
+  )
+
+// the program in a command line: the first word, or the first quoted run
+const programOf = (command: string): string => command.trim().match(/^"([^"]+)"|^(\S+)/)?.slice(1).find(Boolean) ?? ''
+
+// how this editor opens a file at a line, or null when it has no way to
+const atLine = async ($: EngineInterface, ed: Editor, file: string, line: number, isWindows: boolean): Promise<string[] | null> => {
+  const sep = ed.exe.includes('\\') ? '\\' : '/'
+  // a bare name, found on the PATH, has no folder to look in
+  const dir = ed.exe.includes(sep) ? ed.exe.slice(0, ed.exe.lastIndexOf(sep)) : null
+  // a VS Code fork ships a product.json naming its command, beside it or inside its app
+  const root = ed.app ? `${ed.app}/Contents/Resources/app` : dir && `${dir}${sep}resources${sep}app`
+  const product = root ? await $.fs.read(`${root}${sep}product.json`).then(text => JSON.parse(text) as { applicationName?: unknown }, () => null) : null
+  if (typeof product?.applicationName === 'string') {
+    const cli = ed.app ? `${root}/bin/${product.applicationName}` : `${dir}${sep}bin${sep}${product.applicationName}${isWindows ? '.cmd' : ''}`
+    return [...(isWindows ? ['cmd', '/c'] : []), cli, '--goto', `${file}:${line}`]
+  }
+  if (ed.id?.startsWith('dev.zed.')) return [`${ed.app}/Contents/MacOS/cli`, `${file}:${line}`]
+  if (ed.id?.startsWith('com.sublimetext.')) return [`${ed.app}/Contents/SharedSupport/bin/subl`, `${file}:${line}`]
+  if (ed.id?.startsWith('com.jetbrains.') || ed.id === 'com.google.android.studio') return [ed.exe, '--line', String(line), file]
+  const name = ed.exe.slice(ed.exe.lastIndexOf(sep) + 1).toLowerCase().replace(/\.(exe|cmd|sh)$/, '')
+  if (VSCODES.test(name)) return [ed.exe, '--goto', `${file}:${line}`]
+  if (ZEDS.test(name) || SUBLIMES.test(name)) return [ed.exe, `${file}:${line}`]
+  if (JETBRAINS.test(name)) return [ed.exe, '--line', String(line), file]
+  return null
+}
+
+// Windows: the user's choice for the extension, else the class's, then that one's open command
+const windowsDefault = async ($: EngineInterface, file: string): Promise<Editor | null> => {
+  const ext = file.match(/\.[^.\\/]+$/)?.[0]
+  if (!ext) return null
+  const value = (stdout: string, kind: string): string | undefined => stdout.match(new RegExp(`${kind}\\s+REG_(?:EXPAND_)?SZ\\s+(.+)`))?.[1]?.trim()
+  const choice = await ran($, ['reg', 'query', `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\${ext}\\UserChoice`, '/v', 'ProgId'])
+  const cls = await ran($, ['reg', 'query', `HKCR\\${ext}`, '/ve'])
+  const progId = (choice.isOk ? value(choice.stdout, 'ProgId') : undefined) ?? (cls.isOk ? value(cls.stdout, '\\S+') : undefined)
+  if (!progId) return null
+  const open = await ran($, ['reg', 'query', `HKCR\\${progId}\\shell\\open\\command`, '/ve'])
+  const command = open.isOk ? value(open.stdout, '\\S+') : undefined
+  return command ? { exe: programOf(command) } : null
+}
+
+// Linux: the file's type, the .desktop file that opens it, and that one's Exec program
+const linuxDefault = async ($: EngineInterface, file: string): Promise<Editor | null> => {
+  const type = (await ran($, ['xdg-mime', 'query', 'filetype', file])).stdout.trim()
+  const desktop = type ? (await ran($, ['xdg-mime', 'query', 'default', type])).stdout.trim() : ''
+  if (!desktop) return null
+  const home = await $.env.get('HOME')
+  const dataHome = (await $.env.get('XDG_DATA_HOME')) || (home ? `${home}/.local/share` : '')
+  const dataDirs = ((await $.env.get('XDG_DATA_DIRS')) || '/usr/local/share:/usr/share').split(':')
+  for (const base of [dataHome, ...dataDirs, '/var/lib/flatpak/exports/share', '/var/lib/snapd/desktop'].filter(Boolean)) {
+    const text = await $.fs.read(`${base}/applications/${desktop}`).catch(() => null)
+    const exec = text?.match(/^Exec=(.+)$/m)?.[1]
+    if (exec) return { exe: programOf(exec.replace(/^env\s+(\S+=\S+\s+)*/, '')) }
+  }
+  return null
+}
+
+// the editor named by VISUAL or EDITOR, when it is one that goes to a line
+const namedEditor = async ($: EngineInterface): Promise<Editor | null> => {
+  for (const command of [await $.env.get('VISUAL'), await $.env.get('EDITOR')]) {
+    const exe = programOf(command ?? '')
+    const name = exe.slice(Math.max(exe.lastIndexOf('/'), exe.lastIndexOf('\\')) + 1).toLowerCase().replace(/\.(exe|cmd|sh)$/, '')
+    if ([VSCODES, ZEDS, SUBLIMES, JETBRAINS].some(family => family.test(name))) return { exe }
+  }
+  return null
+}
+
+// the commands to try, in order: VISUAL or EDITOR, the system's default app at the line, then the file as the system opens it
+const openers = async ($: EngineInterface, file: string, line: number): Promise<string[][]> => {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const named = await namedEditor($)
+  const ways: string[][] = []
+  const add = async (ed: Editor | null): Promise<void> => {
+    const argv = ed && (await atLine($, ed, file, line, isWindows))
+    if (argv) ways.push(argv)
+  }
+  await add(named)
+  if (named && ways.length > 0) return [...ways, ...(isWindows ? [['cmd', '/c', 'start', '', file]] : [])]
+  if (isWindows) {
+    await add(await windowsDefault($, file))
+    return [...ways, ['cmd', '/c', 'start', '', file]]
+  }
+  const mac = await ran($, ['osascript', '-l', 'JavaScript', '-e', MAC_DEFAULT, file])
+  if (mac.isOk) {
+    const app = mac.stdout.trim() ? (JSON.parse(mac.stdout) as Editor) : null
+    await add(app)
+    return [...ways, app?.app ? ['open', '-a', app.app, file] : ['open', file]]
+  }
+  await add(await linuxDefault($, file))
+  return [...ways, ['xdg-open', file]]
+}
+
+// the editor at the case's line, else the file as the system opens it; why nothing did, in the pane
+const openInEditor = async ($: EngineInterface, file: string, name: string): Promise<void> => {
+  const line = await $.fs.read(file).then(text => caseLine(text, name), () => 1)
+  let why = ''
+  for (const argv of await openers($, file, line)) {
+    try {
+      const done = await $.process.run(argv, { timeoutMs: 30_000 })
+      if (done.exitCode === 0) return update($, openError, () => null)
+      why = done.stderr.trim() || `exit ${done.exitCode}`
+    } catch (err) {
+      why = err instanceof Error ? err.message : String(err)
+    }
+  }
+  const cwd = await $.session.cwd()
+  await update($, openError, () => `Couldn't open ${shortPath(file, cwd)} in an editor: ${why}`)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tests', description: 'Open the test-watch pane (new tests, their quality, coverage)' })
@@ -514,6 +673,7 @@ export const register: Register = on => {
     const running = await read($, run)
     const graded = await read($, existing)
     const noteFailed = await read($, noteError)
+    const openFailed = await read($, openError)
     const now = await $.clock.now()
 
     const columns = e.viewport?.columns ?? 60
@@ -590,13 +750,18 @@ export const register: Register = on => {
           <Box key={`row-${key}`} flexDirection="column" marginLeft={2}>
             <Box flexDirection="row" gap={1}>
               <Text bold color={stateColor(t.state)}>{t.state}</Text>
-              <Button key={key} plain label={clamp(t.name, Math.max(12, columns - t.state.length - (t.isNew ? 10 : 6)))} onPress={() => toggle(key)} />
+              <Box flexDirection="column">
+                {wrapWords(t.name, Math.max(12, columns - t.state.length - (t.isNew ? 10 : 6))).map((part, i) => (
+                  <Button key={i === 0 ? key : `${key}#${i}`} plain label={part} onPress={() => toggle(key)} />
+                ))}
+              </Box>
               {t.isNew && <Text color={VIOLET}>new</Text>}
             </Box>
             {isOpen.has(key) && (
               <Box flexDirection="column" marginLeft={2}>
                 {t.summary && <Text>{t.summary}</Text>}
                 {reason && <Text color={stateColor(t.state)}>{reason}</Text>}
+                <Button key={`o:${t.file}:${t.name}`} plain label="Open in editor" onPress={() => $.clock.after(1, () => void openInEditor($, t.file, t.name))} />
               </Box>
             )}
           </Box>,
@@ -619,6 +784,7 @@ export const register: Register = on => {
           )}
           {drawn as never}
         </Box>
+        {openFailed !== null && <Text color={RED}>{openFailed}</Text>}
         {noteFailed !== null && <Text color={RED}>{`Couldn't share the result with Claude: ${noteFailed}`}</Text>}
         <Box flexDirection="column" marginTop={1}>
           <Box flexDirection="row" justifyContent="space-between">

@@ -41,6 +41,8 @@ declare module 'claude-code' {
       open: string[]
       /** a file pressed open (true) or closed (false) this session; absent, its default */
       fileOpen: Record<string, boolean>
+      /** why the last Open in editor opened nothing, until one does */
+      openError: string | null
     }
   }
 }
