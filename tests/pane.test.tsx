@@ -103,11 +103,11 @@ const mount = ($: Parameters<Parameters<typeof test>[1]>[0], rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => 'good' | 'weak' | 'useless'; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string> }
+type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => 'good' | 'weak' | 'useless'; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string }
 // a command's answer: its exit code, or what it printed too
 type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 // env: the variables the mod reads; outside: files by their full path, outside the project
-function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {} }: Project = {}) {
+function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -115,8 +115,13 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   // the notes for Claude, as the debug log has them: a row a mod appends reaches no test
   // hook (the kit answers it "no implementation"), so the log line is what a test can see
   const notes: string[] = []
+  // every debug line, as logged
+  const logs: string[] = []
+  // each grader call's room for its reply
+  const budgets: number[] = []
   on('ui.log', async (_$, e) => {
     const text = String((e as { text?: unknown }).text)
+    logs.push(text)
     if (text.startsWith('test-watch: note to Claude')) notes.push(text.replace(/^[^)]*\): /, ''))
     return { value: undefined } as never
   })
@@ -149,6 +154,7 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
   // grades by the body: a test asserting true is useless, one with "shallow" in its name weak, else good
   on('model.complete', async (_$, e) => {
     const prompt = String((e as { prompt?: unknown }).prompt)
+    budgets.push(Number((e as { maxTokens?: unknown }).maxTokens))
     if (gate && prompts.length === 0) {
       prompts.push(prompt)
       await gate()
@@ -165,16 +171,18 @@ function project(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<st
       value: {
         isAnswered: true,
         usage: {},
-        text: JSON.stringify(
-          names.flatMap(name => expand[name] ?? [name]).map(name => {
-            const verdict = rule ? rule(name, prompt) : name.includes('shallow') ? 'weak' : name.includes('nothing') ? 'useless' : 'good'
-            return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.` }
-          }),
+        text: (cut ?? (t => t))(
+          JSON.stringify(
+            names.flatMap(name => expand[name] ?? [name]).map(name => {
+              const verdict = rule ? rule(name, prompt) : name.includes('shallow') ? 'weak' : name.includes('nothing') ? 'useless' : 'good'
+              return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.` }
+            }),
+          ),
         ),
       },
     } as never
   })
-  return { prompts, notes, runs }
+  return { prompts, notes, runs, logs, budgets }
 }
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the weak and useless worst first', async ($, on) => {
@@ -1075,4 +1083,35 @@ test('at a turn\'s end, unchanged files cost no grader call, nor does one Claude
   await clock.advance(10)
 
   expect(prompts).toHaveLength(afterWrite)
+})
+
+test('a grader reply cut off before its end keeps every verdict that arrived whole, and the log says it was cut', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { logs } = project(
+    on,
+    { 'src/k.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('a shallow check', () => { expect(f).toBeDefined() })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" },
+    // the reply stops partway through its third verdict
+    { cut: reply => reply.slice(0, reply.lastIndexOf('{"name"') + 30) },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(JSON.stringify(await ui.drawn())).toContain('3 tests · 1 good · 1 weak · 0 useless · 1 unrated')
+  expect(logs.some(line => line.startsWith('test-watch: a grader reply was cut off') && line.includes('src/k.test.ts'))).toBe(true)
+})
+
+test('a grader call has room in its reply for a looped test\'s every case', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const loop = "for (const name of NAMES) {\n  it(`the lifetime: ${name}`, () => { expect(ttl(name)).toBeDefined() })\n}\n"
+  const { budgets } = project(on, { 'src/l.test.ts': loop }, { expand: { 'the lifetime: ${name}': Array.from({ length: 20 }, (_, i) => `the lifetime: case ${i}`) } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  // about 75 tokens a verdict, for 20 cases
+  expect(budgets[0]).toBeGreaterThanOrEqual(20 * 75)
+  expect(budgets[0]).toBeGreaterThan(1500)
 })

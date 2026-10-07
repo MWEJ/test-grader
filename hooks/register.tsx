@@ -29,6 +29,9 @@ const CELLS = 12
 const BATCH = 10
 // grader calls in flight at once
 const PARALLEL = 4
+// a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
+// stand for many cases each
+const MAX_REPLY = 4000
 
 const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
 // a JS case opens its own line, so one quoted inside a fixture string is not one; its
@@ -130,22 +133,43 @@ const excerptOf = (source: string, names: string[]): string => {
   return [head.trimEnd(), '// … other tests left out …', ...bodies.map(b => clamp(b, room))].join('\n\n')
 }
 
-const parseVerdicts = (text: string): { name: string; summary: string; verdict: Verdict; reason: string }[] => {
+// the verdicts in a grader reply; of one cut off before its closing ], each object that
+// arrived whole (isCut)
+const parseVerdicts = (text: string): { verdicts: { name: string; summary: string; verdict: Verdict; reason: string }[]; isCut: boolean } => {
   const start = text.indexOf('[')
-  const end = text.lastIndexOf(']')
-  if (start < 0 || end <= start) return []
-  try {
-    const raw = JSON.parse(text.slice(start, end + 1)) as unknown
-    if (!Array.isArray(raw)) return []
-    return raw.flatMap(r => {
-      const o = r as Record<string, unknown>
-      const verdict = o.verdict === 'good' || o.verdict === 'weak' || o.verdict === 'useless' ? o.verdict : undefined
-      if (typeof o.name !== 'string' || !verdict) return []
-      return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: String(o.reason ?? '') }]
-    })
-  } catch {
-    return []
+  if (start < 0) return { verdicts: [], isCut: false }
+  const objects: unknown[] = []
+  let depth = 0
+  let from = -1
+  let inString = false
+  let isClosed = false
+  for (let i = start + 1; i < text.length && !isClosed; i++) {
+    const c = text[i]
+    if (inString) {
+      if (c === '\\') i++
+      else if (c === '"') inString = false
+    } else if (c === '"') inString = true
+    else if (c === '{') {
+      if (depth === 0) from = i
+      depth++
+    } else if (c === '}') {
+      depth--
+      if (depth === 0) {
+        try {
+          objects.push(JSON.parse(text.slice(from, i + 1)))
+        } catch {
+          // a malformed one is skipped; the rest still count
+        }
+      }
+    } else if (c === ']' && depth === 0) isClosed = true
   }
+  const verdicts = objects.flatMap(r => {
+    const o = r as Record<string, unknown>
+    const verdict = o.verdict === 'good' || o.verdict === 'weak' || o.verdict === 'useless' ? o.verdict : undefined
+    if (typeof o.name !== 'string' || !verdict) return []
+    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: String(o.reason ?? '') }]
+  })
+  return { verdicts, isCut: !isClosed }
 }
 
 // A note for Claude: a user-role row it reads on its next turn, no turn started. A refusal
@@ -176,7 +200,7 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   const source = excerptOf(text, names)
   const reply = await $.model.complete({
     model: 'haiku',
-    maxTokens: 1500,
+    maxTokens: MAX_REPLY,
     system: 'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
     prompt: [
       `Test file: ${file}`,
@@ -194,7 +218,12 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       '```',
     ].join('\n'),
   })
-  return reply.isAnswered ? parseVerdicts(reply.text) : null
+  if (!reply.isAnswered) return null
+  const { verdicts, isCut } = parseVerdicts(reply.text)
+  if (isCut) {
+    $.ui.log(`test-watch: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
+  }
+  return verdicts
 }
 
 const evaluate = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
