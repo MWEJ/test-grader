@@ -325,12 +325,15 @@ export const caseStarts = (text: string, file: string): { name: string; at: numb
 // a top-level declaration a test can use: a constant, a helper, a type, a fixture
 export const DECLARATION = /^(?:export\s+)?(?:declare\s+)?(?:(?:const|let|var|function\*?|async\s+function\*?|class|type|interface|enum|func|def|fn|struct)\s+(\w+)|(\w+)\s*=(?!=))/gm
 
-// A name with ${…} in it is a template: the cases a loop generates. The grader names each
-// case as the loop expands it, and a returned name belongs to the template it fits
-export const isTemplate = (name: string): boolean => /\$\{[^}]*\}/.test(name)
+// A name with a hole in it is a template: the cases a loop or a table generates. A hole is a
+// ${…}, or as it.each and test.each fill one, a printf mark (%s, %p, %i, %d, %j, %o, %#) or a
+// $field of the row. The grader names each case as it expands, and a returned name belongs to
+// the template it fits
+const HOLE = /\$\{[^}]*\}|%[sdifjoOpP#]|\$[A-Za-z_][\w.]*/
+export const isTemplate = (name: string): boolean => HOLE.test(name)
 export const fits = (template: string, name: string): boolean => {
   if (!isTemplate(template)) return template === name
-  const parts = template.split(/\$\{[^}]*\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  const parts = template.split(new RegExp(HOLE.source, 'g')).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
   return new RegExp(`^${parts.join('[\\s\\S]+?')}$`).test(name)
 }
 

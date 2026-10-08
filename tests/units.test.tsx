@@ -3,6 +3,7 @@ import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
 import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { isBuildFailure } from '../hooks/runner'
+import { fits, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -332,6 +333,40 @@ test('a verdict alike to two tests asked is given to neither', () => {
 
 test('a verdict under a loop\'s case keeps the case\'s name', () => {
   expect(asAsked(['adds ${a} and ${b}'], [v('adds 1 and 2')]).map(x => x.name)).toEqual(['adds 1 and 2'])
+})
+
+test('a verdict named with its describe groups answers for the test asked by the end of the name', () => {
+  const asked = ['appends every file', 'sends the body']
+  expect(asAsked(asked, [v('ApiClient.postMultipart › appends every file'), v('ApiClient › post › sends the body')]).map(x => x.name)).toEqual(asked)
+})
+
+test('a describe-prefixed verdict whose end is a group-qualified test asked answers for that test', () => {
+  expect(asAsked(['post › retries'], [v('ApiClient › post › retries')]).map(x => x.name)).toEqual(['post › retries'])
+})
+
+test('a describe-prefixed verdict whose end fits two tests asked, or none, keeps its own name', () => {
+  expect(asAsked(['retries', 'retries (2)', 'other'], [v('A › retries x')]).map(x => x.name)).toEqual(['A › retries x'])
+  expect(asAsked(['adds ${n}', 'adds ${m} twice'], [v('Math › adds 1 twice')]).map(x => x.name)).toEqual(['Math › adds 1 twice'])
+  // two fit its longer end: a shorter end that one test has does not settle it
+  expect(asAsked(['adds ${n} › x', 'adds 1 › ${m}', 'x'], [v('Math › adds 1 › x')]).map(x => x.name)).toEqual(['Math › adds 1 › x'])
+})
+
+test('a case of a table test asked keeps its name, not taken for a group around another test', () => {
+  // "parses › empty" is parses' case, though a test named empty was asked too
+  expect(asAsked(['parses', 'empty'], [v('parses › empty')]).map(x => x.name)).toEqual(['parses › empty'])
+})
+
+test('a describe-prefixed verdict for an it.each case keeps the expanded case\'s name', () => {
+  expect(asAsked(['adds %i and %i'], [v('Math › adds 1 and 2')]).map(x => x.name)).toEqual(['adds 1 and 2'])
+})
+
+test('an it.each name with printf marks or $fields is a template its expanded cases fit', () => {
+  expect(fits('formats %s as %p', 'formats a as "a"')).toBe(true)
+  expect(fits('row %# of %d', 'row 0 of 3')).toBe(true)
+  expect(fits('$label maps to $out.code', 'empty maps to 404')).toBe(true)
+  expect(fits('formats %s as %p', 'parses a as "a"')).toBe(false)
+  expect(isTemplate('costs 5% more')).toBe(false)
+  expect(isTemplate('pays $5')).toBe(false)
 })
 
 // a test the grader graded case by case, as one verdict under the test's own name

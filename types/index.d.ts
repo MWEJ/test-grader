@@ -55,6 +55,9 @@ export type ExistingRun = {
   only?: string[]
   /** while running: what a narrowed run grades, as Claude's note names it (a folder, the branch's changes) */
   scope?: string
+  /** the files the last run graded again for a change since their last grading, and graded for the first time, by their paths in the project */
+  changed?: string[]
+  added?: string[]
   /** what the last run's grader calls cost, in tokens: in (of them from the prompt cache) and out */
   spent?: { input: number; cached: number; output: number; cost?: number; unpriced?: number }
 }

@@ -723,10 +723,29 @@ const existingNote = (results: ExistingTest[], cwd: string, scope?: string, file
   const lines = [`Test grading (test-grader) finished${scope ? ` for ${scope}` : ''}: ${counts.join(' · ')}.`]
   if (files) lines.push(...namedFiles('Changed since their last grading', files.changed), ...namedFiles('Graded for the first time', files.added))
   const flagged = flaggedLines(results, cwd)
-  if (flagged.length > 0) lines.push(`Need work, worst first (${FLAGGED.join(', then ')}):`, ...flagged, EVIDENCE_HINT)
-  if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
+  if (flagged.length > 0) lines.push(`Need work, worst first (${FLAGGED.join(', then ')}):`, ...flagged.slice(0, MAX_NOTED), EVIDENCE_HINT)
+  if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.slice(0, MAX_NOTED).map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
+  // a big run's lists cut short: the rest counted by file, the files with the most first
+  if (flagged.length > MAX_NOTED || unrated.length > MAX_NOTED) {
+    const left = [...results.filter(t => isFlagged(t.verdict)).slice(MAX_NOTED), ...unrated.slice(MAX_NOTED)]
+    const byFile = new Map<string, Map<string, number>>()
+    for (const t of left) {
+      const tally = byFile.get(t.file) ?? new Map<string, number>()
+      const state = t.verdict ?? 'unrated'
+      tally.set(state, (tally.get(state) ?? 0) + 1)
+      byFile.set(t.file, tally)
+    }
+    const files = [...byFile].map(([file, tally]) => ({ file, tally, n: [...tally.values()].reduce((a, b) => a + b, 0) })).sort((a, b) => b.n - a.n || a.file.localeCompare(b.file))
+    lines.push(
+      `${left.length} more not listed, by file: ${files.slice(0, MAX_NAMED_FILES).map(f => `${shortPath(f.file, cwd)} (${[...f.tally].map(([s, n]) => `${n} ${s}`).join(', ')})`).join('; ')}${files.length > MAX_NAMED_FILES ? `; and ${files.length - MAX_NAMED_FILES} more files` : ''}.`,
+      'test_grades with path lists a file\'s or a folder\'s in full.',
+    )
+  }
   return lines.join('\n')
 }
+// how many flagged, and how many unrated, tests a note lists by name: a big run's lists
+// would fill Claude's context, so the rest are counted by file
+const MAX_NOTED = 40
 
 // Grade all tests: every case of every test file git tracks, BATCH cases a call and
 // parallel calls at once; the results keep file order. A batch the grader fails leaves
@@ -969,6 +988,8 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
       graded,
       remembered,
       spent,
+      changed: runFiles.changed,
+      added: runFiles.added,
       ...(isStopped ? { message: `Stopped: ${done} of ${files.length} files graded.` } : skipped > 0 ? { message: skipped === 1 ? '1 file could not be read, and was passed over.' : `${skipped} files could not be read, and were passed over.` } : {}),
     }))
     await saveGrades($)
@@ -1642,9 +1663,14 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
     .sort((a, b) => LISTED.indexOf(a as State) - LISTED.indexOf(b as State))
     .join(' or ')
   const waiting = count('reviewing') > 0 ? `\n${count('reviewing')} still being graded: ask again in a moment for their grades.` : ''
+  // what the last grading run found changed, in scope: the files to look at first
+  const last = await read($, existing)
+  const inScopeFile = (rel: string): boolean => scope === '' || `${cwd}/${rel}` === scope || `${cwd}/${rel}`.startsWith(`${scope}/`)
+  const files = [...namedFiles('The last run graded again, changed since their last grading', (last.changed ?? []).filter(inScopeFile)), ...namedFiles('The last run graded for the first time', (last.added ?? []).filter(inScopeFile))]
+  const runLines = isWritten || files.length === 0 ? '' : `\n${files.join('\n')}`
   if (chosen.length === 0) {
     const hint = count('ungraded') > 0 ? ' Grade all tests in the Tests pane grades the ones never graded.' : ''
-    return `${head}\nNone is ${names}.${hint}${waiting}`
+    return `${head}${runLines}\nNone is ${names}.${hint}${waiting}`
   }
   const shown = chosen.slice(0, limit)
   const texts = new Map<string, string | null>()
@@ -1665,7 +1691,7 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
   }
   const more = chosen.length > shown.length ? `\n${chosen.length - shown.length} more not listed; raise limit or narrow path to see them.` : ''
   const act = shown.some(t => isFlagged(verdictOf(t.state))) ? `\n${EVIDENCE_HINT}` : ''
-  return `${head}\n${names[0]!.toUpperCase()}${names.slice(1)}, worst first:\n${lines.join('\n')}${more}${act}${waiting}`
+  return `${head}${runLines}\n${names[0]!.toUpperCase()}${names.slice(1)}, worst first:\n${lines.join('\n')}${more}${act}${waiting}`
 }
 
 // The test files this branch changed: against where it left main (or master, or the remote's
@@ -1799,6 +1825,32 @@ const SETTINGS: Record<string, (value: unknown) => void> = {
   graderWorkers: v => (parallel = workersOf(v)),
 }
 
+// The session's tools, registered at its start; registered again at a turn's end when the
+// session has lost any of them, as a long run can, so the next prompt has them back
+const TOOLS = [
+  { name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA, what: 'evidence' },
+  { name: GRADES_TOOL, description: GRADES_DESCRIPTION, inputSchema: GRADES_SCHEMA, what: 'grades' },
+  { name: GRADE_TOOL, description: GRADE_DESCRIPTION, inputSchema: GRADE_SCHEMA, what: 'grade' },
+  { name: COVERAGE_TOOL, description: COVERAGE_DESCRIPTION, inputSchema: COVERAGE_SCHEMA, what: 'coverage' },
+  { name: CONTEXT_TOOL, description: CONTEXT_DESCRIPTION, inputSchema: CONTEXT_SCHEMA, what: 'context' },
+  { name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA, what: 'verify' },
+] as const
+const registerTools = async ($: EngineInterface, only?: Set<string>): Promise<void> => {
+  for (const { what, ...tool } of TOOLS) {
+    if (only && !only.has(tool.name)) continue
+    await $.tool
+      .register(tool as never)
+      .catch(error => $.ui.log(`test-grader: the ${what} tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+  }
+}
+const restoreTools = async ($: EngineInterface): Promise<void> => {
+  const listed = new Set((await $.tool.list()).map(t => t.name))
+  const missing = new Set(TOOLS.map(t => t.name).filter(name => !listed.has(`mcp__test-grader__${name}`)))
+  if (missing.size === 0) return
+  $.ui.log(`test-grader: the session had lost ${[...missing].join(', ')}; registered again`, { to: 'debug' })
+  await registerTools($, missing)
+}
+
 export const register: Register = (on, options) => {
   for (const [field, apply] of Object.entries(SETTINGS)) apply(options[field])
   on('config.set', async ($, e, next) => {
@@ -1831,11 +1883,12 @@ export const register: Register = (on, options) => {
     (_$, _e, next) => ({ result: `The grade tool could not answer (${next.error.kind}); ask again.` }),
   )
 
-  // what the grader reads: files the session can read already, so no permission asked
+  // the coverage tool runs the project's tests: the person is asked first, as for any tool
   on('tool.call', { tool: 'mcp__test-grader__test_coverage' }, async ($, e) => ({ result: await answerCoverage($, e as never) })).catch(
     (_$, _e, next) => ({ result: `The coverage tool could not answer (${next.error.kind}); ask again.` }),
   )
 
+  // what the grader reads: files the session can read already, so no permission asked
   on('tool.check', { tool: 'mcp__test-grader__test_context' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
   on('tool.call', { tool: 'mcp__test-grader__test_context' }, async ($, e) => ({ result: await answerContext($, e as never) })).catch(
     (_$, _e, next) => ({ result: `The context tool could not answer (${next.error.kind}); ask again.` }),
@@ -1853,24 +1906,7 @@ export const register: Register = (on, options) => {
       description: 'Open the test-grader pane (tests, their quality, coverage); diff grades the tests changed on this branch, report writes the grades out',
       argumentHint: '[diff | report]',
     })
-    await $.tool
-      .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    await $.tool
-      .register({ name: GRADES_TOOL, description: GRADES_DESCRIPTION, inputSchema: GRADES_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the grades tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    await $.tool
-      .register({ name: GRADE_TOOL, description: GRADE_DESCRIPTION, inputSchema: GRADE_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the grade tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    await $.tool
-      .register({ name: COVERAGE_TOOL, description: COVERAGE_DESCRIPTION, inputSchema: COVERAGE_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the coverage tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    await $.tool
-      .register({ name: CONTEXT_TOOL, description: CONTEXT_DESCRIPTION, inputSchema: CONTEXT_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the context tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    await $.tool
-      .register({ name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA })
-      .catch(error => $.ui.log(`test-grader: the verify tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await registerTools($)
     await pinProject($)
     await detectProject($)
     await renameGrades($).catch(() => undefined)
@@ -2001,6 +2037,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    await restoreTools($).catch(() => undefined)
     await suggestStrengthening($).catch(() => undefined)
     await refreshCoverage($)
     await readRules($).catch(() => undefined)

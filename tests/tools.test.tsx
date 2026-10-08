@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { mount, project, ok, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, askGrades, GRADED, turns, ADDING, jest, ASKED, buttonsOf, BRANCH, branchGit, SUMMARY } from './helpers'
+import { mount, project, ok, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, askGrades, GRADED, turns, ADDING, jest, ASKED, buttonsOf, BRANCH, branchGit, SUMMARY, TURN } from './helpers'
 import type { Engine, Shell } from './helpers'
 
 test('evidence the grader accepts turns a shallow test strong, and the row says it was graded on evidence', async ($, on) => {
@@ -893,4 +893,25 @@ test('test_verify with siblings says when this test alone catches the change', a
 
   const answer = await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b', siblings: true } as never).then(r => String((r as { result: unknown }).result))
   expect(answer).toContain('No other test in the file failed with it (2 run): this test alone catches the change.')
+})
+
+
+test('tools the session has lost are registered again at a turn\'s end, and only those', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('turn.complete', () => ({ text: '' }) as never)
+  const { tools } = project(on, { 'src/e.test.ts': E_TEST })
+  const ALL = ['test_context', 'test_coverage', 'test_evidence', 'test_grade', 'test_grades', 'test_verify']
+  let listed = ALL
+  on('tool.list', async () => ({ value: listed.map(name => ({ name: `mcp__test-grader__${name}`, description: '', mcp: true })) }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  expect(tools).toHaveLength(6)
+
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+  expect(tools).toHaveLength(6)
+
+  listed = ALL.filter(name => name !== 'test_grades' && name !== 'test_verify')
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+  expect(tools.slice(6).sort()).toEqual(['test_grades', 'test_verify'])
 })

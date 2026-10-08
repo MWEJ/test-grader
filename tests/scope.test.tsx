@@ -103,3 +103,30 @@ test('test_grade on a path with no test files, or outside the project, says so a
   expect(await askGrade($, clock, { path: '/elsewhere/src' })).toBe('/elsewhere/src is outside the project (/proj).')
   expect(prompts).toEqual([])
 })
+
+
+test('a run with more flagged tests than a note lists names forty and counts the rest by file', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const hollow = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `it('does nothing ${tag} ${i}', () => { expect(true).toBe(true) })\n`).join('')
+  project(on, { 'src/a.test.ts': hollow(40, 'a'), 'src/b.test.ts': hollow(3, 'b'), 'src/c.test.ts': hollow(2, 'c') })
+  await start($)
+
+  const answer = await askGrade($, clock)
+  expect(answer).toContain('45 graded · 0 strong · 45 hollow')
+  expect(answer.split('\n').filter(l => l.startsWith('- hollow'))).toHaveLength(40)
+  expect(answer).toContain('5 more not listed, by file: src/b.test.ts (3 hollow); src/c.test.ts (2 hollow).')
+})
+
+test('test_grades names the files the last run found changed, within the path asked', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...TWO_FOLDERS }
+  project(on, files)
+  await start($)
+  await askGrade($, clock)
+
+  files['src/a/x.test.ts'] = "it('adds', () => { expect(add(2, 2)).toBe(4) })\n"
+  await askGrade($, clock)
+  const grades = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__test-grader__test_grades', ...input } as never).then(r => String(r.result))
+  expect(await grades({})).toContain('The last run graded again, changed since their last grading: src/a/x.test.ts.')
+  expect(await grades({ path: 'src/b' })).not.toContain('changed since')
+})

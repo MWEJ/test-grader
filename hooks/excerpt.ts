@@ -176,12 +176,29 @@ const loose = (name: string): string =>
 
 // each verdict under the name it was asked by: a verdict whose name differs from one asked
 // name alone only in its quotes, dashes, escapes or spacing answers for that test
-export const asAsked = <V extends { name: string }>(names: string[], verdicts: V[]): V[] =>
-  verdicts.map(v => {
+// and one named with the groups around it ("ApiClient › appends every file") answers for the
+// test asked by the end of that name, where one test alone has it; a name that extends an
+// asked one by a case mark is a case of that test, not a group's
+const GROUP_MARK = /\s+(?:›|>)\s+/
+export const asAsked = <V extends { name: string }>(names: string[], verdicts: V[]): V[] => {
+  const asked = [...new Set(names)]
+  const alikeTo = (name: string): string[] => asked.filter(n => !isTemplate(n) && loose(n) === loose(name))
+  return verdicts.map(v => {
     if (among(names, v.name)) return v
-    const alike = [...new Set(names)].filter(n => !isTemplate(n) && loose(n) === loose(v.name))
-    return alike.length === 1 ? { ...v, name: alike[0]! } : v
+    const alike = alikeTo(v.name)
+    if (alike.length === 1) return { ...v, name: alike[0]! }
+    if (asked.some(n => !isTemplate(n) && v.name.startsWith(n) && CASE_MARK.test(v.name.slice(n.length)))) return v
+    const parts = v.name.split(GROUP_MARK)
+    for (let k = 1; k < parts.length; k++) {
+      const tail = parts.slice(k).join(' › ')
+      const fitting = asked.filter(n => isTemplate(n) && fits(n, tail))
+      const matched = [...new Set([...alikeTo(tail), ...(among(asked.filter(n => !isTemplate(n)), tail) ? [tail] : [])])]
+      if (matched.length + fitting.length === 1) return { ...v, name: matched[0] ?? tail }
+      if (matched.length + fitting.length > 1) return v
+    }
+    return v
   })
+}
 
 // the grader's reply limit, in tokens: a reply cut off there loses the verdicts it had not reached
 export const MAX_REPLY = 4000
