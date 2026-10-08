@@ -384,3 +384,17 @@ test('Run coverage pressed again while a run is under way starts no second run',
   finish()
   await second
 })
+
+test('a session moved from a folder with no way to measure coverage to the project root offers Run coverage within one watch period', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the session opens in the coverage report's folder, which holds no package.json
+  let where = '/proj/coverage'
+  project(on, { 'package.json': '{ "scripts": { "coverage": "node scripts/coverage.mjs" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { cwd: () => where })
+  await $.session.start({ source: 'startup', cwd: '/proj/coverage', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  expect(buttonsOf(await ui.drawn()).has('run')).toBe(false)
+
+  where = '/proj'
+  await clock.advance(2_000)
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+})

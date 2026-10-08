@@ -221,12 +221,14 @@ test('when nothing opens the file and none says why, the pane gives the last exi
 })
 
 
-test('when no command can be started, the pane gives the reason the last one could not', async ($, on) => {
+test('when no command can be started, the pane says which file it could not open, and why', async ($, on) => {
   const { ui } = await openShallow($, on, {
     editor: () => {
       throw new Error('spawn ENOENT')
     },
   })
-  // the reason is the host's own: here the test kit's, which has no command to run
-  expect(JSON.stringify(await ui.drawn())).toContain("Couldn't open src/e.test.ts in an editor: no implementation for process.run")
+  // the reason is the host's own, its words not the mod's: the pane names the file and gives one
+  const said = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.startsWith("Couldn't open src/e.test.ts in an editor: "))
+  expect(said).toHaveLength(1)
+  expect(said[0]!.length).toBeGreaterThan("Couldn't open src/e.test.ts in an editor: ".length)
 })

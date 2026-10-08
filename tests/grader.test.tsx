@@ -837,7 +837,10 @@ test('a grader call the engine refuses leaves each of its tests unrated with the
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(await askGrades($, { verdicts: ['unrated'] })).toContain('"adds": unrated\n  Why: The grader (haiku) call failed: ')
+  // the refusal's words are the host's (here the test kit's): the row gives the very refusal the pane does
+  const refusal = (await ui.findAll({ type: 'Text' })).map(t => t.text).find(t => t.startsWith('The grader (haiku) call failed: '))
+  expect(refusal!.length).toBeGreaterThan('The grader (haiku) call failed: '.length)
+  expect(await askGrades($, { verdicts: ['unrated'] })).toBe(`1 tests: 0 strong, 1 with no verdict.\nUnrated, worst first:\n- src/a.test.ts:1 "adds": unrated\n  Why: ${refusal}`)
 })
 
 test('a test Claude writes that the grader gives no verdict says why in test_grades', async ($, on) => {

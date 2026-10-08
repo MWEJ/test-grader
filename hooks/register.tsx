@@ -1156,12 +1156,29 @@ let checks = 0
 // the check under way: a timer's check is passed over while one runs; a listing one waits for it
 let checking: Promise<void> | null = null
 let watcher: Timer | null = null
+// What the session's folder offers, found as a session starts and again when the session moves
+// to another folder: its test runners, its coverage run (the pane offers Run coverage only
+// then), its report, and its rules
+let detectedFor: string | null = null
+const detectProject = async ($: EngineInterface): Promise<void> => {
+  const cwd = await $.session.cwd()
+  detectedFor = cwd
+  runners = await detectRunners($, cwd).catch(() => ({}))
+  await refreshCoverage($)
+  const cover = await detectCommand($, cwd).catch(() => undefined)
+  await update($, coverWith, () => cover?.label ?? null)
+  await readRules($).catch(() => undefined)
+}
+
 const check = async ($: EngineInterface, isListing = false): Promise<void> => {
   if (checking !== null && !isListing) return
   const after = checking ?? Promise.resolve()
   const now = after.then(async () => {
     checks += 1
-    if (isListing || checks % LIST_EVERY === 0) await listNew($).catch(() => undefined)
+    // a session moved to another folder: what that folder offers, and its tests listed now
+    const moved = (await $.session.cwd().catch(() => detectedFor)) !== detectedFor
+    if (moved) await detectProject($).catch(() => undefined)
+    if (moved || isListing || checks % LIST_EVERY === 0) await listNew($).catch(() => undefined)
     await catchUp($).catch(() => undefined)
     await refreshCoverageIfChanged($).catch(() => undefined)
   })
@@ -1649,12 +1666,7 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the verify tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
-    runners = await detectRunners($, await $.session.cwd()).catch(() => ({}))
-    await refreshCoverage($)
-    // the coverage run this project has, if any: the pane offers it only then
-    const cover = await detectCommand($, await $.session.cwd()).catch(() => undefined)
-    await update($, coverWith, () => cover?.label ?? null)
-    await readRules($).catch(() => undefined)
+    await detectProject($)
     await renameGrades($).catch(() => undefined)
     await loadGrades($).catch(() => undefined)
     await prune($).catch(() => undefined)

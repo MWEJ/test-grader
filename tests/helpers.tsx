@@ -28,13 +28,13 @@ export const mount = ($: Engine, rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict }
+export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict; cwd?: () => string }
 
 // a command's answer: its exit code, or what it printed too
 export type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
-export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm }: Project = {}) {
+export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm, cwd }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -68,7 +68,8 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   })
   on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
   on('session.start', async () => ({ cwd: '/proj' }) as never)
-  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  // the session's folder: the project's root, unless the test moves it
+  on('session.cwd', async () => ({ value: cwd?.() ?? '/proj' }) as never)
   // the session's id: a test sets another to start a new session, the same for a reload
   const session = { id: 's1' }
   on('session.id', async () => ({ value: session.id }) as never)
