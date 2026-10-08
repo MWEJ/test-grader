@@ -3,7 +3,7 @@ import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
 import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { isBuildFailure } from '../hooks/runner'
-import { fits, isTemplate } from '../hooks/discovery'
+import { fits, ignoredBy, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -280,8 +280,14 @@ test('a test the grader gave a verdict for has no reason to be unrated', () => {
 
 test('a test a cut-off reply did not reach is unrated for the reply\'s limit, with how far it got', () => {
   expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"},{"name":"subtr', 'subtracts')).toBe(
-    "The grader's (haiku) reply was cut off at its 4000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.",
+    "The grader's (haiku) reply was cut off at its 8000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.",
   )
+})
+
+test('a cut-off reply counts the tests it answered, not the verdicts a table test\'s cases gave', () => {
+  const rows = Array.from({ length: 5 }, (_, i) => `{"name":"adds ${i}","summary":"s","verdict":"strong","reason":"r"}`).join(',')
+  const { verdicts, isCut } = parseVerdicts(`[${rows},{"name":"subtr`)
+  expect(unratedWhy('', verdicts, isCut, ['adds ${n}', 'subtracts', 'multiplies'], 'subtracts', 'haiku')).toContain('it gave 1 of the 3 verdicts asked for.')
 })
 
 test('a reply with no verdict in it says what came back', () => {
@@ -358,6 +364,31 @@ test('a case of a table test asked keeps its name, not taken for a group around 
 
 test('a describe-prefixed verdict for an it.each case keeps the expanded case\'s name', () => {
   expect(asAsked(['adds %i and %i'], [v('Math › adds 1 and 2')]).map(x => x.name)).toEqual(['adds 1 and 2'])
+})
+
+test('a verdict named with its describe group joined by a space or a colon answers for the test it ends with', () => {
+  const asked = ['reads the debug ID from the trailing //# debugId comment', 'targets a semantic version above 1.1.0']
+  expect(asAsked(asked, [v('parseDebugId reads the debug ID from the trailing //# debugId comment'), v('release marketing version: targets a semantic version above 1.1.0')]).map(x => x.name)).toEqual(asked)
+})
+
+test('a name a test asked ends only part way into a word, or a test asked whole, is not taken for a group\'s prefix', () => {
+  // "preads x" ends with "reads x" mid-word; the longest of two endings wins
+  expect(asAsked(['reads x', 'x'], [v('preads x')]).map(x => x.name)).toEqual(['preads x'])
+  expect(asAsked(['reads x', 'x'], [v('Group reads x')]).map(x => x.name)).toEqual(['reads x'])
+})
+
+test('an ignore list skips a folder at any depth, a rooted path, a glob, and keeps the rest; comments and blanks are no rules', () => {
+  const isIgnored = ignoredBy('# agents\n.agents\n\n/legacy/old/\n**/*.snap.test.ts\nfixtures/\n')
+  expect(isIgnored('.agents/skills/helper.test.js')).toBe(true)
+  expect(isIgnored('mobile/.agents/a.test.ts')).toBe(true)
+  expect(isIgnored('legacy/old/a.test.ts')).toBe(true)
+  expect(isIgnored('src/legacy/old/a.test.ts')).toBe(false)
+  expect(isIgnored('src/deep/view.snap.test.ts')).toBe(true)
+  expect(isIgnored('src/fixtures/a.test.ts')).toBe(true)
+  // a file named like a folder rule is not a folder
+  expect(isIgnored('src/fixtures')).toBe(false)
+  expect(isIgnored('src/agents/a.test.ts')).toBe(false)
+  expect(isIgnored('# agents')).toBe(false)
 })
 
 test('an it.each name with printf marks or $fields is a template its expanded cases fit', () => {

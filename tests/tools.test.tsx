@@ -98,7 +98,7 @@ test('test_grades lists the flagged tests, worst first, each at its line with wh
 
   expect(await askGrades($)).toBe(
     '4 tests: 1 strong, 1 hollow, 2 shallow.\n' +
-      'Flagged, worst first:\n' +
+      'Flagged or unrated, worst first:\n' +
       '- src/math.test.ts:2 "does nothing": hollow\n  Checks: Checks does nothing.\n  Why: hollow because.\n' +
       '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '- src/deep/more.test.ts:4 "another shallow one": shallow\n  Checks: Checks another shallow one.\n  Why: shallow because. It would miss: a wrong edge.\n' +
@@ -118,7 +118,7 @@ test('test_grades narrows to a folder, to the verdicts asked, and to a limit, sa
   const deep = await askGrades($, { path: 'src/deep/', limit: 1 })
   expect(deep).toBe(
     '2 tests in src/deep: 0 strong, 2 shallow.\n' +
-      'Flagged, worst first:\n' +
+      'Flagged or unrated, worst first:\n' +
       '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '1 more not listed; raise limit or narrow path to see them.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
@@ -137,7 +137,7 @@ test('test_grades before any grading says none is flagged, and how to grade the 
   await clock.advance(10)
 
   expect(await askGrades($)).toBe(
-    '4 tests: 0 strong, 4 never graded.\nNone is flagged. Grade all tests in the Tests pane grades the ones never graded.',
+    '4 tests: 0 strong, 4 never graded.\nNone is flagged or unrated. Grade all tests in the Tests pane grades the ones never graded.',
   )
   expect(prompts).toHaveLength(0)
 })
@@ -187,12 +187,12 @@ test('test_grades with written lists only the tests written or edited this sessi
 
   // asked before the grader answers: nothing to list yet, and the two are being graded
   expect(await askGrades($, { written: true })).toBe(
-    '2 tests written or edited this session: 0 strong, 2 being graded.\nNone is flagged.\n2 still being graded: ask again in a moment for their grades.',
+    '2 tests written or edited this session: 0 strong, 2 being graded.\nNone is flagged or unrated.\n2 still being graded: ask again in a moment for their grades.',
   )
   await clock.advance(10)
   expect(await askGrades($, { written: true })).toBe(
     '2 tests written or edited this session: 1 strong, 1 shallow.\n' +
-      'Flagged, worst first:\n' +
+      'Flagged or unrated, worst first:\n' +
       '- src/new.test.ts:1 "a new shallow test": shallow (round 1 of 3)\n  Checks: Checks a new shallow test.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   )
@@ -530,7 +530,7 @@ test('test_grades lists a test whose file cannot be read without a line, and one
 
   expect(await askGrades($, { path: 'src/deep', limit: 1 })).toBe(
     '2 tests in src/deep: 0 strong, 2 shallow.\n' +
-      'Flagged, worst first:\n' +
+      'Flagged or unrated, worst first:\n' +
       '- src/deep/more.test.ts "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '1 more not listed; raise limit or narrow path to see them.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',

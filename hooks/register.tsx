@@ -3,9 +3,9 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Before, Confidence, Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '../types'
 
-import { attr, byDirOf, coverageAnswer, coverageNote, pct } from './coverage'
+import { attr, byDirOf, coverageAnswer, coverageNote, kindAt, mergeParts, pct } from './coverage'
 import type { CoverCommand } from './coverage'
-import { TEST_FILE, among, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
+import { TEST_FILE, among, ignoredBy, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, caseTextsOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, mergeProfile, moduleOf } from './gocover'
@@ -566,8 +566,8 @@ const mtime = async ($: EngineInterface, path: string): Promise<number | null> =
   }
 }
 
-const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
-  const cwd = await projectDir($)
+// the report a coverage run left in this folder (the project's, or a part's), its paths relative to it
+const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage | null> => {
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
   const lcovPath = `${cwd}/coverage/lcov.info`
   const xmlPath = `${cwd}/coverage.xml`
@@ -638,6 +638,17 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
   return null
 }
 
+// The project's coverage: its own report, or where the project is made of parts each with its own
+// way to measure (backend/ in Go, mobile/ with jest), every part's, its folders by their path in
+// the project
+const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
+  const cwd = await projectDir($)
+  const dirs = coverParts.map(p => p.dir)
+  if (dirs.length === 0 || (dirs.length === 1 && dirs[0] === '')) return readCoverageAt($, cwd)
+  const found = (await Promise.all(dirs.map(async dir => ({ dir, cov: await readCoverageAt($, `${cwd}/${dir}`).catch(() => null) })))).flatMap(p => (p.cov ? [{ dir: p.dir, cov: p.cov }] : []))
+  return mergeParts(found)
+}
+
 const refreshCoverage = async ($: EngineInterface): Promise<void> => {
   try {
     const next = await readCoverage($)
@@ -654,7 +665,8 @@ const REPORTS = ['coverage/coverage-summary.json', 'coverage/lcov.info', 'covera
 let reportsAt = ''
 const refreshCoverageIfChanged = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
-  const at = (await Promise.all(REPORTS.map(r => mtime($, `${cwd}/${r}`)))).join(',')
+  const bases = coverParts.length > 0 ? coverParts.map(p => (p.dir ? `${cwd}/${p.dir}` : cwd)) : [cwd]
+  const at = (await Promise.all(bases.flatMap(base => REPORTS.map(r => mtime($, `${base}/${r}`))))).join(',')
   if (at === reportsAt) return
   reportsAt = at
   await refreshCoverage($)
@@ -694,24 +706,44 @@ const measure = async ($: EngineInterface, rel = ''): Promise<{ command: CoverCo
   const cwd = await projectDir($)
   const setRun = (state: 'idle' | 'running' | 'failed', message?: string) => update($, run, () => ({ state, message }))
   try {
-    const base = await detectCommand($, cwd)
-    if (!base) return (await setRun('failed', NO_COVERAGE), NO_COVERAGE)
-    const isGoFolder = rel !== '' && base.goOutput !== undefined
-    const command: CoverCommand = isGoFolder ? { argv: ['go', 'test', `./${rel}/...`, '-cover', `-coverprofile=${GO_PROFILE}`], label: `go test ./${rel}/... -coverprofile` } : base
-    const whole = isGoFolder ? await $.fs.read(`${cwd}/${GO_PROFILE}`).catch(() => null) : null
+    coverParts = await detectParts($, cwd)
+    // a project that lost its way to measure keeps the pane's coverage, which says so
+    if (coverParts.length === 0) return (await setRun('failed', NO_COVERAGE), NO_COVERAGE)
+    await update($, coverWith, () => labelOfParts(coverParts))
+    // the parts the folder is in, or that are in it
+    const chosen = coverParts.filter(p => rel === '' || p.dir === '' || rel === p.dir || rel.startsWith(`${p.dir}/`) || p.dir.startsWith(`${rel}/`))
+    if (chosen.length === 0) return `No part of the project measures ${rel}/: coverage is measured in ${coverParts.map(p => `${p.dir}/`).join(', ')}.`
     await setRun('running')
-    const result = await $.process.run(command.argv, { cwd, timeoutMs: 600_000 })
-    if (command.goOutput) await $.fs.write(`${cwd}/${command.goOutput}`, result.stdout)
-    const part = whole === null ? null : await $.fs.read(`${cwd}/${GO_PROFILE}`).catch(() => null)
-    if (whole !== null && part !== null) await $.fs.write(`${cwd}/${GO_PROFILE}`, mergeProfile(whole, part, moduleOf(await $.fs.read(`${cwd}/go.mod`).catch(() => '')), rel))
+    const runs = await Promise.all(chosen.map(p => measurePart($, cwd, p, rel === p.dir || p.dir.startsWith(`${rel}/`) || rel === '' ? '' : p.dir === '' ? rel : rel.slice(p.dir.length + 1))))
     await refreshCoverage($)
-    await setRun(result.exitCode === 0 ? 'idle' : 'failed', result.exitCode === 0 ? undefined : `Tests exited with ${result.exitCode}.`)
-    return { command, exitCode: result.exitCode, output: [result.stdout, result.stderr].join('\n') }
+    const failed = runs.find(r => r.exitCode !== 0)
+    await setRun(failed ? 'failed' : 'idle', failed ? `Tests exited with ${failed.exitCode}.` : undefined)
+    if (runs.length === 1) return runs[0]!
+    return {
+      command: { argv: [], label: runs.map(r => r.command.label).join(' · ') },
+      exitCode: failed?.exitCode ?? 0,
+      output: runs.filter(r => r.exitCode !== 0).map(r => r.output).join('\n'),
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     await setRun('failed', message)
     return message
   }
+}
+
+// one part's run, in its folder; sub: a folder in it, which a Go part measures alone, merged into
+// its module's last profile
+const measurePart = async ($: EngineInterface, cwd: string, part: Part, sub: string): Promise<{ command: CoverCommand; exitCode: number; output: string }> => {
+  const base = part.dir ? `${cwd}/${part.dir}` : cwd
+  const where = (label: string): string => (part.dir ? `${label} in ${part.dir}/` : label)
+  const isGoFolder = sub !== '' && part.command.goOutput !== undefined
+  const command: CoverCommand = isGoFolder ? { argv: ['go', 'test', `./${sub}/...`, '-cover', `-coverprofile=${GO_PROFILE}`], label: `go test ./${sub}/... -coverprofile` } : part.command
+  const whole = isGoFolder ? await $.fs.read(`${base}/${GO_PROFILE}`).catch(() => null) : null
+  const result = await $.process.run(command.argv, { cwd: base, timeoutMs: 600_000 })
+  if (command.goOutput) await $.fs.write(`${base}/${command.goOutput}`, result.stdout)
+  const part2 = whole === null ? null : await $.fs.read(`${base}/${GO_PROFILE}`).catch(() => null)
+  if (whole !== null && part2 !== null) await $.fs.write(`${base}/${GO_PROFILE}`, mergeProfile(whole, part2, moduleOf(await $.fs.read(`${base}/go.mod`).catch(() => '')), sub))
+  return { command: { ...command, label: where(command.label) }, exitCode: result.exitCode, output: [result.stdout, result.stderr].join('\n') }
 }
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
@@ -786,9 +818,14 @@ export const fingerprint = (text: string): string => {
 // a test's own text, fingerprinted: what a verdict given on evidence was given for
 const ownText = (text: string, name: string, file: string): string => fingerprint(caseTextOf(text, name, file) ?? '')
 // the same for many tests of one file, its cases found once
+// (the last file's kept: a run's batches of one file ask for it in turn)
+let ownLast: { text: string; file: string; of: (name: string) => string } | null = null
 const ownTexts = (text: string, file: string): ((name: string) => string) => {
-  const of = caseTextsOf(text, file)
-  return name => fingerprint(of(name) ?? '')
+  if (ownLast?.text === text && ownLast.file === file) return ownLast.of
+  const cases = caseTextsOf(text, file)
+  const of = (name: string): string => fingerprint(cases(name) ?? '')
+  ownLast = { text, file, of }
+  return of
 }
 // a verdict given on evidence holds, and is not graded again, while the test's own text is as it was
 const isHeld = (t: { name: string; evidence?: string; evidenceOf?: string }, text: string, file: string): boolean =>
@@ -835,10 +872,13 @@ const loadGrades = async ($: EngineInterface): Promise<void> => {
 
 // The project's test files, by their path in it: every one git tracks, and every new one it
 // would (untracked, not ignored); null outside a git repository
+// the project's test files, as git lists them, less those its .test-grader-ignore names
+const IGNORE = '.test-grader-ignore'
 const testFiles = async ($: EngineInterface, cwd: string): Promise<string[] | null> => {
   const listed = await $.process.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], { cwd, timeoutMs: 60_000 })
   if (listed.exitCode !== 0) return null
-  return [...new Set(listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f)))]
+  const isIgnored = ignoredBy(await $.fs.read(`${cwd}/${IGNORE}`).catch(() => ''))
+  return [...new Set(listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f) && !isIgnored(f)))]
 }
 
 // A run under way can be stopped: its grader calls are cut and no more start. The files it had
@@ -1347,11 +1387,30 @@ const pinProject = async ($: EngineInterface): Promise<void> => {
 const detectProject = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
   runners = await detectRunners($, cwd).catch(() => ({}))
+  coverParts = await detectParts($, cwd).catch(() => [])
   await refreshCoverage($)
-  const cover = await detectCommand($, cwd).catch(() => undefined)
-  await update($, coverWith, () => cover?.label ?? null)
+  await update($, coverWith, () => labelOfParts(coverParts))
   await readRules($).catch(() => undefined)
 }
+
+// The project's ways to measure coverage: its own at its root, else each top-level folder's that
+// holds tests and has one of its own (a Go backend/, a jest mobile/), in this load of the module
+type Part = { dir: string; command: CoverCommand }
+let coverParts: Part[] = []
+const detectParts = async ($: EngineInterface, cwd: string): Promise<Part[]> => {
+  const own = await detectCommand($, cwd).catch(() => undefined)
+  if (own) return [{ dir: '', command: own }]
+  const listed = (await testFiles($, cwd)) ?? []
+  const dirs = [...new Set(listed.filter(f => f.includes('/')).map(f => f.slice(0, f.indexOf('/'))))].sort()
+  const parts: Part[] = []
+  for (const dir of dirs) {
+    const command = await detectCommand($, `${cwd}/${dir}`).catch(() => undefined)
+    if (command) parts.push({ dir, command })
+  }
+  return parts
+}
+const labelOfParts = (parts: Part[]): string | null =>
+  parts.length === 0 ? null : parts.length === 1 && parts[0]!.dir === '' ? parts[0]!.command.label : parts.map(p => `${p.dir}/: ${p.command.label}`).join(' · ')
 
 const check = async ($: EngineInterface, isListing = false): Promise<void> => {
   if (checking !== null && !isListing) return
@@ -1693,7 +1752,8 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
 const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown }): Promise<string> => {
   const cwd = await projectDir($)
   const asked = Array.isArray(input.verdicts) ? input.verdicts.filter((v): v is State => (LISTED as readonly unknown[]).includes(v)) : []
-  const wanted = new Set<State>(asked.length > 0 ? asked : FLAGGED)
+  // by default the flagged and the unrated: both need something done
+  const wanted = new Set<State>(asked.length > 0 ? asked : [...FLAGGED, 'unrated'])
   const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '') : ''
   const scope = given === '' || given === '.' ? '' : given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
   const limit = typeof input.limit === 'number' && input.limit >= 1 ? Math.floor(input.limit) : GRADES_LIMIT
@@ -2189,7 +2249,7 @@ export const register: Register = (on, options) => {
         <Box key={`h-${key}`} flexDirection="row" gap={1} marginLeft={indent}>
           <Button key={key} plain label={`${open ? '▾' : '▸'} ${clamp(label, Math.max(16, columns - groupCounts.length - 10 - (canRegrade ? 10 : 0) - indent))}`} onPress={onPress} />
           <Text color={stateColor(worst)}>{groupCounts}</Text>
-          {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% ${cov?.lines === null && cov?.statements !== null ? 'statements' : 'lines'}`}</Text>}
+          {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% ${kindAt(cov, scope.replace(/\/$/, ''))}`}</Text>}
           {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
           {of.some(t => t.isModified) && <Text color={BLUE}>modified</Text>}
           {canRegrade && <Button key={`g-${key}`} plain label="↻ Regrade" onPress={() => soon($, async () => void (await gradeAll($, { isFresh: true, only, scope })))} />}
@@ -2391,6 +2451,15 @@ export const register: Register = (on, options) => {
                 <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
               </Box>
               {metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, 11, 0)) as never}
+              {/* a project of parts: each part's figures under its folder */}
+              {(cov?.parts && cov.parts.length > 1
+                ? cov.parts.flatMap(part => [
+                    <Text key={`cov-part-${part.dir}`} color={MUTED}>{`${part.dir}/ · ${part.source}`}</Text>,
+                    ...([['Lines', part.lines], ['Statements', part.statements], ['Branches', part.branches], ['Functions', part.functions]] as const)
+                      .filter(([, v]) => v !== null)
+                      .map(([label, v]) => bar(`cov-${part.dir}-${label}`, label, v as number, 11, 2)),
+                  ])
+                : []) as never}
               {packageBars.map(p => bar(`cov-pkg-${p.name}`, p.name, p.pct, packageWidth, 2)) as never}
               {packagesLeft.length > 0 && (
                 <Box marginLeft={2}>

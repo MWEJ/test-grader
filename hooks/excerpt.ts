@@ -200,19 +200,25 @@ export const asAsked = <V extends { name: string }>(names: string[], verdicts: V
       if (matched.length + fitting.length === 1) return { ...v, name: matched[0] ?? tail }
       if (matched.length + fitting.length > 1) return v
     }
-    return v
+    // the group's name joined by a space or a colon alone ("parseDebugId reads the debug ID"):
+    // the longest test asked the name ends with, where a space or a colon comes before it (one
+    // ending part way into a word is no group's: no shorter test is taken in its stead)
+    const said = loose(v.name)
+    const ending = asked.filter(n => !isTemplate(n) && said.length > loose(n).length && said.endsWith(loose(n))).sort((a, b) => b.length - a.length)[0]
+    return ending !== undefined && /[\s:]$/.test(said.slice(0, said.length - loose(ending).length)) ? { ...v, name: ending } : v
   })
 }
 
 // the grader's reply limit, in tokens: a reply cut off there loses the verdicts it had not reached
-export const MAX_REPLY = 4000
+export const MAX_REPLY = 8000
 
 // Why a test asked about got no verdict from this reply, for its row to say; null when it got
 // one. The likely causes in turn: the reply cut off before it, no verdict read at all, its own
 // verdict unreadable (an unknown grade, a broken object), a verdict under another name, left out
 export const unratedWhy = (text: string, verdicts: Graded[], isCut: boolean, names: string[], name: string, model: string): string | null => {
   if (verdicts.some(v => fits(name, v.name))) return null
-  const answered = verdicts.filter(v => among(names, v.name)).length
+  // the tests answered, not the verdicts: a loop's or table's cases are many verdicts for one test
+  const answered = names.filter(n => verdicts.some(v => fits(n, v.name))).length
   const count = `it gave ${answered} of the ${names.length} verdicts asked for`
   if (isCut) return `The grader's (${model}) reply was cut off at its ${MAX_REPLY}-token limit before it reached this test: ${count}.`
   if (verdicts.length === 0) {

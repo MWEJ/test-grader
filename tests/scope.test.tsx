@@ -143,3 +143,16 @@ test('test_grade on a changed file shows, for a test flagged anew, its grade bef
   const answer = await askGrade($, clock)
   expect(answer).toContain('- brittle · src/a.test.ts · a shallow check — brittle because.\n  Before: shallow — shallow because. It would miss: a wrong edge.')
 })
+
+
+test('test files the project\'s .test-grader-ignore names are neither listed nor graded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { ...TWO_FOLDERS, '.agents/skill/helper.test.ts': "it('helps', () => { expect(h()).toBe(1) })\n", '.test-grader-ignore': '.agents/\n' })
+  await start($)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  expect(JSON.stringify(await ui.drawn())).not.toContain('helper.test.ts')
+  expect(await askGrade($, clock)).toContain('2 graded')
+  expect(filesOf(prompts).sort()).toEqual(['/proj/src/a/x.test.ts', '/proj/src/b/y.test.ts'])
+})

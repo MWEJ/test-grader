@@ -12,7 +12,7 @@ export const RUBRIC = [
   '"shallow" = it can fail, but misses the likely bugs: happy path only, checks that a value is defined or truthy, loose matchers, one easy case where the edges matter;',
   '"brittle" = it checks real behaviour but would also fail on a correct change: large snapshots, exact mock call order or counts, private state or implementation details, real time, timing, network or order between tests;',
   '"hollow" = no real bug could make it fail: no assertion, a tautology, asserts only on its own mock, a snapshot of nothing, would pass with the code under test deleted;',
-  '"duplicate" = another test in the file already catches the same bugs; name that test in the reason.',
+  '"duplicate" = another test in the file already catches the same bugs. Start the reason with: Repeats "<that test>", keep "<the one to keep>". Keep the clearer or stronger of the two; of two tests that repeat each other, mark only the one to delete duplicate, never both.',
   'Where more than one fits, give the first of: hollow, duplicate, shallow, brittle.',
   'Default to "strong". Flag a test only when you can point at what in it a reviewer would change; where you are unsure between "strong" and a flagged grade, answer "strong".',
   'Judge "shallow" against the whole file: a test that checks one case is strong when other tests in the file cover the edges and errors, or when that one case is all its name promises. Matching a prefix, a subset or one key field is not shallow when that is the contract under test.',
@@ -118,7 +118,7 @@ export const GRADES_TOOL = 'test_grades'
 export const GRADES_LIMIT = 50
 export const GRADES_DESCRIPTION =
   'List the tests test-grader has graded, with each grade, what the test checks and why. A grade names what is wrong, and so the fix: hollow (cannot fail: rewrite it to assert on what the code does), duplicate (delete it or merge it), shallow (add the case it misses), brittle (assert on behaviour, not how the code does it), strong (keep it). ' +
-  'By default only the flagged ones (hollow, duplicate, shallow, brittle), worst first, each with its file and line. ' +
+  'By default the flagged ones (hollow, duplicate, shallow, brittle) and the unrated, worst first, each with its file and line. ' +
   'Call it with written: true once you have finished writing or editing tests, and again after each fix. Use path to narrow to a file or folder.'
 export const GRADES_SCHEMA = {
   type: 'object',
@@ -126,7 +126,7 @@ export const GRADES_SCHEMA = {
     verdicts: {
       type: 'array',
       items: { type: 'string', enum: [...LISTED] },
-      description: 'Which tests to list, by state; default ["hollow", "duplicate", "shallow", "brittle"]. unrated: the grader gave no verdict; reviewing: being graded; ungraded: never graded',
+      description: 'Which tests to list, by state; default ["hollow", "duplicate", "shallow", "brittle", "unrated"]. unrated: the grader gave no verdict; reviewing: being graded; ungraded: never graded',
     },
     path: { type: 'string', description: 'Only tests in this file or folder, absolute or relative to the project' },
     written: { type: 'boolean', description: 'Only the tests written or edited this session' },

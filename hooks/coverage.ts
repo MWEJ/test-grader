@@ -1,6 +1,6 @@
 // Coverage figures worked out from a report: by folder, the least covered, and the note a run
 // sends Claude. Pure: reading the report stays in register.tsx
-import type { Coverage } from '../types'
+import type { Coverage, CoveragePart } from '../types'
 
 import { shortPath } from './discovery'
 
@@ -29,6 +29,45 @@ export const byDirOf = (files: { file: string; total: number; covered: number }[
   return dirs
 }
 
+// The parts' reports as one: each part's figures kept apart (Go's statements and jest's lines do
+// not add up), its folders and packages by their path in the project. A project of one part is
+// that part's report, its paths under the part's folder
+export const mergeParts = (found: { dir: string; cov: Coverage }[]): Coverage | null => {
+  if (found.length === 0) return null
+  const inPart = (dir: string, path: string): string => (path === '' ? dir : `${dir}/${path}`)
+  const byDir: Record<string, { total: number; covered: number }> = {}
+  for (const { dir, cov } of found) for (const [path, d] of Object.entries(cov.byDir ?? {})) byDir[inPart(dir, path)] = d
+  const byPackage = found.flatMap(({ dir, cov }) => (cov.byPackage ?? []).map(p => ({ ...p, name: p.name === './' ? `${dir}/` : `${dir}/${p.name}` })))
+  const parts: CoveragePart[] = found.map(({ dir, cov }) => ({ dir, lines: cov.lines, statements: cov.statements, branches: cov.branches, functions: cov.functions, source: cov.source }))
+  const only = found.length === 1 ? found[0]!.cov : null
+  return {
+    lines: only?.lines ?? null,
+    statements: only?.statements ?? null,
+    branches: only?.branches ?? null,
+    functions: only?.functions ?? null,
+    source: parts.map(p => `${p.dir}/: ${p.source}`).join(' · '),
+    updatedAt: Math.max(...found.map(f => f.cov.updatedAt ?? 0)) || null,
+    byDir,
+    ...(byPackage.length > 0 ? { byPackage } : {}),
+    parts,
+  }
+}
+
+// what a report measures: Go's statements, else lines; a project of parts names each kind it has
+const kindOfFigures = (c: { lines: number | null; statements: number | null }): string => (c.lines === null && c.statements !== null ? 'statements' : 'lines')
+export const kindOf = (cov: Coverage | null): string => (cov?.parts && cov.parts.length > 1 ? [...new Set(cov.parts.map(kindOfFigures))].join(' or ') : cov ? kindOfFigures(cov) : 'lines')
+// the kind of the part a folder is in, by its path in the project
+export const kindAt = (cov: Coverage | null, path: string): string => {
+  const part = cov?.parts?.find(p => path === p.dir || path.startsWith(`${p.dir}/`))
+  return part ? kindOfFigures(part) : kindOf(cov)
+}
+// a report's figures as a note says them
+const figuresOf = (c: { lines: number | null; statements: number | null; branches: number | null; functions: number | null }): string =>
+  ([['lines', c.lines], ['statements', c.statements], ['branches', c.branches], ['functions', c.functions]] as const)
+    .filter(([, v]) => v !== null)
+    .map(([name, v]) => `${name} ${v}%`)
+    .join(' · ')
+
 // the least covered folders, a few lines each at least, lowest first: where more tests would pay
 const LEAST_COVERED = 5
 const MIN_LINES = 20
@@ -48,16 +87,15 @@ export type CoverCommand = { argv: string[]; label: string; goOutput?: string }
 // the end of what it printed
 const COVER_TAIL = 20
 export const coverageNote = (command: CoverCommand, exitCode: number, output: string, cov: Coverage | null): string => {
-  const figures = cov
-    ? ([['lines', cov.lines], ['statements', cov.statements], ['branches', cov.branches], ['functions', cov.functions]] as const)
-        .filter(([, v]) => v !== null)
-        .map(([name, v]) => `${name} ${v}%`)
-        .join(' · ')
-    : ''
+  const figures = !cov
+    ? ''
+    : cov.parts && cov.parts.length > 1
+      ? cov.parts.map(p => `${p.dir}/ ${figuresOf(p)} (${p.source})`).join('; ')
+      : figuresOf(cov) && `${figuresOf(cov)} (${cov.source})`
   if (exitCode === 0) {
     const least = leastCovered(cov)
     return figures
-      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).${least.length > 0 ? `\nLeast covered folders (${cov!.lines === null && cov!.statements !== null ? 'statements' : 'lines'}): ${least.join(', ')}.` : ''}`
+      ? `Coverage run (test-grader) finished: ${figures}.${least.length > 0 ? `\nLeast covered folders (${kindOf(cov)}): ${least.join(', ')}.` : ''}`
       : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
@@ -68,7 +106,6 @@ export const coverageNote = (command: CoverCommand, exitCode: number, output: st
 // the run, the project's beside it, and the least covered folders under it, lowest first
 const UNDER = 8
 export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: number, output: string, before: Coverage | null, after: Coverage | null): string => {
-  const kind = after && after.lines === null && after.statements !== null ? 'statements' : 'lines'
   const of = (cov: Coverage | null, dir: string): number | null => {
     const d = cov?.byDir?.[dir]
     return d && d.total > 0 ? pct((d.covered / d.total) * 100) : null
@@ -77,19 +114,22 @@ export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: num
     const now = of(after, dir)
     const was = of(before, dir)
     if (now === null) return `${where} has no figure in the report: none of its code was measured.`
-    return `${where}: ${now}% ${kind}${was === null ? '' : was === now ? ', unchanged' : `, was ${was}%`}.`
+    return `${where}: ${now}% ${kindAt(after, dir)}${was === null ? '' : was === now ? ', unchanged' : `, was ${was}%`}.`
   }
   const where = rel === '' ? 'The project' : `${rel}/`
   const lines = [`Coverage (test-grader), by ${command.label}:`]
   if (exitCode !== 0) lines.push(`It exited with ${exitCode}: the figures are from the tests that ran.`)
-  lines.push(figure(where, rel))
-  if (rel !== '') lines.push(figure('The project', ''))
+  // a project of parts has no one figure: each part's, or the part the folder is in
+  const parts = after?.parts && after.parts.length > 1 ? after.parts : null
+  if (!(parts && rel === '')) lines.push(figure(where, rel))
+  if (parts) lines.push(...parts.filter(p => rel === '' || rel.startsWith(`${p.dir}/`)).map(p => figure(`${p.dir}/`, p.dir)))
+  else if (rel !== '') lines.push(figure('The project', ''))
   const under = Object.entries(after?.byDir ?? {})
     .filter(([dir, d]) => d.total > 0 && dir !== rel && (rel === '' ? dir !== '' : dir.startsWith(`${rel}/`)))
     .map(([dir, d]) => ({ dir, p: (d.covered / d.total) * 100, d }))
     .sort((a, b) => a.p - b.p || a.dir.localeCompare(b.dir))
     .slice(0, UNDER)
-  if (under.length > 0) lines.push(`Least covered folders${rel === '' ? '' : ` in ${rel}/`} (${kind}): ${under.map(u => `${u.dir}/ ${Math.round(u.p)}% (${u.d.covered} of ${u.d.total})`).join(', ')}.`)
+  if (under.length > 0) lines.push(`Least covered folders${rel === '' ? '' : ` in ${rel}/`} (${rel === '' ? kindOf(after) : kindAt(after, rel)}): ${under.map(u => `${u.dir}/ ${Math.round(u.p)}% (${u.d.covered} of ${u.d.total})`).join(', ')}.`)
   if (!after) lines.splice(1, lines.length - 1, `${command.label} wrote no report test-grader reads.`)
   if (exitCode !== 0) {
     const tail = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)

@@ -550,3 +550,64 @@ test('test_coverage whose tests fail gives the figures of what ran and the end o
   expect(answer).toContain('● adds › expected 3, got 4')
   expect(JSON.stringify(await ui.drawn())).toContain('Tests exited with 1.')
 })
+
+
+// a project of two parts, each measured on its own: a Go backend/ and a jest mobile/
+const PARTS: Record<string, string> = {
+  'backend/go.mod': 'module example.com/shop\n\ngo 1.22\n',
+  'backend/pkg/a/a_test.go': 'package a\n\nfunc TestA(t *testing.T) {}\n',
+  'backend/pkg/b/b_test.go': 'package b\n\nfunc TestB(t *testing.T) {}\n',
+  'mobile/package.json': '{ "devDependencies": { "jest": "^29.0.0" } }',
+  'mobile/src/x.test.ts': "it('x', () => { expect(x()).toBe(1) })\n",
+}
+// each part's run writes its own report: pkg/a 10 of 10 and pkg/b 0 of 30 statements; mobile 6 of 10 lines
+const partsRun = (files: Record<string, string>) => (argv: string[]) => {
+  if (argv[0] === 'go') {
+    files['backend/.test-grader-go-cover.out'] = argv[2] === './...' ? ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/pkg/b/b.go:1.1,2.2 30 0', ''].join('\n') : ['mode: set', 'example.com/shop/pkg/b/b.go:1.1,2.2 30 1', ''].join('\n')
+  } else files['mobile/coverage/lcov.info'] = 'SF:src/x.ts\nLF:10\nLH:6\nend_of_record\n'
+  return { stdout: '', exitCode: 0 }
+}
+
+test('a project of parts with no way to measure at its root runs each part\'s coverage, and shows each part\'s figures under its folder', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...PARTS }
+  const { runs, notes } = project(on, files, { editor: partsRun(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(runs.map(argv => argv.slice(0, 3).join(' ')).sort()).toEqual(['go test ./...', 'npx jest --coverage'])
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('backend/ · go test -coverprofile')
+  expect(texts).toContain('mobile/ · lcov.info')
+  // each folder's figure in its part's kind
+  expect(texts).toContain('25% statements')
+  expect(texts).toContain('60% lines')
+  expect(notes.at(-1)).toContain('backend/ statements 25% (go test -coverprofile); mobile/ lines 60% (lcov.info)')
+})
+
+test('test_coverage on a folder of a part runs that part alone, a Go folder by its packages, and answers with the part\'s figure', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...PARTS }
+  const { runs } = project(on, files, { editor: partsRun(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await askCoverage($, clock)
+  runs.length = 0
+
+  const answer = await askCoverage($, clock, 'backend/pkg/b')
+  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`]])
+  expect(answer).toContain('backend/pkg/b/: 100% statements, was 0%.')
+  expect(answer).toContain('backend/: 100% statements, was 25%.')
+  expect(answer).not.toContain('mobile/')
+})
+
+test('test_coverage on a folder no part measures runs nothing and names the parts that are measured', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...PARTS, 'docs/a.test.ts': "it('d', () => { expect(d()).toBe(1) })\n" }
+  const { runs } = project(on, files, { editor: partsRun(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  expect(await askCoverage($, clock, 'docs')).toBe('Coverage could not be measured: No part of the project measures docs/: coverage is measured in backend/, mobile/.')
+  expect(runs).toEqual([])
+})

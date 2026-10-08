@@ -35,7 +35,10 @@ export type Coverage = {
   byDir?: Record<string, { total: number; covered: number }>
   /** Go's statements by package, by its path in the project ('./' the module's root) */
   byPackage?: { name: string; total: number; covered: number }[]
+  /** a project of parts each measured on its own (backend/ in Go, mobile/ with jest): each part's figures, by its folder */
+  parts?: CoveragePart[]
 }
+export type CoveragePart = { dir: string; lines: number | null; statements: number | null; branches: number | null; functions: number | null; source: string }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
 // textOf: the test's own text, fingerprinted, when it was graded: a changed file's test whose own text is the same keeps its grade

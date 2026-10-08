@@ -872,7 +872,7 @@ test('a grader call the engine refuses leaves each of its tests unrated with the
   expect(await askGrades($, { verdicts: ['unrated'] })).toBe(`1 tests: 0 strong, 1 with no verdict.\nUnrated, worst first:\n- src/a.test.ts:1 "adds": unrated\n  Why: ${refusal}`)
 })
 
-test('a test Claude writes that the grader gives no verdict says why in test_grades', async ($, on) => {
+test('a test Claude writes that the grader gives no verdict says why in test_grades, listed with no filter asked', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n"
   // the reply is cut off after the first verdict
@@ -881,7 +881,7 @@ test('a test Claude writes that the grader gives no verdict says why in test_gra
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
   await clock.advance(10)
-  expect(await askGrades($, { verdicts: ['unrated'] })).toContain(
-    '"subtracts": unrated\n  Why: The grader\'s (haiku) reply was cut off at its 4000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.',
+  expect(await askGrades($)).toContain(
+    '"subtracts": unrated\n  Why: The grader\'s (haiku) reply was cut off at its 8000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.',
   )
 })

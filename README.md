@@ -10,7 +10,7 @@ A Claude Code mod that grades how good your tests are. It lists every test in th
 | **shallow** | It can fail, but misses the likely bugs: happy path only, defined or truthy checks, loose matchers | Add the case it misses: an edge, an error, a boundary |
 | **brittle** | It checks real behaviour but also fails on correct changes: large snapshots, exact mock calls, implementation details, timing | Assert on behaviour, not on how the code does it |
 | **hollow** | No real bug can make it fail: no assertion, a tautology, it tests the mock | Rewrite it to assert on what the code does |
-| **duplicate** | Another test in the file already catches the same bugs | Delete it, or merge it into the other |
+| **duplicate** | Another test in the file already catches the same bugs. The reason starts `Repeats "…", keep "…"`, and of two tests that repeat each other only the one to delete is marked | Delete it, or merge it into the one to keep |
 
 Shallow and brittle are opposite problems: a shallow test misses bugs, and a brittle one raises false alarms. Where more than one grade fits, the grader gives the first of hollow, duplicate, shallow, brittle, and lists and notes put them in that order, worst first. Shallow, brittle, hollow and duplicate tests are *flagged*. Grades kept from before (good, weak, useless) read as strong, shallow and hollow.
 
@@ -20,7 +20,7 @@ Shallow and brittle are opposite problems: a shallow test misses bugs, and a bri
 
 The pane opens at session start, or with `/test-grader`. It shows:
 
-- **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded.
+- **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded. A `.test-grader-ignore` file at the project's root leaves test files out of the list and of grading, one pattern per line as `.gitignore` reads them: `.agents/` (a folder at any depth), `/legacy/old/` (from the root), `**/*.snap.test.ts`, and `#` for a comment.
 - **Tests grouped by folder and file, worst first.** The pane draws the project's folders as a tree. Each folder's row shows the counts for every test beneath it, and its line coverage when a coverage report has it. A folder holding only one subfolder shares its row, as in `gateways/api/`. When tests sit in a single folder, no folder row is drawn, and the list reads flat.
 - **Folders and files start closed among siblings.** One alone at its level starts open. Each opens with a press. What you open stays open across a reload of the mod or a compaction. A new session starts everything closed again.
 - **Go testify suites as their own group.** A suite spread over several files is one group, listing its files. A `Test…` function that only runs the suite is not counted as a test.
@@ -99,7 +99,7 @@ An unrated test says why on its row, in `test_grades` and in the report, as its 
 | --- | --- |
 | The engine refused the call | the model and the refusal, such as a blocked model |
 | The API gave no answer | the model, the status and the API's error |
-| The reply was cut off at its 4,000-token limit | that, and how many of the batch's verdicts it gave |
+| The reply was cut off at its 8,000-token limit | that, and how many of the batch's tests it answered (a table test's many cases count as one) |
 | The reply held no verdict at all | the start of what came back |
 | The reply held a verdict for the test that could not be read | that verdict as it came back, such as one with an unknown grade |
 | The grader answered under a name no test was asked by | the names it used |
@@ -108,7 +108,7 @@ An unrated test says why on its row, in `test_grades` and in the report, as its 
 
 A test whose cases run inside it, such as a Go table test with `t.Run` subtests, gets one verdict. The grader is asked for one verdict per test. When it still grades case by case (`TestX › xdr role`, `TestX/xdr_role`), the cases' verdicts count for the test: the worst of them, its reason naming the case that earned it. A verdict under the test's own name wins over its cases'.
 
-A verdict whose name differs from one test's only in its quotes, dashes, escapes or spacing counts for that test: a grader often echoes `subagent’s` as `subagent's`. Two tests that read alike that way get neither verdict. A verdict named with the `describe` groups around its test, such as `ApiClient › post › retries` for `retries`, counts for the test asked whose name the verdict's ends with, when only one test has that ending.
+A verdict whose name differs from one test's only in its quotes, dashes, escapes or spacing counts for that test: a grader often echoes `subagent’s` as `subagent's`. Two tests that read alike that way get neither verdict. A verdict named with the `describe` groups around its test, such as `ApiClient › post › retries` for `retries`, counts for the test asked whose name the verdict's ends with, when only one test has that ending. So does one whose group is joined by a space or a colon (`parseDebugId reads the debug ID` for `reads the debug ID`): the longest test asked the name ends with, where a space or a colon comes before it.
 
 The reason is kept with the grades, and goes once the test is graded. `test_evidence` answers with it too, when the grader gives no verdict on the evidence.
 
@@ -172,7 +172,7 @@ By default the tool lists the flagged tests, worst first, after a line of counts
 
 | Input | What it does |
 | --- | --- |
-| `verdicts` | which tests to list: `hollow`, `duplicate`, `shallow`, `brittle`, `unrated`, `reviewing`, `ungraded`, `strong`. The default is the four flagged grades. |
+| `verdicts` | which tests to list: `hollow`, `duplicate`, `shallow`, `brittle`, `unrated`, `reviewing`, `ungraded`, `strong`. The default is the four flagged grades and `unrated`. |
 | `path` | only the tests in this file or folder |
 | `written` | only the tests written or edited this session |
 | `limit` | how many tests to list at most, 50 by default. The answer says how many it left out. |
@@ -265,6 +265,8 @@ The pane offers **Run coverage** when it finds a way to measure it, in this orde
 | `package.json` with jest | `npx jest --coverage` |
 | `pytest.ini`, `pyproject.toml` or `setup.cfg` | `pytest --cov` |
 | `go.mod` | `go test ./... -cover -coverprofile=.test-grader-go-cover.out` |
+
+**A project of parts.** When the root has none of these, each top-level folder that holds tests and has one of its own is a part: a Go `backend/` and a jest `mobile/`, say. Run coverage runs every part's in its own folder, at once. The pane shows each part's figures under its folder (Go's statements and jest's lines don't add up to one figure), each folder's row shows its part's kind of figure, and Go's packages are named by their path in the project. `test_coverage` on a folder runs only the part it's in, a Go folder by its packages.
 
 It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or Go's coverage profile. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
 

@@ -366,3 +366,26 @@ export const changedCases = (before: string, after: string, file: string): strin
 
 // a file by its path in the project, or as it is when it lies outside
 export const shortPath = (file: string, cwd: string): string => (cwd && file.startsWith(`${cwd}/`) ? file.slice(cwd.length + 1) : file)
+
+// A project's ignore list (.test-grader-ignore), as gitignore reads one: a pattern per line, # a
+// comment; * any run within a name, ** any run of folders, ? one character; a pattern with a /
+// before its end is from the project's root, one without matches a name at any depth; a
+// trailing / names a folder alone. Whether a path in the project is ignored
+export const ignoredBy = (list: string): ((path: string) => boolean) => {
+  const rules = list
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line !== '' && !line.startsWith('#'))
+    .map(line => {
+      const isDir = line.endsWith('/')
+      const pattern = line.replace(/\/+$/, '')
+      const isRooted = pattern.includes('/')
+      const body = pattern
+        .replace(/^\//, '')
+        .split(/(\*\*\/?|\*|\?)/)
+        .map(part => (part === '**/' ? '(?:.*/)?' : part === '**' ? '.*' : part === '*' ? '[^/]*' : part === '?' ? '[^/]' : part.replace(/[.+^${}()|[\]\\]/g, '\\$&')))
+        .join('')
+      return new RegExp(`${isRooted ? '^' : '(?:^|/)'}${body}${isDir ? '/' : '(?:/|$)'}`)
+    })
+  return path => rules.some(r => r.test(path))
+}
