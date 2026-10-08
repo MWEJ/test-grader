@@ -183,6 +183,38 @@ test('a Go coverage run reads the profile it writes: statements weighted by each
   expect(tree).not.toContain('% lines')
 })
 
+test('a Go coverage run shows a statements bar for each package under the total, lowest first, and says how many it leaves out', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // ten packages: pkg/p0 has 0 of its 10 statements covered, pkg/p9 9; the root package all 10
+  const files: Record<string, string> = { ...GO_MODULE }
+  const blocks = Array.from({ length: 10 }, (_, i) => [
+    `example.com/shop/pkg/p${i}/p.go:1.1,2.2 ${i} 1`,
+    `example.com/shop/pkg/p${i}/p.go:3.1,4.2 ${10 - i} 0`,
+  ]).flat()
+  const { notes } = project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = ['mode: set', 'example.com/shop/main.go:1.1,2.2 10 1', ...blocks, ''].join('\n')
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(notes[0]).toContain('statements 50% (go test -coverprofile)')
+  // the words drawn, not the bars' blank cells
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.trim() !== '')
+  // the total first, then the eight least covered packages, each with its own figure
+  const at = texts.indexOf('Statements')
+  expect(texts.slice(at, at + 2)).toEqual(['Statements', '50%'])
+  const packages = texts.slice(at + 2).filter(t => /^pkg\/|^\.\/$/.test(t))
+  expect(packages).toEqual(['pkg/p0/', 'pkg/p1/', 'pkg/p2/', 'pkg/p3/', 'pkg/p4/', 'pkg/p5/', 'pkg/p6/', 'pkg/p7/'])
+  expect(texts).toContain('0%')
+  expect(texts).toContain('70%')
+  expect(texts).toContain('3 more packages, up to 100%')
+  expect(texts).not.toContain('pkg/p9/')
+})
+
 test('a Go coverage run that wrote no profile falls back to the mean of the figures it printed', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...GO_MODULE }

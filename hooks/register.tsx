@@ -44,6 +44,9 @@ const BLUE = '#60a5fa'
 const MAX_OPEN = 60
 const MAX_TESTS = 5_000
 const CELLS = 12
+// Go's package bars: how many show, and how wide their labels may be
+const PACKAGE_BARS = 8
+const PACKAGE_LABEL = 28
 // Grade all tests: cases per grader call
 const BATCH = 10
 // grader calls in flight at once, from the graderWorkers setting (1 to 20), 10 by default
@@ -638,8 +641,8 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
   const profileAt = await mtime($, `${cwd}/${GO_PROFILE}`)
   if (profileAt !== null) {
     const goMod = await $.fs.read(`${cwd}/go.mod`).catch(() => '')
-    const { statements, byFile } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd)
-    if (statements !== null) return { byDir: byDirOf(byFile, cwd), lines: null, statements: pct(statements), branches: null, functions: null, source: 'go test -coverprofile', updatedAt: profileAt }
+    const { statements, byFile, byPackage } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd)
+    if (statements !== null) return { byDir: byDirOf(byFile, cwd), byPackage, lines: null, statements: pct(statements), branches: null, functions: null, source: 'go test -coverprofile', updatedAt: profileAt }
   }
   const goAt = await mtime($, goPath)
   if (goAt !== null) {
@@ -2192,6 +2195,32 @@ export const register: Register = (on, options) => {
       ? [['Lines', cov.lines], ['Statements', cov.statements], ['Branches', cov.branches], ['Functions', cov.functions]]
       : []
     const age = cov?.updatedAt ? Math.max(0, Math.round((now - cov.updatedAt) / 60_000)) : null
+    // a coverage figure as a bar: its label, its cells filled by the figure, and the figure
+    const bar = (key: string, label: string, value: number, width: number, indent: number): unknown => {
+      const filled = Math.round((Math.min(100, value) / 100) * CELLS)
+      return (
+        <Box key={key} flexDirection="row" gap={1} marginLeft={indent}>
+          <Box width={width}>
+            <Text color={MUTED}>{clamp(label, width)}</Text>
+          </Box>
+          <Box flexDirection="row" width={CELLS}>
+            {Array.from({ length: CELLS }, (_, i) => (
+              <Box key={`c-${key}-${i}`} width={1} backgroundColor={i < filled ? pctColor(value) : TRACK}>
+                <Text> </Text>
+              </Box>
+            ))}
+          </Box>
+          <Text bold color={pctColor(value)}>{`${value}%`}</Text>
+        </Box>
+      )
+    }
+    // Go's packages under the total, least covered first: a few, then how many more and their best
+    const packages = (cov?.byPackage ?? []).length > 1
+      ? cov!.byPackage!.map(p => ({ name: p.name, pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name))
+      : []
+    const packageBars = packages.slice(0, PACKAGE_BARS)
+    const packagesLeft = packages.slice(PACKAGE_BARS)
+    const packageWidth = Math.min(PACKAGE_LABEL, Math.max(9, ...packageBars.map(p => p.name.length)))
 
     return (
       <Box flexDirection="column" flexGrow={1}>
@@ -2221,27 +2250,13 @@ export const register: Register = (on, options) => {
                 <Text bold>Coverage</Text>
                 <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
               </Box>
-              {metrics
-                .filter(([, v]) => v !== null)
-                .map(([label, v]) => {
-                  const value = v as number
-                  const filled = Math.round((Math.min(100, value) / 100) * CELLS)
-                  return (
-                    <Box key={`cov-${label}`} flexDirection="row" gap={1}>
-                      <Box width={11}>
-                        <Text color={MUTED}>{label}</Text>
-                      </Box>
-                      <Box flexDirection="row" width={CELLS}>
-                        {Array.from({ length: CELLS }, (_, i) => (
-                          <Box key={`c-${label}-${i}`} width={1} backgroundColor={i < filled ? pctColor(value) : TRACK}>
-                            <Text> </Text>
-                          </Box>
-                        ))}
-                      </Box>
-                      <Text bold color={pctColor(value)}>{`${value}%`}</Text>
-                    </Box>
-                  )
-                })}
+              {metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, 11, 0)) as never}
+              {packageBars.map(p => bar(`cov-pkg-${p.name}`, p.name, p.pct, packageWidth, 2)) as never}
+              {packagesLeft.length > 0 && (
+                <Box marginLeft={2}>
+                  <Text color={MUTED}>{`${plural(packagesLeft.length, 'more package')}, up to ${Math.max(...packagesLeft.map(p => p.pct))}%`}</Text>
+                </Box>
+              )}
               {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
               {running.state === 'failed' && <Text color={RED}>{running.message ?? 'Coverage run failed.'}</Text>}
             </Box>

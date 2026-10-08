@@ -7,7 +7,9 @@
 // the module path go.mod declares, which every import path in the profile starts with
 export const moduleOf = (goMod: string): string | null => goMod.match(/^module\s+(\S+)/m)?.[1]?.replace(/^"|"$/g, '') ?? null
 
-export const goProfileOf = (profile: string, module: string | null, cwd: string): { statements: number | null; byFile: { file: string; total: number; covered: number }[] } => {
+type Tally = { total: number; covered: number }
+
+export const goProfileOf = (profile: string, module: string | null, cwd: string): { statements: number | null; byFile: ({ file: string } & Tally)[]; byPackage: ({ name: string } & Tally)[] } => {
   const blocks = new Map<string, { file: string; statements: number; isCovered: boolean }>()
   for (const line of profile.split('\n')) {
     const m = line.trim().match(/^(.+\.go):(\d+\.\d+,\d+\.\d+) (\d+) (\d+)$/)
@@ -19,7 +21,7 @@ export const goProfileOf = (profile: string, module: string | null, cwd: string)
   }
   // an import path inside the module is a file in the project; one outside it keeps its path
   const local = (path: string): string => (module && path.startsWith(`${module}/`) ? `${cwd}/${path.slice(module.length + 1)}` : path)
-  const files = new Map<string, { total: number; covered: number }>()
+  const files = new Map<string, Tally>()
   for (const b of blocks.values()) {
     const f = files.get(b.file) ?? { total: 0, covered: 0 }
     f.total += b.statements
@@ -29,5 +31,17 @@ export const goProfileOf = (profile: string, module: string | null, cwd: string)
   const byFile = [...files].map(([path, f]) => ({ file: local(path), ...f }))
   const total = byFile.reduce((s, f) => s + f.total, 0)
   const covered = byFile.reduce((s, f) => s + f.covered, 0)
-  return { statements: total > 0 ? (covered / total) * 100 : null, byFile }
+  // a package is its files' folder: by its path in the project ('./' the module's root), one
+  // outside the module by its import path
+  const packages = new Map<string, Tally>()
+  for (const f of byFile) {
+    const dir = f.file.slice(0, f.file.lastIndexOf('/'))
+    const name = dir === cwd ? './' : `${dir.startsWith(`${cwd}/`) ? dir.slice(cwd.length + 1) : dir}/`
+    const p = packages.get(name) ?? { total: 0, covered: 0 }
+    p.total += f.total
+    p.covered += f.covered
+    packages.set(name, p)
+  }
+  const byPackage = [...packages].filter(([, p]) => p.total > 0).map(([name, p]) => ({ name, ...p }))
+  return { statements: total > 0 ? (covered / total) * 100 : null, byFile, byPackage }
 }

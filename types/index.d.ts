@@ -26,6 +26,8 @@ export type Coverage = {
   updatedAt: number | null
   /** line coverage by folder, its path in the project ('' the project), each with all beneath it */
   byDir?: Record<string, { total: number; covered: number }>
+  /** Go's statements by package, by its path in the project ('./' the module's root) */
+  byPackage?: { name: string; total: number; covered: number }[]
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
