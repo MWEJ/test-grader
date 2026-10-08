@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { mount, project, buttonsOf, appended, JEST_PROJECT, SUMMARY, jest } from './helpers'
+import { mount, project, buttonsOf, nodesOf, appended, JEST_PROJECT, SUMMARY, jest } from './helpers'
 import type { Engine, On } from './helpers'
 
 test('Run coverage shows only in a project with a way to measure it; a report written by other means still shows its figures', async ($, on) => {
@@ -596,6 +596,38 @@ test('a project of parts with no way to measure at its root runs each part\'s co
   expect(texts).toContain('60% lines')
   expect(notes.at(-1)).toContain('backend/ statements 25% (go test -coverprofile); mobile/ lines 60% (lcov.info)')
 })
+
+test("a part's packages left out show at a press, their bars in line with the part's figures, the heading naming only the age", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...PARTS }
+  const blocks = Array.from({ length: 10 }, (_, i) => `example.com/shop/cmd/generate-image-${i}/m.go:1.1,2.2 10 ${i % 2}`)
+  project(on, files, {
+    editor: (argv: string[]) => {
+      if (argv[0] === 'go') files['backend/.test-grader-go-cover.out'] = ['mode: set', ...blocks, ''].join('\n')
+      else files['mobile/coverage/lcov.info'] = 'SF:src/x.ts\nLF:10\nLH:6\nend_of_record\n'
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  const named = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.startsWith('cmd/'))
+  expect(await named()).toHaveLength(8)
+  await ui.press({ key: 'cov:packages:backend' })
+  expect(await named()).toHaveLength(10)
+  // the label column of a package and of the part's figure is one width, so the bars start in line
+  const widthOf = (label: string) => {
+    const box = nodesOf(tree).find(n => n.type === 'Box' && n.props?.width !== undefined && JSON.stringify(n.children ?? []).includes(JSON.stringify(label)))
+    return box?.props?.width
+  }
+  const tree = await ui.drawn()
+  expect(widthOf('cmd/generate-image-0/')).toBe(widthOf('Statements'))
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  // each part names its source under its own heading: the pane's heading is followed by the age alone
+  expect(texts[texts.indexOf('Coverage') + 1]).toBe('0m ago')
+})
+
 
 test('test_coverage on a folder of a part runs that part alone, a Go folder by its packages, and answers with the part\'s figure', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })

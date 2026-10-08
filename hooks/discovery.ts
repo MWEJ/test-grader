@@ -340,6 +340,14 @@ export const fits = (template: string, name: string): boolean => {
 // whether a name the lists hold is still among a file's cases: itself, or a case of a loop
 export const among = (names: string[], name: string): boolean => names.some(n => fits(n, name))
 
+// A looped test's row under its template name, kept from before its cases were graded one by
+// one, gives way to those cases' rows: the test is counted once, not also as unrated
+export const withoutTemplates = <T extends { file: string; name: string }>(rows: T[]): T[] => {
+  const cases = new Map<string, string[]>()
+  for (const t of rows) if (!isTemplate(t.name)) cases.set(t.file, [...(cases.get(t.file) ?? []), t.name])
+  return rows.filter(t => !isTemplate(t.name) || !(cases.get(t.file) ?? []).some(n => fits(t.name, n)))
+}
+
 // the line a case opens on: its own it( or test(, a looped case's the loop's; else the top
 export const caseLine = (text: string, name: string, file: string): number => {
   const found = casesIn(text, file).find(c => fits(c.name, name))

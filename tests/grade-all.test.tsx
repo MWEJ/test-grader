@@ -302,6 +302,58 @@ test('a finished Grade all tests saves grades a later session reads back whole, 
 })
 
 
+test("a looped test's template row saved beside its graded cases leaves at the next session, while a template with no graded cases stays unrated", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const looped = "it.each(['a', 'b'])('indexes %s', k => { expect(idx(k)).toBe(k) })\n"
+  const other = "it.each(['x'])('parses %s', k => { expect(parse(k)).toBe(k) })\n"
+  const files = { 'src/l.test.ts': looped + other }
+  const { store } = project(on, files)
+  // saved before cases were graded one by one: the template's own row, unrated, beside its cases
+  store['grades:/proj'] = {
+    results: [
+      { file: '/proj/src/l.test.ts', name: 'indexes %s' },
+      { file: '/proj/src/l.test.ts', name: 'indexes a', verdict: 'strong', summary: 'Checks a.', reason: 'strong a.' },
+      { file: '/proj/src/l.test.ts', name: 'indexes b', verdict: 'strong', summary: 'Checks b.', reason: 'strong b.' },
+      { file: '/proj/src/l.test.ts', name: 'parses %s' },
+    ],
+    hashes: { '/proj/src/l.test.ts': fingerprint(files['src/l.test.ts']) },
+    finishedAt: 500_000,
+  }
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const names = unkeep(store['grades:/proj'] as never).results.map(t => t.name).sort()
+  expect(names).toEqual(['indexes a', 'indexes b', 'parses %s'])
+})
+
+
+test('a test graded before own texts were kept gains its own on a run that finds its file unchanged, so a later change to a sibling grades the sibling alone', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const adds = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const files: Record<string, string> = { 'src/a.test.ts': adds + "it('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" }
+  const { prompts, store } = project(on, files)
+  // saved by a version that kept no test's own text
+  store['grades:/proj'] = {
+    results: [
+      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong adds.' },
+      { file: '/proj/src/a.test.ts', name: 'subtracts', verdict: 'strong', summary: 'Checks subtracts.', reason: 'strong subtracts.' },
+    ],
+    hashes: { '/proj/src/a.test.ts': fingerprint(files['src/a.test.ts']!) },
+    finishedAt: 500_000,
+  }
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(0)
+
+  files['src/a.test.ts'] = adds + "it('subtracts', () => { expect(sub(3, 2)).toBe(1); expect(sub(2, 3)).toBe(-1) })\n"
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(ASKED(prompts)).toEqual(['subtracts'])
+})
+
+
 test('a new session lists the grades saved for its project, and Grade all tests grades again only the files changed since', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const before = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"

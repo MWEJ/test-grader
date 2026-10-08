@@ -5,7 +5,7 @@ import type { Before, Confidence, Coverage, ExistingRun, ExistingTest, TrackedTe
 
 import { attr, byDirOf, coverageAnswer, coverageNote, kindAt, mergeParts, pct } from './coverage'
 import type { CoverCommand } from './coverage'
-import { TEST_FILE, among, ignoredBy, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
+import { TEST_FILE, among, ignoredBy, withoutTemplates, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, caseTextsOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, mergeProfile, moduleOf } from './gocover'
@@ -967,7 +967,12 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
         const names = [...new Set(caseNames(text, file))]
         const entry: Entry = { file, left: 0, slots: [], hash }
         // unchanged since its last grading, and every test rated: its results stand
-        const kept = before.results.filter(t => t.file === file)
+        // a rated test of a file unchanged since its grading was graded on its text as it is: one
+        // graded before own texts were kept gains its own, so a later change to a sibling leaves it be
+        const ownNow = ownTexts(text, file)
+        const kept = before.results
+          .filter(t => t.file === file)
+          .map(t => (before.hashes?.[file] === hash && t.verdict !== undefined && t.textOf === undefined ? { ...t, textOf: ownNow(t.name) } : t))
         if (!isFresh && before.hashes?.[file] === hash && kept.length > 0 && kept.every(t => t.verdict !== undefined)) {
           entry.slots.push({ items: kept, waiting: kept, was: kept, isDone: true })
           perFile.push(entry)
@@ -981,8 +986,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
         const isSame = !isFresh && before.hashes?.[file] === hash
         // in a changed file, a test whose own text is as it was graded keeps its grade: only the
         // tests a change touched are graded again, so a loop of fixes converges
-        const own = ownTexts(text, file)
-        const isUntouched = (t: ExistingTest): boolean => !isFresh && t.verdict !== undefined && t.textOf !== undefined && t.textOf === own(t.name)
+        const isUntouched = (t: ExistingTest): boolean => !isFresh && t.verdict !== undefined && t.textOf !== undefined && t.textOf === ownNow(t.name)
         const held = kept.filter(t => isHeld(t, text, file) || (isSame && t.verdict !== undefined) || isUntouched(t))
         const toGrade = names.filter(name => !held.some(t => fits(name, t.name)))
         if (held.length > 0) {
@@ -1284,7 +1288,7 @@ const prune = async ($: EngineInterface): Promise<void> => {
   for (const file of files) present.set(file, await $.fs.read(file).then(text => caseNames(text, file), () => []))
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
   await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
-  await update($, existing, r => ({ ...r, results: r.results.filter(isThere) }))
+  await update($, existing, r => ({ ...r, results: withoutTemplates(r.results.filter(isThere)) }))
   await saveGrades($)
 }
 
@@ -1316,7 +1320,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
     }
   }
   const isListed = new Set(Object.keys(hashes))
-  await update($, existing, r => (r.state === 'running' ? r : { ...r, results: [...cases, ...r.results.filter(t => !isListed.has(t.file))] }))
+  await update($, existing, r => (r.state === 'running' ? r : { ...r, results: [...withoutTemplates(cases), ...r.results.filter(t => !isListed.has(t.file))] }))
   // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
   // fingerprint, so a change made between sessions is still caught at a turn's end
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
@@ -2451,12 +2455,15 @@ export const register: Register = (on, options) => {
     }
     // Go's packages under the total (a part's under that part, named in it), least covered first:
     // a few, then how many more and their best, the rest behind a press, kept open as a group is
-    const packagesDrawn = (of: { name: string; total: number; covered: number }[], prefix: string, key: string): unknown[] => {
-      const packages = of.length > 1 ? of.map(p => ({ name: p.name.slice(prefix.length) || './', pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name)) : []
+    const packagesOf = (of: { name: string; total: number; covered: number }[], prefix: string) =>
+      of.length > 1 ? of.map(p => ({ name: p.name.slice(prefix.length) || './', pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name)) : []
+    // the label column of a group of bars, the figures' and their packages' one width, so every bar
+    // starts in line, opened or not
+    const labelWidth = (packages: { name: string }[]): number => Math.min(PACKAGE_LABEL, Math.max(11, ...packages.map(p => p.name.length)))
+    const packagesDrawn = (packages: { name: string; pct: number }[], prefix: string, key: string, width: number): unknown[] => {
       const isAll = filesOpen[key] === true
       const shown = isAll ? packages : packages.slice(0, PACKAGE_BARS)
       const left = isAll ? [] : packages.slice(PACKAGE_BARS)
-      const width = Math.min(PACKAGE_LABEL, Math.max(9, ...shown.map(p => p.name.length)))
       return [
         ...shown.map(p => bar(`cov-pkg-${prefix}${p.name}`, p.name, p.pct, width, 2)),
         ...(left.length > 0
@@ -2503,19 +2510,30 @@ export const register: Register = (on, options) => {
             <Box flexDirection="column">
               <Box flexDirection="row" justifyContent="space-between">
                 <Text bold>Coverage</Text>
-                <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
+                {/* a project of parts names each part's source under its own heading */}
+                <Text color={MUTED}>{cov ? [...(parts ? [] : [cov.source]), ...(age !== null ? [`${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago`] : [])].join(' – ') : 'no report found'}</Text>
               </Box>
-              {metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, 11, 0)) as never}
               {/* a project of parts: each part's figures, and its packages, under its folder */}
               {(parts
-                ? parts.flatMap(part => [
-                    <Text key={`cov-part-${part.dir}`} color={MUTED}>{`${part.dir}/ · ${part.source}`}</Text>,
-                    ...([['Lines', part.lines], ['Statements', part.statements], ['Branches', part.branches], ['Functions', part.functions]] as const)
-                      .filter(([, v]) => v !== null)
-                      .map(([label, v]) => bar(`cov-${part.dir}-${label}`, label, v as number, 11, 2)),
-                    ...packagesDrawn((cov?.byPackage ?? []).filter(p => p.name.startsWith(`${part.dir}/`)), `${part.dir}/`, `${ALL_PACKAGES}:${part.dir}`),
-                  ])
-                : packagesDrawn(cov?.byPackage ?? [], '', ALL_PACKAGES)) as never}
+                ? parts.flatMap(part => {
+                    const packages = packagesOf((cov?.byPackage ?? []).filter(p => p.name.startsWith(`${part.dir}/`)), `${part.dir}/`)
+                    const width = labelWidth(packages)
+                    return [
+                      <Text key={`cov-part-${part.dir}`} color={MUTED}>{`${part.dir}/ · ${part.source}`}</Text>,
+                      ...([['Lines', part.lines], ['Statements', part.statements], ['Branches', part.branches], ['Functions', part.functions]] as const)
+                        .filter(([, v]) => v !== null)
+                        .map(([label, v]) => bar(`cov-${part.dir}-${label}`, label, v as number, width, 2)),
+                      ...packagesDrawn(packages, `${part.dir}/`, `${ALL_PACKAGES}:${part.dir}`, width),
+                    ]
+                  })
+                : (() => {
+                    const packages = packagesOf(cov?.byPackage ?? [], '')
+                    const width = labelWidth(packages)
+                    return [
+                      ...metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, width + 2, 0)),
+                      ...packagesDrawn(packages, '', ALL_PACKAGES, width),
+                    ]
+                  })()) as never}
               {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
               {/* tests failed but left figures: a warning, not a failure */}
               {running.state === 'failed' && <Text color={cov && running.message?.startsWith('Tests exited') ? AMBER : RED}>{running.message ?? 'Coverage run failed.'}</Text>}
