@@ -3,6 +3,14 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '../types'
 
+import { TEST_FILE, among, caseLine, caseNames, casesAround, changedCases, casesIn, fits, isTemplate, kindOf, suitesOf } from './discovery'
+import type { Kind } from './discovery'
+import { clamp, excerptOf, parseVerdicts } from './excerpt'
+import type { Graded } from './excerpt'
+import { modelOf, workersOf } from './settings'
+import { runArgv, shown, tailOf } from './runner'
+import type { RunTarget, Runners } from './runner'
+
 const PANE = 'test-grader'
 const tests = atom({ plugin: 'test-grader', key: 'tests' } as const, [])
 const coverage = atom({ plugin: 'test-grader', key: 'coverage' } as const, null)
@@ -17,6 +25,9 @@ const openFor = atom({ plugin: 'test-grader', key: 'openFor' } as const, null)
 const rounds = atom({ plugin: 'test-grader', key: 'rounds' } as const, {})
 const outbox = atom({ plugin: 'test-grader', key: 'outbox' } as const, { accepted: [], going: [], spent: [] })
 const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
+const saveError = atom({ plugin: 'test-grader', key: 'saveError' } as const, null)
+const testRuns = atom({ plugin: 'test-grader', key: 'testRuns' } as const, {})
+const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -24,165 +35,34 @@ const RED = '#f87171'
 const MUTED = '#8b90a0'
 const TRACK = '#343848'
 const VIOLET = '#a78bfa'
-const MAX_TESTS = 60
-const MAX_SOURCE = 12_000
-// of a file too long to send whole: at most this much of its head (imports, helpers), and of
-// any one case under review
-const MAX_HEAD = 12_000
-const MAX_BODY = 20_000
+const BLUE = '#60a5fa'
+// the rows kept pressed open, and the tests written this session the list keeps: the oldest go
+const MAX_OPEN = 60
+const MAX_TESTS = 5_000
 const CELLS = 12
 // Grade all tests: cases per grader call, and how many weak or useless ones are listed
 const BATCH = 10
 // grader calls in flight at once, from the graderWorkers setting (1 to 20), 10 by default
-const MAX_WORKERS = 20
 let parallel = 10
 // a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
 // stand for many cases each
 const MAX_REPLY = 4000
 // the model that grades, from the graderModel setting; set as the module loads, and a change
 // to the setting reloads the module
-const GRADER_MODELS = ['haiku', 'sonnet', 'opus'] as const
 let graderModel: string = 'haiku'
-
-const TEST_FILE = /(\.|_)(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]*\.py$|Tests?\.(swift|kt|java)$|(^|\/)(__tests__|tests?)\/[^/]+\.[cm]?[jt]sx?$/
-// a JS case opens its own line, so one quoted inside a fixture string is not one; its
-// name runs to the closing quote, past any escaped one
-const CASE_PATTERNS = [
-  /^[ \t]*(?:it|test)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\\n])+)\1/gm,
-  /^\s*(?:async\s+)?def\s+(test_\w+)/gm,
-  /\bfunc\s+(Test\w+)\s*\(/g,
-  // a Go suite's test: a Test method of the suite type (testify)
-  /\bfunc\s+\(\s*\w+\s+\*?(\w+)\s*\)\s+(Test\w+)\s*\(/g,
-  /\bfunc\s+(test\w+)\s*\(/g,
-  /^\s*#\[test\]\s*\n\s*(?:async\s+)?fn\s+(\w+)/gm,
-]
-
-// a Go suite's test, its suite the receiver's type; and a Go test that only runs a suite
-const GO_SUITE_CASE = /\bfunc\s+\(\s*\w+\s+\*?(\w+)\s*\)\s+(Test\w+)\s*\(/g
-const GO_SUITE_RUNNER = /\bfunc\s+(Test\w+)\s*\(\s*\w+\s+\*testing\.T\s*\)\s*\{\s*suite\.Run\([^)]*\)\)?\s*\}/g
+// grades again what the first grade left weak (a regrade, evidence, a last round), when set
+let escalateModel: string | null = null
 
 const verdictColor = (v: Verdict | undefined): string =>
   v === 'good' ? GREEN : v === 'weak' ? AMBER : v === 'useless' ? RED : MUTED
+
+// a count of tokens as the pane shows it: 950, 310k, 1.2M
+const tokens = (n: number): string => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${n}`)
 
 const pctColor = (p: number): string => (p >= 80 ? GREEN : p >= 50 ? AMBER : RED)
 
 const shortPath = (file: string, cwd: string): string => (cwd && file.startsWith(`${cwd}/`) ? file.slice(cwd.length + 1) : file)
 
-const nameOf = (m: RegExpMatchArray): string => (m[2] ?? (m[1] as string)).replace(/\\(.)/g, '$1')
-
-// the families of syntax a test file's strings and comments follow: JS and TS; Go; Python
-// and Ruby; and the C-like rest (Rust, Swift, Kotlin, Java)
-type Lang = 'js' | 'go' | 'py' | 'c'
-const langOf = (file: string): Lang =>
-  /\.[cm]?[jt]sx?$/.test(file) ? 'js' : file.endsWith('.go') ? 'go' : /\.(py|rb)$/.test(file) ? 'py' : 'c'
-
-// Which characters of a source sit inside a string literal or a comment (1) rather than in
-// code (0): a test written out as text, a fixture, is not one of the file's tests
-const quotedMask = (text: string, lang: Lang): Uint8Array => {
-  const n = text.length
-  const mask = new Uint8Array(n)
-  const fill = (from: number, to: number): number => (mask.fill(1, from, to), to)
-  // past a string's opening quote at `from`: where it ends, past its closing quote; one that
-  // may not span lines ends at its line's end
-  const close = (from: number, quote: string, { escapes = true, lines = false } = {}): number => {
-    for (let j = from; j < n; j++) {
-      if (escapes && text[j] === '\\') j++
-      else if (text.startsWith(quote, j)) return j + quote.length
-      else if (text[j] === '\n' && !lines) return j
-    }
-    return n
-  }
-  // JS: the ${…} holes open in templates, innermost last, each with the braces opened in it
-  const holes: number[] = []
-  // a JS template's text from `from` to its close or its next hole
-  const template = (from: number, scan: number): number => {
-    for (let j = scan; j < n; j++) {
-      if (text[j] === '\\') j++
-      else if (text[j] === '`') return fill(from, j + 1)
-      else if (text[j] === '$' && text[j + 1] === '{') return holes.push(0), fill(from, j + 2)
-    }
-    return fill(from, n)
-  }
-  // a JS slash opens a regex where a value is due, not after one
-  const isRegexAt = (at: number): boolean => {
-    let k = at - 1
-    while (k >= 0 && /\s/.test(text[k]!)) k--
-    if (k < 0 || '(,=:[!&|?{};+-*%~^'.includes(text[k]!)) return true
-    return /\b(?:return|typeof|case|in|of|delete|void|throw|new|else|do|yield|await)$/.test(text.slice(Math.max(0, k - 9), k + 1))
-  }
-  const regexEnd = (at: number): number => {
-    let isClass = false
-    for (let j = at + 1; j < n; j++) {
-      const t = text[j]
-      if (t === '\\') j++
-      else if (t === '\n') return j
-      else if (isClass) isClass = t !== ']'
-      else if (t === '[') isClass = true
-      else if (t === '/') return j + 1
-    }
-    return n
-  }
-  const RUST_RAW = /r(#*)"/y
-  let i = 0
-  while (i < n) {
-    const c = text[i]!
-    const d = text[i + 1]
-    if (lang === 'py' ? c === '#' : c === '/' && d === '/') {
-      const end = text.indexOf('\n', i)
-      i = fill(i, end < 0 ? n : end)
-    } else if (lang !== 'py' && c === '/' && d === '*') {
-      const end = text.indexOf('*/', i + 2)
-      i = fill(i, end < 0 ? n : end + 2)
-    } else if (lang === 'js' && c === '`') i = template(i, i + 1)
-    else if (lang === 'js' && holes.length > 0 && (c === '{' || c === '}')) {
-      const top = holes.length - 1
-      if (c === '{') holes[top]! += 1
-      else if (holes[top]! > 0) holes[top]! -= 1
-      else {
-        holes.pop()
-        i = template(i, i + 1)
-        continue
-      }
-      i++
-    } else if (lang === 'js' && c === '/' && isRegexAt(i)) i = fill(i, regexEnd(i))
-    else if (lang === 'go' && c === '`') i = fill(i, close(i + 1, '`', { escapes: false, lines: true }))
-    else if (lang !== 'js' && lang !== 'go' && (text.startsWith('"""', i) || (lang === 'py' && text.startsWith("'''", i)))) {
-      i = fill(i, close(i + 3, text.slice(i, i + 3), { lines: true }))
-    } else if (lang === 'c' && c === 'r' && !/\w/.test(text[i - 1] ?? '') && ((RUST_RAW.lastIndex = i), RUST_RAW.test(text))) {
-      i = fill(i, close(RUST_RAW.lastIndex, `"${text.slice(i + 1, RUST_RAW.lastIndex - 1)}`, { escapes: false, lines: true }))
-    } else if (c === '"' || (c === "'" && lang !== 'c')) i = fill(i, close(i + 1, c))
-    // C-like: a quote opens a char literal ('a', '\n'), not a Rust lifetime ('a)
-    else if (c === "'" && d === '\\') i = fill(i, close(i + 1, "'"))
-    else if (c === "'" && text[i + 2] === "'") i = fill(i, i + 3)
-    else i++
-  }
-  return mask
-}
-
-// where a match's own keyword stands, past the indent a line-anchored pattern takes in
-const opensOf = (m: RegExpMatchArray): number => (m.index ?? 0) + m[0].length - m[0].trimStart().length
-
-// every case a test file declares in its code, in file order: where its match starts (at:
-// for a JS case, its line's start) and where its keyword stands (opens). A Go function that
-// only runs a suite is marked a runner
-const casesIn = (text: string, file: string): { name: string; at: number; opens: number; isRunner: boolean }[] => {
-  const quoted = quotedMask(text, langOf(file))
-  const isCode = (m: RegExpMatchArray): boolean => quoted[opensOf(m)] !== 1
-  const runners = new Set([...text.matchAll(GO_SUITE_RUNNER)].filter(isCode).map(m => m[1]!))
-  return CASE_PATTERNS.flatMap(pattern =>
-    [...text.matchAll(pattern)].filter(isCode).map(m => ({ name: nameOf(m), at: m.index ?? 0, opens: opensOf(m), isRunner: runners.has(nameOf(m)) })),
-  ).sort((a, b) => a.at - b.at)
-}
-
-const caseNames = (text: string, file: string): string[] => casesIn(text, file).flatMap(c => (c.isRunner ? [] : [c.name]))
-
-// each Go suite test's suite, by its name
-const suitesOf = (text: string, file: string): Map<string, string> => {
-  const quoted = quotedMask(text, langOf(file))
-  return new Map([...text.matchAll(GO_SUITE_CASE)].filter(m => quoted[opensOf(m)] !== 1).map(m => [m[2]!, m[1]!]))
-}
-
-const clamp = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 // the lines a text fills at this width, broken between words; a word wider than a line, in pieces
 const wrapWords = (s: string, n: number): string[] => {
   const lines: string[] = []
@@ -199,123 +79,6 @@ const wrapWords = (s: string, n: number): string[] => {
     }
   }
   return [...lines, line]
-}
-
-// where each case starts in a file, in file order: right after the previous case closes
-// (a line opening with "})"), so what sits between two cases (a comment, the data a
-// loop runs over, the loop itself) goes with the case below it; failing a close, on
-// the line after the previous case's first
-const caseStarts = (text: string, file: string): { name: string; at: number; opens: number }[] => {
-  const found = casesIn(text, file)
-  return found.map((start, i) => {
-    const prev = found[i - 1]
-    const at = (): number => {
-      if (!prev) return start.at
-      const between = text.slice(prev.at, start.at)
-      // the previous case's own close, at its indent: a helper declared after it keeps its head
-      const indent = text.slice(text.lastIndexOf('\n', prev.opens - 1) + 1, prev.opens)
-      const own = /^[ \t]*$/.test(indent) ? between.match(new RegExp(`\\n${indent}\\}\\)[^\\n]*\\n`)) : null
-      const closes = [...between.matchAll(/\n[ \t]*\}\)[^\n]*\n/g)]
-      const last = own ?? closes[closes.length - 1]
-      const after = last ? last.index! + last[0].length : between.indexOf('\n') + 1
-      return after > 0 ? prev.at + after : start.at
-    }
-    return { name: start.name, at: at(), opens: start.opens }
-  })
-}
-
-// a top-level declaration a test can use: a constant, a helper, a type, a fixture
-const DECLARATION = /^(?:export\s+)?(?:declare\s+)?(?:(?:const|let|var|function\*?|async\s+function\*?|class|type|interface|enum|func|def|fn|struct)\s+(\w+)|(\w+)\s*=(?!=))/gm
-
-// A name with ${…} in it is a template: the cases a loop generates. The grader names each
-// case as the loop expands it, and a returned name belongs to the template it fits
-const isTemplate = (name: string): boolean => /\$\{[^}]*\}/.test(name)
-const fits = (template: string, name: string): boolean => {
-  if (!isTemplate(template)) return template === name
-  const parts = template.split(/\$\{[^}]*\}/).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-  return new RegExp(`^${parts.join('[\\s\\S]+?')}$`).test(name)
-}
-
-// What the grader reads: the whole file when it fits. Else, in file order: its head, the
-// cases under review whole, each from its start to the next case's, and of what sits between
-// the other cases, each piece that declares a name the shown code uses
-const excerptOf = (source: string, names: string[], file: string): string => {
-  if (source.length <= MAX_SOURCE) return source
-  const starts = caseStarts(source, file)
-  const head = clamp(source.slice(0, starts[0]?.at ?? source.length), MAX_HEAD)
-  const pieces = starts.map((start, i) => ({
-    isChosen: names.includes(start.name),
-    whole: source.slice(start.at, starts[i + 1]?.at ?? source.length).trimEnd(),
-    // what sits above the case's own line: comments, data, helpers
-    declares: [...source.slice(start.at, start.opens).matchAll(DECLARATION)].map(m => (m[1] ?? m[2])!),
-    gap: source.slice(start.at, start.opens).trimEnd(),
-  }))
-  const extra = new Set<number>()
-  let shown = pieces.filter(p => p.isChosen).map(p => p.whole).join('\n')
-  // a helper the shown code uses can use another, so until nothing more is named
-  for (let isGrowing = true; isGrowing; ) {
-    isGrowing = false
-    pieces.forEach((p, i) => {
-      if (p.isChosen || extra.has(i) || !p.declares.some(name => new RegExp(`\\b${name}\\b`).test(shown))) return
-      extra.add(i)
-      shown += `\n${p.gap}`
-      isGrowing = true
-    })
-  }
-  const note = langOf(file) === 'py' ? '#' : '//'
-  const LEFT_OUT = `${note} … other tests left out …`
-  const out = [head.trimEnd()]
-  pieces.forEach((p, i) => {
-    const piece = p.isChosen
-      ? p.whole.length > MAX_BODY
-        ? `${p.whole.slice(0, MAX_BODY)}\n${note} … the rest of this test is left out: it is too long to send …`
-        : p.whole
-      : extra.has(i)
-        ? p.gap
-        : null
-    if (piece !== null) out.push(piece)
-    else if (out[out.length - 1] !== LEFT_OUT) out.push(LEFT_OUT)
-  })
-  return out.join('\n\n')
-}
-
-// the verdicts in a grader reply; of one cut off before its closing ], each object that
-// arrived whole (isCut)
-const parseVerdicts = (text: string): { verdicts: { name: string; summary: string; verdict: Verdict; reason: string }[]; isCut: boolean } => {
-  const start = text.indexOf('[')
-  if (start < 0) return { verdicts: [], isCut: false }
-  const objects: unknown[] = []
-  let depth = 0
-  let from = -1
-  let inString = false
-  let isClosed = false
-  for (let i = start + 1; i < text.length && !isClosed; i++) {
-    const c = text[i]
-    if (inString) {
-      if (c === '\\') i++
-      else if (c === '"') inString = false
-    } else if (c === '"') inString = true
-    else if (c === '{') {
-      if (depth === 0) from = i
-      depth++
-    } else if (c === '}') {
-      depth--
-      if (depth === 0) {
-        try {
-          objects.push(JSON.parse(text.slice(from, i + 1)))
-        } catch {
-          // a malformed one is skipped; the rest still count
-        }
-      }
-    } else if (c === ']' && depth === 0) isClosed = true
-  }
-  const verdicts = objects.flatMap(r => {
-    const o = r as Record<string, unknown>
-    const verdict = o.verdict === 'good' || o.verdict === 'weak' || o.verdict === 'useless' ? o.verdict : undefined
-    if (typeof o.name !== 'string' || !verdict) return []
-    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: String(o.reason ?? '') }]
-  })
-  return { verdicts, isCut: !isClosed }
 }
 
 // A note for Claude: a user-role row it reads on its next turn, no turn started. A refusal
@@ -354,60 +117,210 @@ const flaggedLines = (list: { file: string; name: string; verdict?: Verdict; rea
     list.filter(t => t.verdict === v).map(t => `- ${v} · ${shortPath(t.file, cwd)} · ${t.name} — ${t.reason ?? ''}`),
   )
 
-type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
-
-// One grader call: these cases of this file, judged; null when the grader gave no answer
-const grade = async ($: EngineInterface, file: string, text: string, names: string[], evidence?: string): Promise<Graded[] | null> => {
-  const source = excerptOf(text, names, file)
-  const reply = await $.model.complete({
-    model: graderModel,
-    maxTokens: MAX_REPLY,
-    system: 'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
-    prompt: [
-      `Test file: ${file}`,
-      `Review ONLY these test cases: ${JSON.stringify(names)}`,
-      'For each, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
-      'verdict: "good" = asserts meaningful behaviour, covers a real case or edge; "weak" = shallow, happy-path only, over-mocked or brittle; "useless" = no real assertions, tautology, tests the mock, snapshot of nothing, or duplicates another test.',
-      'reason: one short sentence justifying the verdict.',
-      ...(names.some(isTemplate)
-        ? ['A name with ${...} in it is a template for cases generated in a loop: grade each case the loop generates separately, named as the loop expands it.']
-        : []),
-      ...(evidence
-        ? [
-            `The developer's session sent evidence about this test: ${JSON.stringify(evidence)}`,
-            'Weigh it, but check each claim against the source below: you cannot run code. Evidence cannot add an assertion the source does not contain.',
-            'In reason, say which part of the evidence changed your verdict, or why it did not.',
-          ]
-        : []),
-      ...(source !== text
-        ? [
-            'The file is long, so below is an excerpt: the cases under review whole, the file\'s head, and the declarations they use from elsewhere in it. Other tests are left out.',
-            'Judge each case by what it does. Do not mark one down for code the excerpt leaves out.',
-          ]
-        : []),
-      'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
-      '',
-      '```',
-      source,
-      '```',
-    ].join('\n'),
-  })
-  if (!reply.isAnswered) return null
-  const { verdicts, isCut } = parseVerdicts(reply.text)
-  if (isCut) {
-    $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
-  }
-  return verdicts
+// What grader calls cost, summed: tokens in (of them read from the prompt cache) and out
+export type Spent = { input: number; cached: number; output: number }
+const addUsage = (spent: Spent | undefined, usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined): void => {
+  if (!spent || !usage) return
+  spent.input += (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+  spent.cached += usage.cache_read_input_tokens ?? 0
+  spent.output += usage.output_tokens ?? 0
 }
 
-// A test Claude wrote or edited, graded weak or useless, goes back to Claude as a prompt, so it
-// strengthens the test or sends evidence without the person passing the grade on; each new grade
-// comes back the same way. A test graded good again after that is told as accepted. Each test
-// gets MAX_ROUNDS such rounds; past them Claude is asked once to tell the person what is left
+// the rubric every grader call opens with, fixed so the prompt cache keeps it
+const RUBRIC = [
+  'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
+  'For each test case you are asked about, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
+  'verdict: "good" = asserts meaningful behaviour, covers a real case or edge; "weak" = shallow, happy-path only, over-mocked or brittle; "useless" = no real assertions, tautology, tests the mock, snapshot of nothing, or duplicates another test.',
+  'reason: one short sentence justifying the verdict.',
+  'A name with ${...} in it is a template for cases generated in a loop: grade each case the loop generates separately, named as the loop expands it.',
+  'A name with › in it is the groups the test sits in (describe blocks, classes), then its own name; a name ending in (2) is the second test of that name. Answer with each name exactly as given.',
+  'When the code under test is shown, judge each assertion against what that code really does.',
+  'Return a JSON array: [{"name": string, "summary": string, "verdict": "good"|"weak"|"useless", "reason": string}]',
+].join('\n')
+
+// the project's own rules for its tests, from .test-grader.md at its root: read at a session's
+// start and each turn's end; the grader is told them after the rubric
+const RUBRIC_FILE = '.test-grader.md'
+const MAX_RULES = 4_000
+let projectRules = ''
+const readRules = async ($: EngineInterface): Promise<void> => {
+  const cwd = await $.session.cwd()
+  projectRules = cwd ? ((await $.fs.read(`${cwd}/${RUBRIC_FILE}`).catch(() => '')) ?? '').trim().slice(0, MAX_RULES) : ''
+}
+
+// an API error worth trying again: too many requests, overloaded, the server's own, or no answer
+const RETRIES = 3
+const isPassing = (r: { reason: string; status?: number | null; error?: string }): boolean =>
+  r.reason === 'api-error' && (r.status === null || r.status === 429 || r.status === 529 || (r.status ?? 0) >= 500 || r.error === 'rate_limit' || r.error === 'overloaded' || r.error === 'server_error')
+const sleep = ($: EngineInterface, ms: number): Promise<void> => new Promise(done => void $.clock.after(ms, () => done()))
+// how long one grader call may take
+const CALL_TIMEOUT = 120_000
+
+type GradeOptions = { evidence?: string; model?: string; signal?: AbortSignal; spent?: Spent }
+
+// The code a test file tests, as the grader reads it beside the test: the project files it
+// imports by a relative path (JS and TS, Python, Ruby), its package's other files (Go), or the
+// class it is named for (Kotlin, Java), each cut to its share of MAX_UNDER_TEST. Kept per file
+// as it last read, until the file changes
+const MAX_UNDER_TEST = 16_000
+const MAX_UNDER_TEST_FILES = 4
+const underTestCache = new Map<string, { hash: string; text: string }>()
+const codeUnderTest = async ($: EngineInterface, file: string, text: string): Promise<string> => {
+  const hash = fingerprint(text)
+  const kept = underTestCache.get(file)
+  if (kept?.hash === hash) return kept.text
+  const cwd = await $.session.cwd()
+  const paths = await candidatesFor($, file, text, cwd)
+  const found: { path: string; text: string }[] = []
+  for (const path of paths) {
+    if (found.length >= MAX_UNDER_TEST_FILES || found.some(f => f.path === path) || path === file || TEST_FILE.test(path)) continue
+    const body = await $.fs.read(path).catch(() => null)
+    if (body !== null && body.trim() !== '') found.push({ path, text: body })
+  }
+  const share = Math.floor(MAX_UNDER_TEST / Math.max(1, found.length))
+  const out =
+    found.length === 0
+      ? ''
+      : ['The code under test, as the test file reaches it:', ...found.map(f => [`--- ${shortPath(f.path, cwd)} ---`, '```', clamp(f.text, share), '```'].join('\n'))].join('\n')
+  underTestCache.set(file, { hash, text: out })
+  return out
+}
+
+// where a test file's code under test may be, most likely first; a path that is not there is
+// passed over when read
+const candidatesFor = async ($: EngineInterface, file: string, text: string, cwd: string): Promise<string[]> => {
+  const dir = file.slice(0, file.lastIndexOf('/'))
+  const join = (base: string, rel: string): string => {
+    const parts = `${base}/${rel}`.split('/')
+    const out: string[] = []
+    for (const part of parts) part === '..' ? out.pop() : part !== '.' && out.push(part)
+    return out.join('/')
+  }
+  const kind = kindOf(file)
+  if (kind === 'js') {
+    const specs = [...text.matchAll(/(?:\bfrom\s+|\brequire\(\s*|\bimport\(\s*|^import\s+)['"](\.{1,2}\/[^'"]+)['"]/gm)].map(m => m[1]!)
+    return specs.flatMap(spec => {
+      const base = join(dir, spec.replace(/\.[cm]?js$/, ''))
+      return [spec.match(/\.[cm]?[jt]sx?$/) ? join(dir, spec) : null, ...['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '/index.ts', '/index.js'].map(ext => base + ext)].filter((p): p is string => p !== null)
+    })
+  }
+  if (kind === 'py') {
+    return [...text.matchAll(/^\s*from\s+(\.*)([\w.]*)\s+import\b/gm)].flatMap(m => {
+      const rel = m[2]!.replace(/\./g, '/')
+      if (m[1]) {
+        const up = '../'.repeat(m[1].length - 1)
+        return rel ? [join(dir, `${up}${rel}.py`), join(dir, `${up}${rel}/__init__.py`)] : []
+      }
+      return rel ? [`${cwd}/${rel}.py`, `${cwd}/src/${rel}.py`, `${dir}/${rel}.py`] : []
+    })
+  }
+  if (kind === 'rb') return [...text.matchAll(/^\s*require_relative\s+['"]([^'"]+)['"]/gm)].map(m => join(dir, m[1]!.endsWith('.rb') ? m[1]! : `${m[1]}.rb`))
+  if (kind === 'go') {
+    const entries = await $.fs.list(dir).catch(() => [])
+    return entries.filter(e => e.kind === 'file' && e.name.endsWith('.go') && !e.name.endsWith('_test.go')).map(e => `${dir}/${e.name}`)
+  }
+  if (kind === 'jvm') {
+    const name = file.slice(file.lastIndexOf('/') + 1).replace(/(Tests?|Spec|IT)\.(kt|java)$/, '.$2')
+    const mainDir = dir.replace(/\/src\/test\//, '/src/main/')
+    return mainDir === dir ? [] : [`${mainDir}/${name}`]
+  }
+  return []
+}
+
+// One grader call: these cases of this file, judged; null when the grader gave no answer. An
+// API error that may pass is tried again, waiting longer each time; a stopped run is not
+const grade = async ($: EngineInterface, file: string, text: string, names: string[], { evidence, model, signal, spent }: GradeOptions = {}): Promise<Graded[] | null> => {
+  const source = excerptOf(text, names, file)
+  const underTest = await codeUnderTest($, file, text).catch(() => '')
+  const ask = [
+    ...(source !== text
+      ? [
+          "The file is long, so the source above is an excerpt: the cases under review whole, the file's head, and the declarations they use from elsewhere in it. Other tests are left out.",
+          'Judge each case by what it does. Do not mark one down for code the excerpt leaves out.',
+        ]
+      : []),
+    ...(evidence
+      ? [
+          `The developer's session sent evidence about this test: ${JSON.stringify(evidence)}`,
+          'Weigh it, but check each claim against the source above: you cannot run code. Evidence cannot add an assertion the source does not contain.',
+          'Evidence should name a concrete mutation (where, before, after), the command run, and the test\'s output before and after; evidence "measured by test-grader" was run by the tool itself, not claimed. Accept it only when the mutation changes behaviour the test\'s assertions in the source would detect; reject evidence that only reports the test passing, coverage, or claims about code not shown.',
+          'In reason, say which part of the evidence changed your verdict, or why it did not.',
+        ]
+      : []),
+    `Review ONLY these test cases: ${JSON.stringify(names)}`,
+  ].join('\n')
+  const request = {
+    model: model ?? graderModel,
+    maxTokens: MAX_REPLY,
+    // the plain grade asks for little thought; a second look, or evidence, the model's own
+    ...(model === undefined && !evidence ? { effort: 'low' as const } : {}),
+    timeoutMs: CALL_TIMEOUT,
+    system: [{ text: RUBRIC, cache: true as const }, ...(projectRules ? [{ text: `The project's own rules for its tests (${RUBRIC_FILE}):\n${projectRules}` }] : [])],
+    // the file first and marked, so the next batch of the same file reads it from the cache
+    prompt: [{ text: [`Test file: ${file}`, '```', source, '```', ...(underTest ? ['', underTest] : [])].join('\n'), cache: true as const }, { text: `\n${ask}` }],
+  }
+  for (let attempt = 0; ; attempt++) {
+    if (signal?.aborted) return null
+    const reply = await $.model.complete(request, signal ? { signal } : undefined)
+    addUsage(spent, reply.usage)
+    if (reply.isAnswered) {
+      const { verdicts, isCut } = parseVerdicts(reply.text)
+      if (isCut) {
+        $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
+      }
+      return verdicts
+    }
+    if (attempt >= RETRIES || !isPassing(reply as never)) {
+      $.ui.log(`test-grader: the grader gave no answer for ${file} (${reply.reason}${'status' in reply ? ` ${reply.status ?? ''} ${reply.error}` : ''})`, { to: 'debug' })
+      return null
+    }
+    // 2s, 4s, 8s, each with up to a second more, so parallel calls do not retry together
+    await sleep($, 2_000 * 2 ** attempt + Math.floor(Math.random() * 1_000))
+  }
+}
+
+// A test Claude wrote or edited, graded weak or useless, is told to Claude in a note, never a
+// prompt: the system prompt has told it to look up its tests' grades with test_grades once it is
+// done writing them, and follow up. A test graded good again after that is told as accepted.
+// Each test gets MAX_ROUNDS such rounds; past them the note says test-grader stops on it
 const MAX_ROUNDS = 3
 const roundKey = (file: string, name: string): string => `${file}::${name}`
-const ITERATE_NUDGE = `Respond to this now: strengthen each test above graded weak or useless, or, where one is better than rated, send your evidence with the test_evidence tool. Each new grade comes back to you, until the test is graded good or it has had ${MAX_ROUNDS} rounds.`
-const SPENT_NUDGE = 'Respond to this now: tell the person which tests are still weak or useless and why; test-grader has stopped asking about them.'
+const FOLLOW_UP = `Once you are done writing tests, strengthen each of these, or, where one is better than rated, send your evidence with the test_evidence tool. Each test gets ${MAX_ROUNDS} rounds.`
+const SPENT_FOLLOW_UP = 'Tell the person which of these are still weak or useless and why.'
+
+// told to Claude in the system prompt, ahead of any test it writes: how to write a test the
+// grader rates good, and how to follow up on the grades
+const GRADING_SECTION = [
+  '# Test grading (test-grader)',
+  'Every test you write or edit is graded in the background by a reviewer model: good, weak (shallow, happy-path only, over-mocked, brittle) or useless (no real assertion, a tautology, tests the mock, snapshot of nothing, duplicate of another test). Write tests that grade good:',
+  '- Assert on behaviour: the return value, the thrown error, the state or output the code produces. Never assert only that a mock was called, that a value is defined or truthy, or that a thing equals itself.',
+  '- Before you keep a test, ask which plausible bug in the code would make it fail. If none, rewrite it. If it would pass with the function body deleted, it is useless.',
+  '- One behaviour per test, named for the behaviour and the case ("rejects a negative amount"), not the function.',
+  '- Cover edges and errors, not only the happy path: empty, boundary, invalid input, failure paths. Prefer several small tests to one long one.',
+  "- Use real code where you can; mock only I/O, time and randomness, and assert on what the code did with the mock's answer, not on the mock.",
+  '- Make it deterministic: fixed clocks, seeds and data; no sleeps, no order dependence, no shared mutable state.',
+  '- No snapshots unless the snapshot is small and reviewed.',
+  'Grades arrive as notes; nothing waits on them. When you have finished writing or editing tests for the task, call test_grades with written: true. Strengthen each weak or useless test, the useless first.',
+  'Where one is better than rated, prove it: test_verify runs it, applies a mutation to the code under test, runs it again and puts the file back, and sends what it measured as evidence. Or send test_evidence: run the test unchanged (it must pass), apply the mutation, run again (it must fail), revert, and quote both results.',
+  `Each change is graded again; call test_grades again to see the new grades. Tests listed as being graded: wait a moment and ask again. After ${MAX_ROUNDS} rounds on one test, tell the person what is left instead.`,
+].join('\n')
+
+// A guide for each language, in the mod's guides folder (guides/js.md, guides/go.md, ...): the
+// section names only the ones for the languages the project's tests are written in, for Claude
+// to read before it writes tests
+const LANGUAGE_NAMES: Record<Kind, string> = {
+  js: 'JavaScript and TypeScript',
+  go: 'Go',
+  py: 'Python',
+  rb: 'Ruby',
+  swift: 'Swift',
+  jvm: 'Java and Kotlin',
+  cs: 'C#',
+  php: 'PHP',
+  rs: 'Rust',
+}
+const guideOf = (root: string, kind: Kind): string => `${root}/guides/${kind}.md`
+const LANGUAGE_ORDER: Kind[] = ['js', 'go', 'py', 'rb', 'swift', 'jvm', 'cs', 'php', 'rs']
 
 // the round a test is on now: one more for a weak or useless grade, none once it is good
 const countRound = async ($: EngineInterface, file: string, name: string, verdict: Verdict | undefined): Promise<{ round: number; wasRetried: boolean }> => {
@@ -418,8 +331,8 @@ const countRound = async ($: EngineInterface, file: string, name: string, verdic
   return { round, wasRetried: before > 0 }
 }
 
-// Grades wait in the outbox while grading is under way or a turn of Claude's runs, then go
-// as one prompt: several weak tests, or several files graded, are one round, not one prompt each.
+// Grades wait in the outbox while grading is under way, then go as one note: several weak
+// tests, or several files graded, are one round, not one note each.
 // A test graded again before then is listed once, at its latest grade
 type Report = { file: string; name: string; verdict?: Verdict; reason?: string }
 const reportGrades = async ($: EngineInterface, graded: Report[]): Promise<void> => {
@@ -428,10 +341,23 @@ const reportGrades = async ($: EngineInterface, graded: Report[]): Promise<void>
     // lists): its entry takes this grade's words and keeps its place
     const isSame = (o: Report): boolean => roundKey(o.file, o.name) === roundKey(t.file, t.name)
     const box = await read($, outbox)
-    if ([...box.accepted, ...box.going, ...box.spent].some(isSame)) {
-      const take = (list: Report[]) => list.map(o => (isSame(o) ? { ...o, reason: t.reason ?? o.reason } : o))
+    const waiting = [...box.accepted, ...box.going, ...box.spent].find(isSame)
+    const isFlagged = (v: Verdict | undefined): boolean => v === 'weak' || v === 'useless'
+    // the same kind of grade: its words and verdict replace the waiting one's, in its place
+    if (waiting && isFlagged(waiting.verdict ?? (box.accepted.includes(waiting) ? 'good' : undefined)) === isFlagged(t.verdict)) {
+      const take = (list: Report[]) => list.map(o => (isSame(o) ? { ...o, verdict: t.verdict ?? o.verdict, reason: t.reason ?? o.reason } : o))
       await update($, outbox, b => ({ accepted: take(b.accepted), going: take(b.going), spent: take(b.spent) }))
       continue
+    }
+    // another kind (a weak test now good): the waiting entry's round is undone, and the new
+    // grade counted in its stead
+    if (waiting && isFlagged(waiting.verdict)) {
+      const key = roundKey(t.file, t.name)
+      await update($, rounds, all => {
+        const left = (all[key] ?? 1) - 1
+        const { [key]: _, ...rest } = all
+        return left > 0 ? { ...rest, [key]: left } : rest
+      })
     }
     const { round, wasRetried } = await countRound($, t.file, t.name, t.verdict)
     const kind = round === 0 && wasRetried ? 'accepted' : round > 0 && round <= MAX_ROUNDS ? 'going' : round === MAX_ROUNDS + 1 ? 'spent' : null
@@ -445,11 +371,8 @@ const reportGrades = async ($: EngineInterface, graded: Report[]): Promise<void>
   await flush($)
 }
 
-// a turn of Claude's under way: its grades wait for its end
-let isTurnRunning = false
-
 const flush = async ($: EngineInterface): Promise<void> => {
-  if (working > 0 || isTurnRunning) return
+  if (working > 0) return
   const box = await read($, outbox)
   const { accepted, going, spent } = box
   if (accepted.length + going.length + spent.length === 0) return
@@ -457,11 +380,11 @@ const flush = async ($: EngineInterface): Promise<void> => {
   const cwd = await $.session.cwd()
   const lines = [
     ...(accepted.length > 0 ? ['Now graded good (test-grader):', ...accepted.map(t => `- good · ${shortPath(t.file, cwd)} · ${t.name}`)] : []),
-    ...(going.length > 0 ? ['Tests graded weak or useless (test-grader):', ...flaggedLines(going, cwd), EVIDENCE_HINT] : []),
-    ...(spent.length > 0 ? [`Still weak or useless after ${MAX_ROUNDS} rounds (test-grader stops asking about these):`, ...flaggedLines(spent, cwd)] : []),
+    ...(going.length > 0 ? ['Tests graded weak or useless (test-grader):', ...flaggedLines(going, cwd), FOLLOW_UP] : []),
+    ...(spent.length > 0 ? [`Still weak or useless after ${MAX_ROUNDS} rounds (test-grader stops on these):`, ...flaggedLines(spent, cwd), SPENT_FOLLOW_UP] : []),
   ]
-  // accepted alone needs nothing of Claude: added to the conversation, no turn started
-  await share($, lines.join('\n'), going.length > 0 ? ITERATE_NUDGE : spent.length > 0 ? SPENT_NUDGE : undefined)
+  // a note, added to the conversation: no turn is started for it
+  await share($, lines.join('\n'))
 }
 
 // Grading under way in this load of the module: a Grade all run, a regrade, a new test's
@@ -489,12 +412,14 @@ const soon = ($: EngineInterface, work: () => Promise<void>): void => {
   void $.clock.after(1, () => void work().catch(() => undefined).finally(() => finishWork($)))
 }
 
-const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => busy($, () => evaluateNow($, file, ids))
-const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>): Promise<void> => {
-  const fail = (): Promise<void> =>
-    update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' } : t)))
+// model: a second look, for a test graded again after a weak grade
+const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>, model?: string): Promise<void> => busy($, () => evaluateNow($, file, ids, model))
+const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>, model?: string): Promise<void> => {
+  const fail = async (): Promise<void> => {
+    await update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' as const } : t)))
+  }
   try {
-    const verdicts = await grade($, file, await $.fs.read(file), [...ids.values()])
+    const verdicts = await grade($, file, await $.fs.read(file), [...ids.values()], { model })
     if (verdicts === null) return fail()
     await update($, tests, list =>
       // a looped test becomes one entry per case it generates
@@ -535,6 +460,36 @@ const mtime = async ($: EngineInterface, path: string): Promise<number | null> =
   }
 }
 
+// Line coverage by folder, every folder holding the lines of all beneath it: by its path in
+// the project ('' the project itself)
+const byDirOf = (files: { file: string; total: number; covered: number }[], cwd: string): Record<string, { total: number; covered: number }> => {
+  const dirs: Record<string, { total: number; covered: number }> = {}
+  for (const f of files) {
+    if (f.total <= 0) continue
+    const rel = shortPath(f.file, cwd)
+    const parts = rel.split('/').slice(0, -1)
+    for (let i = 0; i <= parts.length; i++) {
+      const dir = parts.slice(0, i).join('/')
+      const d = (dirs[dir] ??= { total: 0, covered: 0 })
+      d.total += f.total
+      d.covered += f.covered
+    }
+  }
+  return dirs
+}
+
+// the least covered folders, a few lines each at least, lowest first: where more tests would pay
+const LEAST_COVERED = 5
+const MIN_LINES = 20
+const leastCovered = (cov: Coverage | null): string[] =>
+  Object.entries(cov?.byDir ?? {})
+    .filter(([dir, d]) => dir !== '' && d.total >= MIN_LINES)
+    .map(([dir, d]) => ({ dir, p: (d.covered / d.total) * 100 }))
+    .filter(d => d.p < 80)
+    .sort((a, b) => a.p - b.p)
+    .slice(0, LEAST_COVERED)
+    .map(d => `${d.dir}/ ${Math.round(d.p)}%`)
+
 const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
   const cwd = await $.session.cwd()
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
@@ -545,8 +500,13 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
   const at = await mtime($, summaryPath)
   if (at !== null) {
     try {
-      const total = (JSON.parse(await $.fs.read(summaryPath)) as { total: Record<string, { pct: unknown }> }).total
+      const report = JSON.parse(await $.fs.read(summaryPath)) as Record<string, Record<string, { pct?: unknown; total?: unknown; covered?: unknown }>>
+      const total = report.total!
+      const byFile = Object.entries(report)
+        .filter(([file]) => file !== 'total')
+        .map(([file, m]) => ({ file, total: Number(m.lines?.total ?? 0), covered: Number(m.lines?.covered ?? 0) }))
       return {
+        byDir: byDirOf(byFile, cwd),
         lines: pct(total.lines?.pct),
         statements: pct(total.statements?.pct),
         branches: pct(total.branches?.pct),
@@ -563,7 +523,14 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
     const text = await $.fs.read(lcovPath)
     const sum = (key: string): number => [...text.matchAll(new RegExp(`^${key}:(\\d+)`, 'gm'))].reduce((s, m) => s + Number(m[1]), 0)
     const ratio = (hit: string, found: string): number | null => (sum(found) > 0 ? pct((sum(hit) / sum(found)) * 100) : null)
+    // per file: each record from its SF: line to its end_of_record
+    const byFile = text.split('end_of_record').flatMap(record => {
+      const file = record.match(/^SF:(.+)$/m)?.[1]?.trim()
+      const count = (key: string): number => Number(record.match(new RegExp(`^${key}:(\\d+)`, 'm'))?.[1] ?? 0)
+      return file ? [{ file: file.startsWith('/') ? file : `${cwd}/${file}`, total: count('LF'), covered: count('LH') }] : []
+    })
     return {
+      byDir: byDirOf(byFile, cwd),
       lines: ratio('LH', 'LF'),
       statements: null,
       branches: ratio('BRH', 'BRF'),
@@ -625,8 +592,9 @@ const coverageNote = (command: CoverCommand, exitCode: number, output: string, c
         .join(' · ')
     : ''
   if (exitCode === 0) {
+    const least = leastCovered(cov)
     return figures
-      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).`
+      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).${least.length > 0 ? `\nLeast covered folders (lines): ${least.join(', ')}.` : ''}`
       : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
@@ -656,12 +624,12 @@ const runCoverage = async ($: EngineInterface): Promise<void> => {
 
 // what a finished Grade all tests run tells Claude: the counts, then every weak,
 // useless and unrated test (the good are counted, not listed)
-const existingNote = (results: ExistingTest[], cwd: string): string => {
+const existingNote = (results: ExistingTest[], cwd: string, scope?: string): string => {
   const count = (v: Verdict): number => results.filter(t => t.verdict === v).length
   const unrated = results.filter(t => !t.verdict)
   const counts = [`${results.length} graded`, `${count('good')} good`, `${count('weak')} weak`, `${count('useless')} useless`]
   if (unrated.length > 0) counts.push(`${unrated.length} unrated`)
-  const lines = [`Test grading (test-grader) finished: ${counts.join(' · ')}.`]
+  const lines = [`Test grading (test-grader) finished${scope ? ` for ${scope}` : ''}: ${counts.join(' · ')}.`]
   const flagged = flaggedLines(results, cwd)
   if (flagged.length > 0) lines.push('Weak or useless, worst first:', ...flagged, EVIDENCE_HINT)
   if (unrated.length > 0) lines.push('Unrated (the grader gave no verdict):', ...unrated.map(t => `- ${shortPath(t.file, cwd)} · ${t.name}`))
@@ -682,7 +650,37 @@ export const fingerprint = (text: string): string => {
 // with each graded file's fingerprint, so a later session lists them and Grade all tests
 // grades again only the files changed since. Listed-but-ungraded rows are not kept
 type SavedGrades = { results: ExistingTest[]; hashes: Record<string, string>; finishedAt?: number }
+// as kept: by file, each file's fingerprint and its tests as [name, verdict, summary, reason,
+// suite, evidence], verdicts as g, w, u (none: unrated); a file's path is written once
+type KeptTest = [string, string, string?, string?, string?, string?]
+type KeptGrades = { v: 2; files: Record<string, { hash?: string; tests: KeptTest[] }>; finishedAt?: number }
 const gradesKey = (cwd: string): string => `grades:${cwd}`
+const VERDICT_CODE: Record<Verdict, string> = { good: 'g', weak: 'w', useless: 'u' }
+const CODE_VERDICT: Record<string, Verdict> = { g: 'good', w: 'weak', u: 'useless' }
+
+// lean: the summaries left out, for a project whose grades are too many to keep whole
+const keep = (saved: SavedGrades, isLean: boolean): KeptGrades => {
+  const files: KeptGrades['files'] = {}
+  for (const [file, hash] of Object.entries(saved.hashes)) files[file] = { hash, tests: [] }
+  for (const t of saved.results) {
+    const row: KeptTest = [t.name, t.verdict ? VERDICT_CODE[t.verdict] : '', isLean ? '' : (t.summary ?? ''), t.reason ?? '', t.suite ?? '', t.evidence ?? '']
+    while (row.length > 2 && !row[row.length - 1]) row.pop()
+    ;(files[t.file] ??= { tests: [] }).tests.push(row)
+  }
+  return { v: 2, files, ...(saved.finishedAt === undefined ? {} : { finishedAt: saved.finishedAt }) }
+}
+const unkeep = (kept: KeptGrades | SavedGrades): SavedGrades => {
+  if (!('v' in kept)) return kept
+  const results: ExistingTest[] = []
+  const hashes: Record<string, string> = {}
+  for (const [file, { hash, tests }] of Object.entries(kept.files)) {
+    if (hash) hashes[file] = hash
+    for (const [name, code, summary, reason, suite, evidence] of tests) {
+      results.push({ file, name, ...(CODE_VERDICT[code] ? { verdict: CODE_VERDICT[code] } : {}), ...(summary ? { summary } : {}), ...(reason ? { reason } : {}), ...(suite ? { suite } : {}), ...(evidence ? { evidence } : {}) })
+    }
+  }
+  return { results, hashes, ...(kept.finishedAt === undefined ? {} : { finishedAt: kept.finishedAt }) }
+}
 
 const saveGrades = async ($: EngineInterface): Promise<void> => {
   const cwd = await $.session.cwd()
@@ -693,7 +691,22 @@ const saveGrades = async ($: EngineInterface): Promise<void> => {
     hashes: run.hashes ?? {},
     ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
   }
-  await $.store.set(gradesKey(cwd), saved).catch(error => $.ui.log(`test-grader: the grades could not be saved: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+  const why = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+  try {
+    await $.store.set(gradesKey(cwd), keep(saved, false))
+    await update($, saveError, () => null)
+  } catch (error) {
+    // too large whole: kept without the summaries; failing that, the pane says the grades
+    // will not outlive the session
+    try {
+      await $.store.set(gradesKey(cwd), keep(saved, true))
+      await update($, saveError, () => null)
+      $.ui.log(`test-grader: the grades were kept without their summaries: ${why(error)}`, { to: 'debug' })
+    } catch (lean) {
+      $.ui.log(`test-grader: the grades could not be saved: ${why(lean)}`, { to: 'debug' })
+      await update($, saveError, () => `The grades could not be saved, and will not outlive this session: ${why(lean)}`)
+    }
+  }
 }
 
 // at a session's start, one that has graded nothing yet takes the project's saved grades
@@ -702,69 +715,131 @@ const loadGrades = async ($: EngineInterface): Promise<void> => {
   if (run.hashes || run.results.some(t => !t.isUngraded)) return
   const cwd = await $.session.cwd()
   if (!cwd) return
-  const saved = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as SavedGrades | undefined
-  if (!saved || !Array.isArray(saved.results)) return
+  const kept = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as KeptGrades | SavedGrades | undefined
+  if (!kept || !('v' in kept ? kept.files : Array.isArray(kept.results))) return
+  const saved = unkeep(kept)
   await update($, existing, r => ({ ...r, results: saved.results, hashes: saved.hashes ?? {}, ...(saved.finishedAt === undefined ? {} : { finishedAt: saved.finishedAt }) }))
 }
 
-// isFresh: grade every file again, the remembered ones too
-const gradeAll = ($: EngineInterface, isFresh = false): Promise<void> => busy($, () => gradeAllNow($, isFresh))
-const gradeAllNow = async ($: EngineInterface, isFresh: boolean): Promise<void> => {
+// The project's test files, by their path in it: every one git tracks, and every new one it
+// would (untracked, not ignored); null outside a git repository
+const testFiles = async ($: EngineInterface, cwd: string): Promise<string[] | null> => {
+  const listed = await $.process.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], { cwd, timeoutMs: 60_000 })
+  if (listed.exitCode !== 0) return null
+  return [...new Set(listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f)))]
+}
+
+// A run under way can be stopped: its grader calls are cut and no more start. The files it had
+// not graded keep what they had, and the next run grades them
+let stopRun: AbortController | null = null
+const stopGrading = (): void => stopRun?.abort()
+
+// isFresh: grade every file again, the remembered ones too; only: these files alone (their
+// paths in the project), the rest of the project's results left as they are
+type RunOptions = { isFresh?: boolean; only?: string[] }
+const gradeAll = ($: EngineInterface, isFresh = false, only?: string[]): Promise<void> => busy($, () => gradeAllNow($, { isFresh, only }))
+const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOptions): Promise<void> => {
   const before = await read($, existing)
   if (before.state === 'running') return
   const cwd = await $.session.cwd()
-  const fail = (message: string) => update($, existing, () => ({ state: 'failed', done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
+  const fail = (message: string) => update($, existing, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
+  const stop = new AbortController()
+  stopRun = stop
   try {
-    const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
-    if (listed.exitCode !== 0) return void (await fail('Not a git repository: there is no list of test files to grade.'))
-    const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f))
-    await update($, existing, r => ({ ...r, state: 'running', done: 0, total: files.length, isFresh }))
+    const listed = only ?? (await testFiles($, cwd))
+    if (listed === null) return void (await fail('Not a git repository: there is no list of test files to grade.'))
+    const files = only ? listed.filter(f => TEST_FILE.test(f)) : listed
+    const inRun = new Set(files.map(rel => `${cwd}/${rel}`))
+    // a narrowed run leaves the other files' results be
+    const others = only ? before.results.filter(t => !inRun.has(t.file)) : []
+    await update($, existing, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}) }))
     const hashes: Record<string, string> = {}
+    const spent: Spent = { input: 0, cached: 0, output: 0 }
     // tests whose results stand from before
     let remembered = 0
     // every file's batches, in file order; a file is done when its last batch is. Until the
     // grader answers a batch, its tests are listed as they were, marked reviewing
-    type Slot = { items: ExistingTest[]; waiting: ExistingTest[]; isDone: boolean }
+    // was: the batch's rows as they stood before the run, for a stop to put back
+    type Slot = { items: ExistingTest[]; waiting: ExistingTest[]; was: ExistingTest[]; isDone: boolean }
+    type Entry = { file: string; left: number; slots: Slot[]; hash?: string }
     const jobs: { file: string; text: string; batch: string[]; slot: Slot }[] = []
-    const perFile: { left: number; slots: Slot[] }[] = []
-    const shown = (): ExistingTest[] => perFile.flatMap(f => f.slots.flatMap(s => (s.isDone ? s.items : s.waiting)))
+    const perFile: Entry[] = []
+    const shown = (): ExistingTest[] => [...others, ...perFile.flatMap(f => f.slots.flatMap(s => (s.isDone ? s.items : s.waiting)))]
     let done = 0
-    for (const rel of files) {
-      const file = `${cwd}/${rel}`
-      const text = await $.fs.read(file)
-      hashes[file] = fingerprint(text)
-      const names = [...new Set(caseNames(text, file))]
-      const entry = { left: 0, slots: [] as Slot[] }
-      // unchanged since its last grading, and every test rated: its results stand
-      const kept = before.results.filter(t => t.file === file)
-      if (!isFresh && before.hashes?.[file] === hashes[file] && kept.length > 0 && kept.every(t => t.verdict !== undefined)) {
-        entry.slots.push({ items: kept, waiting: kept, isDone: true })
-        perFile.push(entry)
-        remembered += kept.length
-        done += 1
-        continue
-      }
-      for (let at = 0; at < names.length; at += BATCH) {
-        const batch = names.slice(at, at + BATCH)
-        const waiting = batch.flatMap(name => {
-          const had = kept.filter(t => fits(name, t.name))
-          return (had.length > 0 ? had : [{ file, name }]).map(({ isUngraded: _, ...t }) => ({ ...t, isPending: true }))
-        })
-        const slot: Slot = { items: [], waiting, isDone: false }
-        entry.slots.push(slot)
-        entry.left += 1
-        jobs.push({ file, text, batch, slot })
-      }
-      perFile.push(entry)
-      if (entry.left === 0) done += 1
+    let skipped = 0
+    // the files are read while the first are graded: a worker waits for the reading when it
+    // has caught up with it
+    let isRead = false
+    let wake: (() => void) | null = null
+    const ready = (): void => {
+      wake?.()
+      wake = null
     }
-    await update($, existing, s => ({ ...s, done, results: shown() }))
-    const owner = new Map(perFile.flatMap(f => f.slots.map(slot => [slot, f] as const)))
+    const owner = new Map<Slot, Entry>()
+    const reading = (async () => {
+      for (const rel of files) {
+        if (stop.signal.aborted) break
+        const file = `${cwd}/${rel}`
+        // a file git lists but that cannot be read (deleted, too large) is passed over
+        const text = await $.fs.read(file).catch(() => null)
+        if (text === null) {
+          skipped += 1
+          done += 1
+          continue
+        }
+        const hash = fingerprint(text)
+        const names = [...new Set(caseNames(text, file))]
+        const entry: Entry = { file, left: 0, slots: [], hash }
+        // unchanged since its last grading, and every test rated: its results stand
+        const kept = before.results.filter(t => t.file === file)
+        if (!isFresh && before.hashes?.[file] === hash && kept.length > 0 && kept.every(t => t.verdict !== undefined)) {
+          entry.slots.push({ items: kept, waiting: kept, was: kept, isDone: true })
+          perFile.push(entry)
+          hashes[file] = hash
+          remembered += kept.length
+          done += 1
+          continue
+        }
+        for (let at = 0; at < names.length; at += BATCH) {
+          const batch = names.slice(at, at + BATCH)
+          const was = batch.flatMap(name => {
+            const had = kept.filter(t => fits(name, t.name))
+            return had.length > 0 ? had : [{ file, name, isUngraded: true }]
+          })
+          const waiting = was.map(({ isUngraded: _, ...t }) => ({ ...t, isPending: true }))
+          const slot: Slot = { items: [], waiting, was, isDone: false }
+          entry.slots.push(slot)
+          owner.set(slot, entry)
+          entry.left += 1
+          jobs.push({ file, text, batch, slot })
+        }
+        perFile.push(entry)
+        if (entry.left === 0) {
+          hashes[file] = hash
+          done += 1
+        }
+        ready()
+      }
+      isRead = true
+      ready()
+      await update($, existing, r => ({ ...r, done, results: shown() }))
+    })()
     let next = 0
     const worker = async (): Promise<void> => {
-      while (next < jobs.length) {
+      for (;;) {
+        if (stop.signal.aborted) return
+        if (next >= jobs.length) {
+          if (isRead) return
+          await new Promise<void>(r => {
+            const before = wake
+            wake = () => (before?.(), r())
+          })
+          continue
+        }
         const { file, text, batch, slot } = jobs[next++]!
-        const verdicts = (await grade($, file, text, batch).catch(() => null)) ?? []
+        const verdicts = (await grade($, file, text, batch, { signal: stop.signal, spent }).catch(() => null)) ?? []
+        // cut by a stop: the batch keeps what it had
+        if (stop.signal.aborted) return
         const suites = suitesOf(text, file)
         for (const name of batch) {
           const suite = suites.has(name) ? { suite: suites.get(name) } : {}
@@ -775,20 +850,44 @@ const gradeAllNow = async ($: EngineInterface, isFresh: boolean): Promise<void> 
         slot.isDone = true
         const entry = owner.get(slot)!
         entry.left -= 1
-        if (entry.left === 0) done += 1
-        await update($, existing, s => ({ ...s, done, results: shown() }))
+        if (entry.left === 0) {
+          hashes[entry.file] = entry.hash!
+          done += 1
+        }
+        await update($, existing, r => ({ ...r, done, results: shown() }))
       }
     }
-    await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker))
+    await Promise.all([reading, ...Array.from({ length: parallel }, worker)])
+    const isStopped = stop.signal.aborted
+    // stopped: a batch not graded lists its tests as they were, not reviewing
+    for (const f of perFile) for (const slot of f.slots) if (!slot.isDone) slot.waiting = slot.was
     const results = shown()
     const finishedAt = await $.clock.now()
-    const graded = results.length - remembered
-    await update($, existing, () => ({ state: 'idle', done: files.length, total: files.length, results, finishedAt, hashes, graded, remembered }))
+    const graded = perFile.flatMap(f => f.slots.filter(s => s.isDone && s.items !== s.was).flatMap(s => s.items)).length
+    // a file not graded keeps its last fingerprint, so the next run grades it
+    const kept = Object.fromEntries(Object.entries(before.hashes ?? {}).filter(([f]) => !inRun.has(f) || hashes[f] === undefined))
+    const allHashes = only || isStopped ? { ...kept, ...hashes } : hashes
+    await update($, existing, (): ExistingRun => ({
+      state: 'idle' as const,
+      done,
+      total: files.length,
+      results,
+      finishedAt,
+      hashes: allHashes,
+      graded,
+      remembered,
+      spent,
+      ...(isStopped ? { message: `Stopped: ${done} of ${files.length} files graded.` } : skipped > 0 ? { message: skipped === 1 ? '1 file could not be read, and was passed over.' : `${skipped} files could not be read, and were passed over.` } : {}),
+    }))
     await saveGrades($)
     await update($, seen, all => ({ ...all, ...hashes }))
-    await share($, existingNote(results, cwd), results.some(t => t.verdict !== 'good') ? GRADE_NUDGE : GRADE_CLEAN_NUDGE)
+    if (isStopped) return
+    const told = results.filter(t => inRun.has(t.file))
+    await share($, existingNote(told, cwd, only ? 'the files changed on this branch' : undefined), told.some(t => t.verdict !== 'good') ? GRADE_NUDGE : GRADE_CLEAN_NUDGE)
   } catch (err) {
     await fail(err instanceof Error ? err.message : String(err))
+  } finally {
+    if (stopRun === stop) stopRun = null
   }
 }
 
@@ -805,9 +904,6 @@ const track = async ($: EngineInterface, file: string, names: string[]): Promise
   soon($, () => evaluate($, file, ids))
 }
 
-// whether a name the lists hold is still among a file's cases: itself, or a case of a loop
-const among = (names: string[], name: string): boolean => names.some(n => fits(n, name))
-
 // After the session writes a test file: entries for cases no longer in it leave both lists,
 // and the weak, useless and unrated ones the change touched are graded again
 const refresh = async ($: EngineInterface, file: string, touched: string[]): Promise<void> => {
@@ -818,8 +914,10 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
     return
   }
   const present = caseNames(text, file)
-  const isRedo = (t: { file: string; name: string; verdict?: Verdict }): boolean =>
-    t.file === file && t.verdict !== 'good' && among(touched, t.name)
+  // every test the change touched is graded again: a good grade may not hold for its new text
+  const isRedo = (t: { file: string; name: string; verdict?: Verdict }): boolean => t.file === file && among(touched, t.name)
+  const known = new Set([...(await read($, existing)).results, ...(await read($, tests))].filter(t => t.file === file && among(touched, t.name) && among(present, t.name)).map(t => `${t.file}:${t.name}`))
+  if (known.size > 0) await update($, modified, all => [...new Set([...all, ...known])].slice(-MAX_TESTS))
 
   const now = await read($, tests)
   const redoNew = new Map(now.filter(t => isRedo(t) && t.status !== 'pending' && among(present, t.name)).map(t => [t.id, t.name]))
@@ -828,11 +926,13 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
       .filter(t => t.file !== file || t.status === 'pending' || among(present, t.name))
       .map(t => (redoNew.has(t.id) ? { ...t, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
   )
-  if (redoNew.size > 0) soon($, () => evaluate($, file, redoNew))
+  if (redoNew.size > 0) soon($, () => evaluate($, file, redoNew, escalateModel ?? undefined))
 
   const run = await read($, existing)
   const kept = run.results.filter(t => t.file !== file || among(present, t.name))
-  const redo = kept.filter(t => isRedo(t) && !t.isPending).map(t => t.name)
+  // a test the session's own list grades again is not graded twice: its newer grade wins the row
+  const redoing = new Set(redoNew.values())
+  const redo = kept.filter(t => isRedo(t) && !t.isPending && !redoing.has(t.name)).map(t => t.name)
   if (kept.length === run.results.length && redo.length === 0) return
   const pick = (t: ExistingTest): boolean => t.file === file && redo.includes(t.name)
   await update($, existing, r => ({
@@ -847,7 +947,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
 const regradeRows = ($: EngineInterface, file: string, text: string, names: string[]): Promise<void> =>
   busy($, async () => {
     const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
-    const verdicts = await grade($, file, text, names).catch(() => null)
+    const verdicts = await grade($, file, text, names, { model: escalateModel ?? undefined }).catch(() => null)
     await reportGrades($, names.flatMap(name => {
       const v = verdicts?.find(x => x.name === name)
       return v ? [{ file, name, verdict: v.verdict, reason: v.reason }] : []
@@ -870,8 +970,8 @@ const resume = async ($: EngineInterface): Promise<void> => {
   if (working > 0) return
   const run = await read($, existing)
   if (run.state === 'running') {
-    await update($, existing, ({ isFresh: _, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
-    soon($, () => gradeAll($, run.isFresh === true))
+    await update($, existing, ({ isFresh: _, only: _o, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
+    soon($, () => gradeAll($, run.isFresh === true, run.only))
   } else {
     const byFile = new Map<string, string[]>()
     for (const t of run.results) if (t.isPending) byFile.set(t.file, [...(byFile.get(t.file) ?? []), t.name])
@@ -893,14 +993,20 @@ const resume = async ($: EngineInterface): Promise<void> => {
 // checkout rather than Claude's Write or Edit, is taken as if Claude had written it whole: its
 // gone tests leave, its weak, useless and unrated ones are graded again, and new ones are added.
 // Last seen: as Write, Edit or Grade all left it, else as its last grading fingerprinted it
+// each file's modification time as catchUp last read it, in this load of the module
+const readAt = new Map<string, number>()
 const catchUp = async ($: EngineInterface): Promise<void> => {
   const cwd = await $.session.cwd()
   const run = await read($, existing)
   const files = [...new Set([...(await read($, tests)).map(t => t.file), ...run.results.map(t => t.file)])].filter(f => cwd !== '' && f.startsWith(`${cwd}/`))
   const last = await read($, seen)
   for (const file of files) {
+    // a file not modified since last read is passed over unread
+    const at = await mtime($, file)
+    if (at !== null && readAt.get(file) === at && last[file] !== undefined) continue
     const text = await $.fs.read(file).catch(() => null)
     if (text === null) continue
+    if (at !== null) readAt.set(file, at)
     const now = fingerprint(text)
     const before = last[file] ?? run.hashes?.[file]
     if (before === now) continue
@@ -930,9 +1036,9 @@ const prune = async ($: EngineInterface): Promise<void> => {
 // tracks, with its result from before when it has one, ungraded otherwise. No grader call
 const listAll = async ($: EngineInterface): Promise<void> => {
   const cwd = await $.session.cwd()
-  const listed = await $.process.run(['git', 'ls-files'], { cwd, timeoutMs: 60_000 })
-  if (listed.exitCode !== 0) return
-  const files = listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f)).map(rel => `${cwd}/${rel}`)
+  const listed = await testFiles($, cwd)
+  if (listed === null) return
+  const files = listed.map(rel => `${cwd}/${rel}`)
   const run = await read($, existing)
   const cases: ExistingTest[] = []
   const hashes: Record<string, string> = {}
@@ -951,12 +1057,6 @@ const listAll = async ($: EngineInterface): Promise<void> => {
   // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
   // fingerprint, so a change made between sessions is still caught at a turn's end
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
-}
-
-// the line a case opens on: its own it( or test(, a looped case's the loop's; else the top
-const caseLine = (text: string, name: string, file: string): number => {
-  const found = casesIn(text, file).find(c => fits(c.name, name))
-  return found ? text.slice(0, found.opens).split('\n').length : 1
 }
 
 // an editor as the system names it: its program, and on macOS the app it is inside
@@ -1080,7 +1180,7 @@ const openInEditor = async ($: EngineInterface, file: string, name: string): Pro
   for (const argv of await openers($, file, line)) {
     try {
       const done = await $.process.run(argv, { timeoutMs: 30_000 })
-      if (done.exitCode === 0) return update($, openError, () => null)
+      if (done.exitCode === 0) return void (await update($, openError, () => null))
       why = done.stderr.trim() || `exit ${done.exitCode}`
     } catch (err) {
       why = err instanceof Error ? err.message : String(err)
@@ -1090,14 +1190,39 @@ const openInEditor = async ($: EngineInterface, file: string, name: string): Pro
   await update($, openError, () => `Couldn't open ${shortPath(file, cwd)} in an editor: ${why}`)
 }
 
+// One list: the last Grade all tests run and the tests written this session, a test in
+// both once, with the newer verdict; one written this session is marked new
+type State = Verdict | 'unrated' | 'reviewing' | 'ungraded'
+// isModified: a test that was there before, edited this session (a new one is new, not modified)
+type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean; isModified?: boolean; suite?: string; evidence?: string }
+const entriesOf = (graded: ExistingRun, list: TrackedTest[], edited: string[] = []): Entry[] => {
+  const merged = new Map<string, Entry>()
+  for (const t of graded.results) {
+    const state: State = t.isPending ? 'reviewing' : t.isUngraded ? 'ungraded' : (t.verdict ?? 'unrated')
+    merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false, suite: t.suite, evidence: t.evidence })
+  }
+  for (const t of list) {
+    const key = `${t.file}:${t.name}`
+    const prev = merged.get(key)
+    const state: State = t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated')
+    const isNewer = !prev || graded.finishedAt === undefined || t.at >= graded.finishedAt
+    merged.set(key, isNewer ? { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: true, suite: t.suite ?? prev?.suite, evidence: t.evidence ?? prev?.evidence } : { ...prev, isNew: true })
+  }
+  for (const key of edited) {
+    const t = merged.get(key)
+    if (t && !t.isNew) merged.set(key, { ...t, isModified: true })
+  }
+  return [...merged.values()]
+}
+
 // the session's tool for evidence that a test is better (or worse) than its verdict
 const EVIDENCE_TOOL = 'test_evidence'
 const EVIDENCE_MAX = 4_000
 const EVIDENCE_HINT =
   'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.'
 const EVIDENCE_DESCRIPTION =
-  'Send evidence to test-grader that a test deserves a different verdict than it got (good, weak, useless), e.g. a mutation of the code that makes this test fail. ' +
-  'The grader weighs it against the test source and answers with the new verdict and why. It cannot run code: state what you ran and what happened.'
+  'Ask test-grader to regrade one test on evidence that it deserves a different verdict. The grader cannot run code, so give it facts it can check against the source: the exact mutation you made (file, line, before and after), the command you ran, and the test\'s output before and after. ' +
+  'Strong evidence: a mutation that changes behaviour and makes only this test fail. Weak evidence: that the test passes, that it has coverage, or that other tests cover the same code. Send one test per call; test_verify measures a mutation for you.'
 const EVIDENCE_SCHEMA = {
   type: 'object',
   properties: {
@@ -1111,8 +1236,7 @@ const EVIDENCE_SCHEMA = {
 // The test regraded with the session's evidence; its verdict replaces the one in both lists
 const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?: unknown; evidence?: unknown }): Promise<string> => {
   const cwd = await $.session.cwd()
-  const given = String(input.file ?? '')
-  const file = given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
+  const file = inProject(cwd, String(input.file ?? ''))
   const name = String(input.test ?? '')
   const evidence = String(input.evidence ?? '').trim().slice(0, EVIDENCE_MAX)
   if (!evidence) return 'No evidence was given. Nothing was regraded.'
@@ -1120,8 +1244,15 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was regraded.`
   const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was regraded.`
+  return regradeOnEvidence($, file, text, name, caseName, evidence)
+}
+
+// a path the session gave: absolute, or in the project
+const inProject = (cwd: string, given: string): string => (given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`)
+
+const regradeOnEvidence = async ($: EngineInterface, file: string, text: string, name: string, caseName: string, evidence: string): Promise<string> => {
   const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
-  const verdicts = await grade($, file, text, [caseName], evidence).catch(() => null)
+  const verdicts = await grade($, file, text, [caseName], { evidence, model: escalateModel ?? undefined }).catch(() => null)
   const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
   if (!v) return 'The grader gave no verdict. Nothing was regraded; send it again.'
   const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence }
@@ -1140,26 +1271,318 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   return `${v.verdict === before ? 'Still' : 'Now'} ${v.verdict}: ${v.reason}${left}`
 }
 
+// What the project runs its tests with, found at its root as a session starts
+let runners: Runners = {}
+const detectRunners = async ($: EngineInterface, cwd: string): Promise<Runners> => {
+  const has = async (name: string): Promise<boolean> => (await mtime($, `${cwd}/${name}`)) !== null
+  const pkg = (await has('package.json')) ? await $.fs.read(`${cwd}/package.json`).catch(() => '') : ''
+  const composer = (await has('composer.json')) ? await $.fs.read(`${cwd}/composer.json`).catch(() => '') : ''
+  return {
+    ...(/"vitest"/.test(pkg) ? { js: 'vitest' as const } : /"jest"/.test(pkg) ? { js: 'jest' as const } : /"@playwright\/test"/.test(pkg) ? { js: 'playwright' as const } : {}),
+    ...((await has('build.gradle')) || (await has('build.gradle.kts')) ? { jvm: 'gradle' as const } : (await has('pom.xml')) ? { jvm: 'maven' as const } : {}),
+    ...((await has('Gemfile')) ? { isBundled: true } : {}),
+    ...(/"pestphp\/pest"/.test(composer) ? { isPest: true } : {}),
+  }
+}
+
+// a test as its runner names it, found in its file as it is now
+const targetOf = (cwd: string, file: string, text: string, name: string): RunTarget | null => {
+  const found = casesIn(text, file).find(c => fits(c.name, name))
+  if (!found) return null
+  const suite = suitesOf(text, file).get(found.plain)
+  return { rel: shortPath(file, cwd), kind: kindOf(file), plain: found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}) }
+}
+
+// One test run by the project's runner: whether it passed, and the end of what it printed
+const RUN_TAIL = 12
+const RUN_TIMEOUT = 300_000
+type Ran = { isPassed: boolean; command: string; tail: string }
+const runOne = async ($: EngineInterface, file: string, name: string): Promise<Ran | string> => {
+  const cwd = await $.session.cwd()
+  const text = await $.fs.read(file).catch(() => null)
+  if (text === null) return `There is no file ${shortPath(file, cwd)}.`
+  const target = targetOf(cwd, file, text, name)
+  if (!target) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
+  const argv = runArgv(target, runners)
+  if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
+  const result = await $.process.run(argv, { cwd, timeoutMs: RUN_TIMEOUT })
+  return { isPassed: result.exitCode === 0, command: shown(argv), tail: tailOf([result.stdout, result.stderr].join('\n'), RUN_TAIL) }
+}
+
+// a test run from the pane: its row shows it running, then passed or failed with the end of
+// what it printed
+const runFromPane = async ($: EngineInterface, file: string, name: string): Promise<void> => {
+  const key = `${file}:${name}`
+  await update($, testRuns, all => ({ ...all, [key]: { state: 'running' as const } }))
+  const ran = await runOne($, file, name).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+  await update($, testRuns, all => ({
+    ...all,
+    [key]: typeof ran === 'string' ? { state: 'failed' as const, tail: ran } : { state: ran.isPassed ? ('passed' as const) : ('failed' as const), command: ran.command, tail: ran.tail },
+  }))
+}
+
+// The session's tool for evidence test-grader measures itself: the test is run as it is (it
+// must pass), then with one change made to the code under test (it should fail), and the file
+// put back. What was run and what came of it goes to the grader as evidence. It changes files
+// and runs commands, so the person is asked before it runs
+const VERIFY_TOOL = 'test_verify'
+const VERIFY_DESCRIPTION =
+  'Have test-grader measure whether a test catches a bug: it runs the test unchanged (it must pass), applies your mutation to the code under test (replace one exact piece of text in one file), runs the test again (it should fail), and puts the file back. ' +
+  'What it measured is sent to the grader as evidence, and the test regraded. Use it for a test you believe is better than its grade: pick a mutation that breaks the behaviour the test asserts.'
+const VERIFY_SCHEMA = {
+  type: 'object',
+  properties: {
+    file: { type: 'string', description: 'The test file, absolute or relative to the project' },
+    test: { type: 'string', description: 'The test name, as test_grades lists it' },
+    mutate: { type: 'string', description: 'The file of code under test to change for the second run (not a test file)' },
+    find: { type: 'string', description: 'Exact text in that file, found exactly once, to replace' },
+    replace: { type: 'string', description: 'What to put in its place: a plausible bug' },
+  },
+  required: ['file', 'test', 'mutate', 'find', 'replace'],
+}
+
+const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: unknown; mutate?: unknown; find?: unknown; replace?: unknown }): Promise<string> => {
+  const cwd = await $.session.cwd()
+  const file = inProject(cwd, String(input.file ?? ''))
+  const name = String(input.test ?? '')
+  const target = inProject(cwd, String(input.mutate ?? ''))
+  const find = String(input.find ?? '')
+  const replace = String(input.replace ?? '')
+  if (TEST_FILE.test(target)) return `${shortPath(target, cwd)} is a test file: mutate the code under test. Nothing was run.`
+  if (find === '' || find === replace) return 'The mutation changes nothing: give the text to find and a different text to replace it with. Nothing was run.'
+  const text = await $.fs.read(file).catch(() => null)
+  if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was run.`
+  const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
+  if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was run.`
+  const original = await $.fs.read(target).catch(() => null)
+  if (original === null) return `There is no file ${shortPath(target, cwd)} to mutate. Nothing was run.`
+  const count = original.split(find).length - 1
+  if (count !== 1) return `The text to find is in ${shortPath(target, cwd)} ${count} times, not once: give a piece found exactly once. Nothing was run.`
+
+  const clean = await runOne($, file, name)
+  if (typeof clean === 'string') return `${clean} Nothing was run.`
+  if (!clean.isPassed) return `The test fails unchanged, so a mutation shows nothing. ${clean.command} printed:\n${clean.tail}`
+  let mutated: Ran | string
+  try {
+    await $.fs.write(target, original.replace(find, replace))
+    mutated = await runOne($, file, name).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+  } finally {
+    await $.fs.write(target, original)
+  }
+  if ((await $.fs.read(target).catch(() => null)) !== original) return `test-grader could not put ${shortPath(target, cwd)} back as it was: check it now.`
+  if (typeof mutated === 'string') return `The run with the mutation failed to start: ${mutated}. The file is back as it was; nothing was regraded.`
+  if (mutated.isPassed) {
+    return `The test still passes with ${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}: it does not catch that change. The file is back as it was; nothing was regraded.`
+  }
+  const evidence = clamp(
+    [
+      `Measured by test-grader, not claimed: ${clean.command} passed with the code unchanged.`,
+      `With ${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}, the same command failed. The end of its output:`,
+      mutated.tail,
+    ].join('\n'),
+    EVIDENCE_MAX,
+  )
+  return `Measured: the test passes unchanged and fails with the mutation. ${await regradeOnEvidence($, file, text, name, caseName, evidence)}`
+}
+
+// the session's tool for the grades as they stand: the weak and useless tests by default,
+// worst first, each at its line, so Claude can find them without the pane
+const GRADES_TOOL = 'test_grades'
+const GRADES_LIMIT = 50
+const LISTED: readonly State[] = ['useless', 'weak', 'unrated', 'reviewing', 'ungraded', 'good']
+const GRADES_DESCRIPTION =
+  'List the tests test-grader has graded, with each verdict (good, weak, useless), what the test checks and why. By default only the weak and useless ones, worst first, each with its file and line. ' +
+  'Call it with written: true once you have finished writing or editing tests, and again after each fix. Fix the useless ones first: a useless test usually needs a different assertion, a weak one a harder case. Use path to narrow to a file or folder.'
+const GRADES_SCHEMA = {
+  type: 'object',
+  properties: {
+    verdicts: {
+      type: 'array',
+      items: { type: 'string', enum: [...LISTED] },
+      description: 'Which tests to list, by state; default ["useless", "weak"]. unrated: the grader gave no verdict; reviewing: being graded; ungraded: never graded',
+    },
+    path: { type: 'string', description: 'Only tests in this file or folder, absolute or relative to the project' },
+    written: { type: 'boolean', description: 'Only the tests written or edited this session' },
+    limit: { type: 'number', description: `How many tests to list at most; default ${GRADES_LIMIT}` },
+  },
+}
+
+const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown }): Promise<string> => {
+  const cwd = await $.session.cwd()
+  const asked = Array.isArray(input.verdicts) ? input.verdicts.filter((v): v is State => (LISTED as readonly unknown[]).includes(v)) : []
+  const wanted = new Set<State>(asked.length > 0 ? asked : ['useless', 'weak'])
+  const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '') : ''
+  const scope = given === '' || given === '.' ? '' : given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
+  const limit = typeof input.limit === 'number' && input.limit >= 1 ? Math.floor(input.limit) : GRADES_LIMIT
+  const isWritten = input.written === true
+  const inScope = entriesOf(await read($, existing), await read($, tests), await read($, modified)).filter(
+    t => (scope === '' || t.file === scope || t.file.startsWith(`${scope}/`)) && (!isWritten || t.isNew || t.isModified === true),
+  )
+  const where = (isWritten ? ' written or edited this session' : '') + (scope === '' ? '' : ` in ${shortPath(scope, cwd)}`)
+  if (inScope.length === 0) return `test-grader lists no tests${where}.`
+  const count = (s: State): number => inScope.filter(t => t.state === s).length
+  const head =
+    `${inScope.length} tests${where}: ${count('good')} good, ${count('weak')} weak, ${count('useless')} useless` +
+    [['unrated', 'with no verdict'], ['reviewing', 'being graded'], ['ungraded', 'never graded']]
+      .map(([s, label]) => (count(s as State) > 0 ? `, ${count(s as State)} ${label}` : ''))
+      .join('') +
+    '.'
+  const chosen = inScope.filter(t => wanted.has(t.state)).sort((a, b) => LISTED.indexOf(a.state) - LISTED.indexOf(b.state) || a.file.localeCompare(b.file))
+  const names = [...wanted].sort((a, b) => LISTED.indexOf(a) - LISTED.indexOf(b)).join(' or ')
+  const waiting = count('reviewing') > 0 ? `\n${count('reviewing')} still being graded: ask again in a moment for their grades.` : ''
+  if (chosen.length === 0) {
+    const hint = count('ungraded') > 0 ? ' Grade all tests in the Tests pane grades the ones never graded.' : ''
+    return `${head}\nNone is ${names}.${hint}${waiting}`
+  }
+  const shown = chosen.slice(0, limit)
+  const texts = new Map<string, string | null>()
+  const counted = await read($, rounds)
+  const lines: string[] = []
+  for (const t of shown) {
+    if (!texts.has(t.file)) texts.set(t.file, await $.fs.read(t.file).catch(() => null))
+    const text = texts.get(t.file)
+    const at = text ? `:${caseLine(text, t.name, t.file)}` : ''
+    const round = counted[roundKey(t.file, t.name)]
+    lines.push(
+      `- ${shortPath(t.file, cwd)}${at} ${JSON.stringify(t.name)}: ${t.state}` +
+        (round ? (round > MAX_ROUNDS ? ` (${MAX_ROUNDS} rounds spent: test-grader has stopped on it)` : ` (round ${round} of ${MAX_ROUNDS})`) : '') +
+        (t.summary ? `\n  Checks: ${t.summary}` : '') +
+        (t.reason ? `\n  Why: ${t.reason}` : '') +
+        (t.evidence ? '\n  Graded on evidence.' : ''),
+    )
+  }
+  const more = chosen.length > shown.length ? `\n${chosen.length - shown.length} more not listed; raise limit or narrow path to see them.` : ''
+  const act = shown.some(t => t.state === 'weak' || t.state === 'useless') ? `\n${EVIDENCE_HINT}` : ''
+  return `${head}\n${names[0]!.toUpperCase()}${names.slice(1)}, worst first:\n${lines.join('\n')}${more}${act}${waiting}`
+}
+
+// The test files this branch changed: against where it left main (or master, or the remote's
+// default), with the changes not committed yet and new files; null outside a git repository
+const branchFiles = async ($: EngineInterface, cwd: string): Promise<{ base: string; files: string[] } | string> => {
+  const git = (argv: string[]) => $.process.run(['git', ...argv], { cwd, timeoutMs: 60_000 })
+  let base: string | null = null
+  for (const ref of ['origin/HEAD', 'main', 'master', 'origin/main', 'origin/master']) {
+    const found = await git(['merge-base', 'HEAD', ref])
+    if (found.exitCode === 0 && found.stdout.trim()) {
+      base = ref
+      break
+    }
+  }
+  if (base === null) return 'No main or master branch to compare with: /test-grader diff grades the test files changed since this branch left it.'
+  const changed = await git(['diff', '--name-only', '--diff-filter=d', `${base}...`])
+  const working = await git(['diff', '--name-only', '--diff-filter=d', 'HEAD'])
+  const added = await git(['ls-files', '--others', '--exclude-standard'])
+  if (changed.exitCode !== 0) return `git could not list the changes against ${base}: ${changed.stderr.trim()}`
+  const files = [...new Set([changed, working, added].flatMap(r => (r.exitCode === 0 ? r.stdout.split('\n') : [])))].filter(f => f !== '' && TEST_FILE.test(f))
+  return { base, files }
+}
+
+const gradeBranch = async ($: EngineInterface): Promise<string> => {
+  if ((await read($, existing)).state === 'running') return 'Grading is already under way.'
+  const found = await branchFiles($, await $.session.cwd())
+  if (typeof found === 'string') return found
+  if (found.files.length === 0) return `No test files changed against ${found.base}.`
+  soon($, () => gradeAll($, true, found.files))
+  return `Grading the ${found.files.length} test ${found.files.length === 1 ? 'file' : 'files'} changed against ${found.base}.`
+}
+
+// The grades written out, for a review or CI: a Markdown page and its JSON, at the project's root
+const REPORT = 'test-grader-report'
+const writeReport = async ($: EngineInterface): Promise<string> => {
+  const cwd = await $.session.cwd()
+  if (!cwd) return 'No project folder to write the report to.'
+  const entries = entriesOf(await read($, existing), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
+  if (entries.length === 0) return 'No tests to report: Grade all tests grades the project first.'
+  const texts = new Map<string, string | null>()
+  const rows: { file: string; line: number | null; name: string; state: State; summary: string | null; reason: string | null; onEvidence: boolean }[] = []
+  for (const t of [...entries].sort((a, b) => LISTED.indexOf(a.state) - LISTED.indexOf(b.state) || a.file.localeCompare(b.file))) {
+    if (!texts.has(t.file)) texts.set(t.file, await $.fs.read(t.file).catch(() => null))
+    const text = texts.get(t.file)
+    rows.push({ file: shortPath(t.file, cwd), line: text ? caseLine(text, t.name, t.file) : null, name: t.name, state: t.state, summary: t.summary ?? null, reason: t.reason ?? null, onEvidence: Boolean(t.evidence) })
+  }
+  const counts = Object.fromEntries(LISTED.map(s => [s, entries.filter(t => t.state === s).length]))
+  const at = new Date(await $.clock.now()).toISOString()
+  const cov = await read($, coverage)
+  const md = [
+    '# Test grades',
+    '',
+    `${entries.length} tests: ${LISTED.filter(s => counts[s]! > 0).map(s => `${counts[s]} ${s}`).join(', ')}. Graded by test-grader, ${at}.`,
+    ...(cov?.lines != null ? ['', `Line coverage: ${cov.lines}% (${cov.source}).`] : []),
+    ...LISTED.filter(s => s !== 'good' && counts[s]! > 0).flatMap(s => [
+      '',
+      `## ${s[0]!.toUpperCase()}${s.slice(1)} (${counts[s]})`,
+      '',
+      ...rows.filter(r => r.state === s).map(r => `- \`${r.file}${r.line ? `:${r.line}` : ''}\` ${r.name}${r.reason ? `: ${r.reason}` : ''}`),
+    ]),
+    ...(counts.good! > 0 ? ['', `## Good (${counts.good})`, '', ...rows.filter(r => r.state === 'good').map(r => `- \`${r.file}${r.line ? `:${r.line}` : ''}\` ${r.name}`)] : []),
+    '',
+  ].join('\n')
+  await $.fs.write(`${cwd}/${REPORT}.md`, md)
+  await $.fs.write(`${cwd}/${REPORT}.json`, `${JSON.stringify({ generatedAt: at, counts, coverage: cov ? { lines: cov.lines, branches: cov.branches, functions: cov.functions, statements: cov.statements } : null, tests: rows }, null, 2)}\n`)
+  return `Wrote ${REPORT}.md and ${REPORT}.json: ${entries.length} tests, ${counts.weak} weak, ${counts.useless} useless.`
+}
+
+// After a turn that leaves tests it wrote weak or useless, the prompt box offers to strengthen
+// them, once for each set of such tests
+let suggestedFor = ''
+const suggestStrengthening = async ($: EngineInterface): Promise<void> => {
+  const counted = await read($, rounds)
+  const flagged = (await read($, tests)).filter(t => t.status === 'done' && (t.verdict === 'weak' || t.verdict === 'useless') && (counted[roundKey(t.file, t.name)] ?? 1) <= MAX_ROUNDS)
+  const key = flagged.map(t => `${t.file}:${t.name}`).sort().join('\n')
+  if (flagged.length === 0 || key === suggestedFor) return
+  suggestedFor = key
+  await $.prompt.suggest({ text: `Strengthen the ${flagged.length === 1 ? 'weak test' : `${flagged.length} weak or useless tests`} you wrote this session (test_grades lists them)` })
+}
+
 export const register: Register = (on, options) => {
-  const chosen = options.graderModel
-  graderModel = typeof chosen === 'string' && (GRADER_MODELS as readonly string[]).includes(chosen) ? chosen : 'haiku'
-  const workers = options.graderWorkers
-  parallel = typeof workers === 'number' && Number.isFinite(workers) ? Math.min(MAX_WORKERS, Math.max(1, Math.floor(workers))) : 10
+  graderModel = modelOf(options.graderModel, 'haiku')
+  escalateModel = options.graderEscalate === 'off' ? null : modelOf(options.graderEscalate, '') || null
+  parallel = workersOf(options.graderWorkers)
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
-  on('tool.check', { tool: /^mcp__test-grader__test_evidence$/ }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
-  on('tool.call', { tool: /^mcp__test-grader__test_evidence$/ }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
+  on('tool.check', { tool: 'mcp__test-grader__test_evidence' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: 'mcp__test-grader__test_evidence' }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
     (_$, _e, next) => ({ result: `The evidence tool could not answer (${next.error.kind}). Nothing was regraded; send it again.` }),
   )
 
+  on('tool.check', { tool: 'mcp__test-grader__test_grades' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: 'mcp__test-grader__test_grades' }, async ($, e) => ({ result: await answerGrades($, e as never) })).catch(
+    (_$, _e, next) => ({ result: `The grades tool could not answer (${next.error.kind}); ask again.` }),
+  )
+
+  // the guides are the mod's own files, read-only: Claude reads them with no permission asked
+  on('tool.check', { tool: 'Read' }, async ($, e, next) => {
+    const path = (e.input as { file_path?: unknown } | undefined)?.file_path
+    const isGuide = typeof path === 'string' && /^[\w-]+\.md$/.test(path.slice(`${$.plugin.root}/guides/`.length)) && path.startsWith(`${$.plugin.root}/guides/`)
+    return isGuide ? { decision: 'allow' as const } : next(e)
+  }).catch(($, e, next) => next(e))
+
+  // the verify tool runs commands and changes a file for a moment: the person is asked first,
+  // as for any tool, so no allow here
+  on('tool.call', { tool: 'mcp__test-grader__test_verify' }, async ($, e) => ({ result: await answerVerify($, e as never) })).catch(
+    (_$, _e, next) => ({ result: `The verify tool could not answer (${next.error.kind}). If it had changed a file, check that it is back as it was.` }),
+  )
+
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'test-grader', description: 'Open the test-grader pane (new tests, their quality, coverage)' })
+    await $.command.register({
+      name: 'test-grader',
+      description: 'Open the test-grader pane (tests, their quality, coverage); diff grades the tests changed on this branch, report writes the grades out',
+      argumentHint: '[diff | report]',
+    })
     await $.tool
       .register({ name: EVIDENCE_TOOL, description: EVIDENCE_DESCRIPTION, inputSchema: EVIDENCE_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the evidence tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await $.tool
+      .register({ name: GRADES_TOOL, description: GRADES_DESCRIPTION, inputSchema: GRADES_SCHEMA })
+      .catch(error => $.ui.log(`test-grader: the grades tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await $.tool
+      .register({ name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA })
+      .catch(error => $.ui.log(`test-grader: the verify tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    runners = await detectRunners($, await $.session.cwd()).catch(() => ({}))
     await refreshCoverage($)
     // the coverage run this project has, if any: the pane offers it only then
     const cover = await detectCommand($, await $.session.cwd()).catch(() => undefined)
     await update($, coverWith, () => cover?.label ?? null)
+    await readRules($).catch(() => undefined)
     await loadGrades($).catch(() => undefined)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
@@ -1176,19 +1599,27 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'test-grader' }, async $ => {
+  // /test-grader opens the pane; /test-grader diff grades the test files changed on this branch;
+  // /test-grader report writes the grades out
+  on('command.run', { command: 'test-grader' }, async ($, e) => {
+    const [verb] = e.args.trim().split(/\s+/)
     await $.ui.open({ id: PANE, title: 'Tests' })
     await refreshCoverage($)
+    if (verb === 'diff') return { text: await gradeBranch($) }
+    if (verb === 'report') return { text: await writeReport($) }
+    if (verb) return { text: `Test pane opened. /test-grader takes diff (grade the test files changed on this branch) or report (write the grades to ${REPORT}.md and .json); not ${JSON.stringify(verb)}.` }
 
     return { text: 'Test pane opened.' }
   })
 
   on('tool.call', { tool: 'Write' }, async ($, e, next) => {
+    const prior = TEST_FILE.test(e.file_path) ? await $.fs.read(e.file_path).catch(() => null) : null
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const names = caseNames(e.content, e.file_path)
       await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(e.content) }))
-      await refresh($, e.file_path, names)
+      // a file written over: only the tests whose text changed are touched
+      await refresh($, e.file_path, prior !== null && prior !== e.content ? changedCases(prior, e.content, e.file_path) : names)
       // a file written afresh holds its old cases too: only the ones not tracked yet are new
       const known = new Set((await read($, tests)).filter(t => t.file === e.file_path).map(t => t.name))
       const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
@@ -1196,9 +1627,17 @@ export const register: Register = (on, options) => {
     }
 
     return ran
+  }).catch(($, e, next) => {
+    // the write ran (or not) as it would without this mod; only its tests went untracked.
+    // next is replay-safe here: it answers what the tool did, running nothing again
+    $.ui.log(`test-grader: a write to a test file was not tracked (${next.error.kind})`, { to: 'debug' })
+
+    return next(e)
   })
 
   on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
+    // the file as it was: where the replaced text stood, for an edit that only removes
+    const prior = TEST_FILE.test(e.file_path) ? await $.fs.read(e.file_path).catch(() => null) : null
     const ran = await next(e)
     if (ran.deny === undefined && ran.isError !== true && TEST_FILE.test(e.file_path)) {
       const text = await $.fs.read(e.file_path).catch(() => null)
@@ -1206,25 +1645,57 @@ export const register: Register = (on, options) => {
       // whole file, read as code, has it as one (not as a fixture's text)
       const isCase = text === null ? () => true : ((all: Set<string>) => (n: string) => all.has(n))(new Set(caseNames(text, e.file_path)))
       const before = new Set(caseNames(e.old_string, e.file_path))
-      const touched = caseNames(e.new_string, e.file_path).filter(isCase)
+      const named = caseNames(e.new_string, e.file_path).filter(isCase)
+      // and the cases the edit fell inside: a change to a test's body alone names no test
+      const inside: string[] = []
+      if (text !== null && e.new_string !== '') {
+        for (let at = text.indexOf(e.new_string); at >= 0; at = e.replace_all ? text.indexOf(e.new_string, at + e.new_string.length) : -1) {
+          inside.push(...casesAround(text, e.file_path, at, at + e.new_string.length))
+        }
+      }
+      if (prior !== null && e.old_string !== '') {
+        const at = prior.indexOf(e.old_string)
+        if (at >= 0) inside.push(...casesAround(prior, e.file_path, at, at + e.old_string.length).filter(isCase))
+      }
+      // with the file as it was: the tests whose own text changed, and no other
+      // (an edit read as already made, the file the same before and after: by where it fell)
+      const touched = prior !== null && text !== null && prior !== text ? changedCases(prior, text, e.file_path).filter(isCase) : [...new Set([...named, ...inside])]
       if (text !== null) await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(text) }))
       await refresh($, e.file_path, touched)
-      const names = touched.filter(n => !before.has(n))
+      const names = named.filter(n => !before.has(n))
       if (names.length > 0) await track($, e.file_path, names)
     }
 
     return ran
-  })
-
-  on('turn.start', async ($, e, next) => {
-    isTurnRunning = true
+  }).catch(($, e, next) => {
+    // the edit ran (or not) as it would without this mod; only its tests went untracked.
+    // next is replay-safe here: it answers what the tool did, running nothing again
+    $.ui.log(`test-grader: an edit to a test file was not tracked (${next.error.kind})`, { to: 'debug' })
 
     return next(e)
   })
 
+  // Claude is told ahead of any test it writes that its tests are graded, and to look the
+  // grades up when it is done writing them
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    if (!e.tools.includes(`mcp__test-grader__${GRADES_TOOL}`)) return composed
+
+    // the languages the project's tests are in, as listed: the guide for each, and no other
+    const kinds = new Set([...(await read($, existing)).results, ...(await read($, tests))].map(t => kindOf(t.file)))
+    const guides = LANGUAGE_ORDER.filter(k => kinds.has(k)).map(k => `- ${LANGUAGE_NAMES[k]}: ${guideOf($.plugin.root, k)}`)
+    const text =
+      guides.length > 0
+        ? `${GRADING_SECTION}\nBefore you write or edit tests, read the guide for their language (once a session; the others do not apply to this project):\n${guides.join('\n')}`
+        : GRADING_SECTION
+
+    return { sections: [...composed.sections, { id: 'test-grader:grading', text, scope: 'session' as const }] }
+  })
+
   on('turn.complete', async ($, e, next) => {
-    isTurnRunning = false
+    await suggestStrengthening($).catch(() => undefined)
     await refreshCoverage($)
+    await readRules($).catch(() => undefined)
     await catchUp($).catch(() => undefined)
     await flush($).catch(() => undefined)
 
@@ -1244,38 +1715,25 @@ export const register: Register = (on, options) => {
     const graded = await read($, existing)
     const noteFailed = await read($, noteError)
     const openFailed = await read($, openError)
+    const saveFailed = await read($, saveError)
+    const runs = await read($, testRuns)
     const now = await $.clock.now()
 
     // the pane's own width: docked beside the transcript, it is narrower than the window
     const columns = (e.props as { bodyColumns?: number }).bodyColumns ?? e.viewport?.columns ?? 60
     const isOpen = new Set(await read($, opened))
     const filesOpen = await read($, fileOpen)
-    const toggle = (key: string): Promise<void> =>
-      update($, opened, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key].slice(-MAX_TESTS)))
+    const toggle = async (key: string): Promise<void> => {
+      await update($, opened, keys => (keys.includes(key) ? keys.filter(k => k !== key) : [...keys, key].slice(-MAX_OPEN)))
+    }
 
-    // One list: the last Grade all tests run and the tests written this session, a test in
-    // both once, with the newer verdict; one written this session is marked new
-    type State = Verdict | 'unrated' | 'reviewing' | 'ungraded'
-    type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; isNew: boolean; suite?: string; evidence?: string }
-    const merged = new Map<string, Entry>()
-    for (const t of graded.results) {
-      const state: State = t.isPending ? 'reviewing' : t.isUngraded ? 'ungraded' : (t.verdict ?? 'unrated')
-      merged.set(`${t.file}:${t.name}`, { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: false, suite: t.suite, evidence: t.evidence })
-    }
-    for (const t of list) {
-      const key = `${t.file}:${t.name}`
-      const prev = merged.get(key)
-      const state: State = t.status === 'pending' ? 'reviewing' : t.status === 'failed' ? 'unrated' : (t.verdict ?? 'unrated')
-      const isNewer = !prev || graded.finishedAt === undefined || t.at >= graded.finishedAt
-      merged.set(key, isNewer ? { file: t.file, name: t.name, state, summary: t.summary, reason: t.reason, isNew: true, suite: t.suite ?? prev?.suite, evidence: t.evidence ?? prev?.evidence } : { ...prev, isNew: true })
-    }
-    const entries = [...merged.values()]
+    const entries = entriesOf(graded, list, await read($, modified))
     const tally = (of: Entry[], s: State): number => of.filter(t => t.state === s).length
 
     // grouped: a Go suite over its files, else by file; the worst group first, and in a
     // file the worst test first, the new ahead
     const RANK: Record<State, number> = { useless: 0, weak: 1, unrated: 2, reviewing: 3, ungraded: 4, good: 5 }
-    const worstFirst = (of: Entry[]): Entry[] => [...of].sort((a, b) => RANK[a.state] - RANK[b.state] || Number(b.isNew) - Number(a.isNew))
+    const worstFirst = (of: Entry[]): Entry[] => [...of].sort((a, b) => RANK[a.state] - RANK[b.state] || Number(b.isNew) - Number(a.isNew) || Number(b.isModified ?? false) - Number(a.isModified ?? false))
     const byFile = (of: Entry[]): { file: string; of: Entry[] }[] => {
       const files = new Map<string, Entry[]>()
       for (const t of of) files.set(t.file, [...(files.get(t.file) ?? []), t])
@@ -1310,10 +1768,13 @@ export const register: Register = (on, options) => {
       ...(tally(entries, 'reviewing') > 0 ? [`${tally(entries, 'reviewing')} reviewing`] : []),
       ...(tally(entries, 'ungraded') > 0 ? [`${tally(entries, 'ungraded')} ungraded`] : []),
       ...(list.length > 0 ? [`${new Set(list.map(t => `${t.file}:${t.name}`)).size} new`] : []),
+      ...(entries.some(t => t.isModified) ? [`${entries.filter(t => t.isModified).length} modified`] : []),
     ].join(' · ')
 
     // a group's header line: its toggle, its counts, and new when it holds a new test
-    const header = (key: string, label: string, of: Entry[], indent: number, open: boolean, onPress: () => Promise<void>): unknown => {
+    // lines: the folder's line coverage, when the report has it
+    const header = (key: string, label: string, of: Entry[], indent: number, open: boolean, onPress: () => Promise<void>, lines?: { total: number; covered: number }): unknown => {
+      const linePct = lines && lines.total > 0 ? Math.round((lines.covered / lines.total) * 100) : null
       const worst = worstFirst(of)[0]!.state
       const groupCounts = [
         `${of.length}`,
@@ -1324,14 +1785,18 @@ export const register: Register = (on, options) => {
         <Box key={`h-${key}`} flexDirection="row" gap={1} marginLeft={indent}>
           <Button key={key} plain label={`${open ? '▾' : '▸'} ${clamp(label, Math.max(16, columns - groupCounts.length - 10 - indent))}`} onPress={onPress} />
           <Text color={worst === 'good' ? GREEN : stateColor(worst)}>{groupCounts}</Text>
+          {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% lines`}</Text>}
           {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
+          {of.some(t => t.isModified) && <Text color={BLUE}>modified</Text>}
         </Box>
       )
     }
     // a group starts open when it is alone among its siblings, closed among several; a press
     // sets it, until the next session
     const isGroupOpen = (key: string, siblings: number): boolean => filesOpen[key] ?? siblings === 1
-    const flip = (key: string, open: boolean) => () => update($, fileOpen, all => ({ ...all, [key]: !open }))
+    const flip = (key: string, open: boolean) => async (): Promise<void> => {
+      await update($, fileOpen, all => ({ ...all, [key]: !open }))
+    }
 
     // a file's header and, open, every one of its tests; the pane scrolling
     const drawn: unknown[] = []
@@ -1340,7 +1805,7 @@ export const register: Register = (on, options) => {
     // the characters a name's line holds: the row's room after its margin, the verdict, the gap
     // and the marks beside it; a desktop's proportional font fits a fifth more than its cells
     const nameWidth = (indent: number, t: Entry): number => {
-      const room = columns - indent - 2 - verdictWidth - 1 - (t.isNew ? ' new'.length : 0) - (t.evidence ? ' on evidence'.length : 0)
+      const room = columns - indent - 2 - verdictWidth - 1 - (t.isNew ? ' new'.length : 0) - (t.isModified ? ' modified'.length : 0) - (t.evidence ? ' on evidence'.length : 0)
       return Math.max(12, Math.floor(room * (e.surface === 'desktop' ? 1.2 : 1)))
     }
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
@@ -1350,6 +1815,7 @@ export const register: Register = (on, options) => {
       if (!open) return
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
+        const ran = runs[`${t.file}:${t.name}`]
         const reason = t.state === 'unrated' ? 'The grader gave no verdict for this test. Grade again to retry it.' : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
         drawn.push(
           <Box key={`row-${key}`} flexDirection="column" marginLeft={indent + 2}>
@@ -1363,6 +1829,7 @@ export const register: Register = (on, options) => {
                 ))}
               </Box>
               {t.isNew && <Text color={VIOLET}>new</Text>}
+              {t.isModified && <Text color={BLUE}>modified</Text>}
               {t.evidence && <Text color={MUTED}>on evidence</Text>}
             </Box>
             {isOpen.has(key) && (
@@ -1370,7 +1837,19 @@ export const register: Register = (on, options) => {
                 {t.summary && <Text>{t.summary}</Text>}
                 {reason && <Text color={stateColor(t.state)}>{reason}</Text>}
                 {t.evidence && <Text color={MUTED}>{`Evidence: ${t.evidence}`}</Text>}
-                <Button key={`o:${t.file}:${t.name}`} plain label="Open in editor" onPress={() => $.clock.after(1, () => void openInEditor($, t.file, t.name))} />
+                {ran && (
+                  <Text color={ran.state === 'passed' ? GREEN : ran.state === 'failed' ? RED : MUTED}>
+                    {ran.state === 'running'
+                      ? 'Running…'
+                      : [`${ran.state === 'passed' ? 'Passed' : 'Failed'}${ran.command ? `: ${ran.command}` : ''}`, ...(ran.state === 'failed' && ran.tail ? [ran.tail] : [])].join('\n')}
+                  </Text>
+                )}
+                <Box flexDirection="row" gap={2}>
+                  <Button key={`o:${t.file}:${t.name}`} plain label="Open in editor" onPress={() => $.clock.after(1, () => void openInEditor($, t.file, t.name))} />
+                  {runArgv({ rel: '', kind: kindOf(t.file), plain: '', groups: [], line: 1 }, runners) !== null && ran?.state !== 'running' && (
+                    <Button key={`x:${t.file}:${t.name}`} plain label="Run test" onPress={() => $.clock.after(1, () => void runFromPane($, t.file, t.name))} />
+                  )}
+                </Box>
               </Box>
             )}
           </Box>,
@@ -1416,7 +1895,7 @@ export const register: Register = (on, options) => {
         if (c.kind === 'dir') {
           const key = `d:${c.folder.path}`
           const open = isGroupOpen(key, children.length)
-          drawn.push(header(key, `${prefix}${c.name}/`, c.of, indent, open, flip(key, open)))
+          drawn.push(header(key, `${prefix}${c.name}/`, c.of, indent, open, flip(key, open), cov?.byDir?.[c.folder.path]))
           if (open) drawLevel(c.folder, '', indent + 2)
           continue
         }
@@ -1446,8 +1925,12 @@ export const register: Register = (on, options) => {
         <Text bold color={VIOLET}>{counts}</Text>
         {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
         {graded.state === 'idle' && graded.graded !== undefined && (
-          <Text color={MUTED}>{`Last run: ${graded.graded} graded · ${graded.remembered ?? 0} remembered`}</Text>
+          <Text color={MUTED}>
+            {`Last run: ${graded.graded} graded · ${graded.remembered ?? 0} remembered` +
+              (graded.spent && graded.spent.input + graded.spent.output > 0 ? ` · ${tokens(graded.spent.input)} in (${tokens(graded.spent.cached)} cached) / ${tokens(graded.spent.output)} out` : '')}
+          </Text>
         )}
+        {graded.state === 'idle' && graded.message !== undefined && <Text color={AMBER}>{graded.message}</Text>}
         <Box flexDirection="column" flexGrow={1} marginTop={1}>
           {entries.length === 0 && (
             <Text color={MUTED}>No tests yet. New tests show up here as they are written; Grade all tests grades the ones already there.</Text>
@@ -1456,6 +1939,7 @@ export const register: Register = (on, options) => {
         </Box>
         {openFailed !== null && <Text color={RED}>{openFailed}</Text>}
         {noteFailed !== null && <Text color={RED}>{`Couldn't share the result with Claude: ${noteFailed}`}</Text>}
+        {saveFailed !== null && <Text color={RED}>{saveFailed}</Text>}
         <Box flexDirection="column" marginTop={1}>
           {hasCoverage && (
             <Box flexDirection="column">
@@ -1502,6 +1986,7 @@ export const register: Register = (on, options) => {
               // on a timer: a run outlasts the press that starts it
               onPress={() => (graded.state === 'running' ? undefined : soon($, () => gradeAll($)))}
             />
+            {graded.state === 'running' && <Button key="stopGrading" label="Stop" onPress={() => stopGrading()} />}
             {graded.state !== 'running' && graded.hashes && Object.keys(graded.hashes).length > 0 && (
               <Button key="regradeAll" label="Regrade all" onPress={() => soon($, () => gradeAll($, true))} />
             )}

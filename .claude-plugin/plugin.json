@@ -1,19 +1,23 @@
 {
   "name": "test-grader",
   "version": "0.1.0",
-  "description": "A side pane that tracks newly written tests, summarises what each does, rates whether it is worth having, and shows test coverage.",
+  "description": "A side pane that grades every test in the project (good, weak, useless), tells Claude how to write tests that grade good, and shows coverage.",
+  "author": {
+    "name": "Martin Hygge"
+  },
   "types": "./types/index.d.ts",
   "userConfig": {
     "graderModel": {
       "type": "string",
       "title": "Grader model",
-      "description": "The model that grades tests: haiku (fast, cheapest), sonnet or opus.",
-      "default": "haiku",
-      "options": [
-        "haiku",
-        "sonnet",
-        "opus"
-      ]
+      "description": "The model that grades tests: an alias (haiku, sonnet, opus) or a model id. A Haiku older than 5.5 grades as claude-haiku-5-5.",
+      "default": "haiku"
+    },
+    "graderEscalate": {
+      "type": "string",
+      "title": "Second-look model",
+      "description": "A model that grades again what the first grade left weak: regrades after an edit, evidence and verified mutations. off: the grader model does it all.",
+      "default": "off"
     },
     "graderWorkers": {
       "type": "number",

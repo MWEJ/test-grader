@@ -22,6 +22,8 @@ export type Coverage = {
   functions: number | null
   source: string
   updatedAt: number | null
+  /** line coverage by folder, its path in the project ('' the project), each with all beneath it */
+  byDir?: Record<string, { total: number; covered: number }>
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
@@ -42,6 +44,10 @@ export type ExistingRun = {
   remembered?: number
   /** while running: a Regrade all, every file graded again */
   isFresh?: boolean
+  /** while running: a run of these files alone (their paths in the project), the rest left be */
+  only?: string[]
+  /** what the last run's grader calls cost, in tokens: in (of them from the prompt cache) and out */
+  spent?: { input: number; cached: number; output: number }
 }
 
 /** a test's grade as Claude is told it */
@@ -72,7 +78,13 @@ declare module 'claude-code' {
       coverWith: string | null
       /** how many weak or useless grades in a row each test Claude wrote or edited has had, by file::name; a good one leaves */
       rounds: Record<string, number>
-      /** grades waiting to go to Claude as one prompt, once no grading or turn is under way */
+      /** the tests there before, edited this session, by file:name: marked modified */
+      modified: string[]
+      /** each test run from the pane, by file:name: running, or how it ended and what it printed last */
+      testRuns: Record<string, { state: 'running' | 'passed' | 'failed'; command?: string; tail?: string }>
+      /** why the grades could not be saved to outlive the session, until a save goes through */
+      saveError: string | null
+      /** grades waiting to go to Claude as one note, once no grading is under way */
       outbox: { accepted: GradeReport[]; going: GradeReport[]; spent: GradeReport[] }
     }
   }
