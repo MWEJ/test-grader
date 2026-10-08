@@ -43,3 +43,31 @@ export const charCount = (tree: unknown): number => {
   const props = Object.values(el.props ?? {}).reduce((n: number, v) => n + (typeof v === 'string' ? v.length : 0), 0)
   return props + (el.children ?? []).reduce((n: number, c) => n + charCount(c), 0)
 }
+
+// What the engine would refuse in a tree, as far as test-grader knows its rules, said with where
+// it is; undefined for a tree it takes
+const MAX_NODES = 20_000
+const MAX_DEPTH = 32
+const HAS_REFUSED = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u{10eeee}]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u
+export const problemOf = (tree: unknown): string | undefined => {
+  let nodes = 0
+  const walk = (n: unknown, depth: number, at: string): string | undefined => {
+    if ((nodes += 1) > MAX_NODES) return `more than ${MAX_NODES} elements`
+    if (depth > MAX_DEPTH) return `nested deeper than ${MAX_DEPTH} at ${at}`
+    if (typeof n === 'string') return HAS_REFUSED.test(n) ? `a text holds a control character at ${at}: ${JSON.stringify(n.slice(0, 80))}` : undefined
+    if (!n || typeof n !== 'object' || Array.isArray(n)) return `a child is ${Array.isArray(n) ? 'an array' : String(n)} at ${at}`
+    const el = n as Element
+    const here = `${at} > ${String(el.type)}${typeof el.props?.key === 'string' ? ` "${el.props.key.slice(0, 80)}"` : ''}`
+    for (const [k, v] of Object.entries(el.props ?? {})) {
+      if (!(typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))) return `prop ${k} is ${v === null ? 'null' : typeof v === 'number' ? String(v) : typeof v} at ${here}`
+      if (typeof v === 'string' && HAS_REFUSED.test(v)) return `prop ${k} holds a control character at ${here}`
+    }
+    if (el.type === 'Button' && (typeof el.props?.key !== 'string' || el.props.key === '' || typeof el.props?.label !== 'string')) return `a Button without a key and a label at ${here}`
+    for (const c of el.children ?? []) {
+      const problem = walk(c, depth + 1, here)
+      if (problem) return problem
+    }
+    return undefined
+  }
+  return walk(tree, 0, 'pane')
+}

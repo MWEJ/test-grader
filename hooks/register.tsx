@@ -15,7 +15,11 @@ import { costOf } from './prices'
 import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, CONTEXT_DESCRIPTION, COVERAGE_DESCRIPTION, COVERAGE_SCHEMA, COVERAGE_TOOL, CONTEXT_MAX, VERIFY_SIBLINGS, CONTEXT_SCHEMA, CONTEXT_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
 import { PROJECT_MARKS, goTagsOf, isBuildFailure, isSetupFailure, isNoneRun, runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
-import { CHAR_BUDGET, NODE_BUDGET, charCount, drawable, nodeCount } from './tree'
+import { LAYERS, LAYERS_FILE, LAYER_NAMES, layerOf, layerRulesOf } from './layers'
+import type { Layer, LayerRules } from './layers'
+import { goRanOf, jsRanOf, mergeRan, ranStateOf } from './ran'
+import type { RanRecord, RanState } from './ran'
+import { CHAR_BUDGET, NODE_BUDGET, charCount, drawable, nodeCount, printable, problemOf } from './tree'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
 import { FLAGGED, LISTED, isFlagged, verdictOf } from './verdicts'
 import type { State } from './verdicts'
@@ -89,6 +93,8 @@ const testRuns = atom({ plugin: 'test-grader', key: 'testRuns' } as const, {})
 const basesFound = atom({ plugin: 'test-grader', key: 'basesFound' } as const, 0)
 const survived = atom({ plugin: 'test-grader', key: 'survived' } as const, {})
 const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
+const layersFound = atom({ plugin: 'test-grader', key: 'layersFound' } as const, 0)
+const ranRecord = atom({ plugin: 'test-grader', key: 'ranRecord' } as const, null)
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -207,7 +213,23 @@ let projectRules = ''
 const readRules = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
   projectRules = cwd ? ((await $.fs.read(`${cwd}/${RUBRIC_FILE}`).catch(() => '')) ?? '').trim().slice(0, MAX_RULES) : ''
+  const layers = cwd ? ((await $.fs.read(`${cwd}/${LAYERS_FILE}`).catch(() => '')) ?? '') : ''
+  if (layers !== layersText) {
+    layersText = layers
+    layerRules = layerRulesOf(layers)
+    // every file read again for its layer by the rules now
+    layerCache.clear()
+    readAt.clear()
+    await update($, layersFound, n => n + 1)
+  }
 }
+
+// Each test file's layer, read from its path and, once its text is read, its imports and Go
+// build tags; the project's .test-grader-layers rules first
+let layersText = ''
+let layerRules: LayerRules = []
+const layerCache = new Map<string, Layer>()
+const layerAt = (cwd: string, file: string): Layer => layerCache.get(file) ?? layerOf(shortPath(file, cwd), null, layerRules)
 
 // an API error worth trying again: too many requests, overloaded, the server's own, or no answer
 const RETRIES = 3
@@ -784,6 +806,7 @@ const NO_COVERAGE = 'No coverage script, jest, vitest, pytest or Go project foun
 const measure = async ($: EngineInterface, rel = ''): Promise<{ command: CoverCommand; exitCode: number; output: string } | string> => {
   const cwd = await projectDir($)
   const setRun = (state: 'idle' | 'running' | 'failed', message?: string) => update($, run, () => ({ state, message }))
+  isMeasuring = true
   try {
     coverParts = await detectParts($, cwd)
     // a project that lost its way to measure keeps the pane's coverage, which says so
@@ -807,6 +830,8 @@ const measure = async ($: EngineInterface, rel = ''): Promise<{ command: CoverCo
     const message = err instanceof Error ? err.message : String(err)
     await setRun('failed', message)
     return message
+  } finally {
+    isMeasuring = false
   }
 }
 
@@ -818,16 +843,88 @@ const measurePart = async ($: EngineInterface, cwd: string, part: Part, sub: str
   const isGoFolder = sub !== '' && part.command.goOutput !== undefined
   const command: CoverCommand = isGoFolder ? { argv: ['go', 'test', `./${sub}/...`, '-cover', `-coverprofile=${GO_PROFILE}`], label: `go test ./${sub}/... -coverprofile` } : part.command
   const whole = isGoFolder ? await $.fs.read(`${base}/${GO_PROFILE}`).catch(() => null) : null
-  const result = await $.process.run(command.argv, { cwd: base, timeoutMs: 600_000 })
-  if (command.goOutput) await $.fs.write(`${base}/${command.goOutput}`, result.stdout)
+  // which tests the run ran: Go's -v lines, Jest's or Vitest's JSON results in a file of
+  // test-grader's own; a project's own coverage script is run as it is
+  const isGo = command.goOutput !== undefined || isGoFolder
+  const runner = isGo ? 'go' : command.argv[1] === 'jest' ? 'jest' : command.argv[1] === 'vitest' ? 'vitest' : null
+  const ranDir = runner ? await keptDir($, cwd, 'ran').catch(() => null) : null
+  const results = ranDir && runner !== 'go' ? `${ranDir}/${part.dir.replace(/[^A-Za-z0-9._-]+/g, '-') || 'root'}.results.json` : null
+  if (results) await $.fs.write(results, '').catch(() => undefined)
+  const extra = isGo ? ['-v'] : !results ? [] : runner === 'jest' ? ['--json', `--outputFile=${results}`] : ['--reporter=default', '--reporter=json', `--outputFile.json=${results}`]
+  const result = await $.process.run([...command.argv, ...extra], { cwd: base, timeoutMs: 600_000, ...(await runEnvIn($, cwd)) })
+  // the run's own lines, without -v's line for each test that ran
+  const stdout = isGo ? result.stdout.split('\n').filter(l => !/^(=== (RUN|PAUSE|CONT|NAME)\s|\s*--- (PASS|SKIP): )/.test(l)).join('\n') : result.stdout
+  await recordRan($, cwd, base, sub, runner, result.stdout, results).catch(error => $.ui.log(`test-grader: the tests the coverage run ran could not be read: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+  if (command.goOutput) await $.fs.write(`${base}/${command.goOutput}`, stdout)
   const part2 = whole === null ? null : await $.fs.read(`${base}/${GO_PROFILE}`).catch(() => null)
   if (whole !== null && part2 !== null) await $.fs.write(`${base}/${GO_PROFILE}`, mergeProfile(whole, part2, moduleOf(await $.fs.read(`${base}/go.mod`).catch(() => '')), sub))
-  return { command: { ...command, label: where(command.label) }, exitCode: result.exitCode, output: [result.stdout, result.stderr].join('\n') }
+  return { command: { ...command, label: where(command.label) }, exitCode: result.exitCode, output: [stdout, result.stderr].join('\n') }
+}
+
+// The tests a coverage run ran, over what the runs before left: kept for the session, and in a
+// file of test-grader's own for the next
+const RAN_FILE = 'ran.json'
+const recordRan = async ($: EngineInterface, cwd: string, base: string, sub: string, runner: 'go' | 'jest' | 'vitest' | null, stdout: string, results: string | null): Promise<void> => {
+  if (runner === null) return
+  const by = runner === 'go' ? goRanOf(stdout, base, moduleOf(await $.fs.read(`${base}/go.mod`).catch(() => '')) ?? '') : results ? jsRanOf(await $.fs.read(results)) : null
+  if (by === null) return
+  const next: RanRecord = { at: await $.clock.now(), measured: [sub ? `${base}/${sub}` : base], by }
+  const merged = mergeRan(await read($, ranRecord), next)
+  await update($, ranRecord, () => merged)
+  const dir = await keptDir($, cwd, 'ran')
+  const text = JSON.stringify(merged)
+  if (dir && text.length <= PART) await $.fs.write(`${dir}/${RAN_FILE}`, text)
+}
+const loadRan = async ($: EngineInterface): Promise<void> => {
+  if ((await read($, ranRecord)) !== null) return
+  const dir = await keptDir($, await projectDir($), 'ran')
+  const text = dir ? await $.fs.read(`${dir}/${RAN_FILE}`).catch(() => null) : null
+  if (text) await update($, ranRecord, () => JSON.parse(text) as RanRecord)
+}
+
+// A run a reload cut off: its state says running, but nothing in this load of the module runs it
+let isMeasuring = false
+const endCutOff = async ($: EngineInterface): Promise<void> => {
+  if (!isMeasuring && (await read($, run)).state === 'running') await update($, run, () => ({ state: 'failed' as const, message: 'The coverage run was cut off by a reload of test-grader: run it again.' }))
+  const runs = await read($, testRuns)
+  const ended = Object.fromEntries(Object.entries(runs).map(([k, r]) => [k, r.state === 'running' && !runningTests.has(k) ? { state: 'failed' as const, tail: 'Cut off by a reload of test-grader: run it again.' } : r]))
+  if (Object.entries(ended).some(([k, r]) => r !== runs[k])) await update($, testRuns, () => ended)
+}
+const runningTests = new Set<string>()
+
+// /test-grader reset-view: every row and group closed, the runs shown cleared, a coverage run
+// left running by a reload ended
+const resetView = async ($: EngineInterface): Promise<string> => {
+  await update($, opened, () => [])
+  await update($, fileOpen, () => ({}))
+  await update($, testRuns, () => ({}))
+  await endCutOff($)
+  return 'Test pane reset: every row and folder closed, and the test runs it showed cleared.'
 }
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
   const ran = await measure($)
-  if (typeof ran !== 'string') await share($, coverageNote(ran.command, ran.exitCode, ran.output, await read($, coverage)))
+  if (typeof ran !== 'string') await share($, coverageNote(ran.command, ran.exitCode, ran.output, await read($, coverage)) + (await notRunNote($)))
+}
+
+// what a coverage run tells Claude of the listed tests it reached but did not run: how many, and
+// the files most of them are in
+const notRunNote = async ($: EngineInterface): Promise<string> => {
+  const record = await read($, ranRecord)
+  if (!record) return ''
+  const cwd = await projectDir($)
+  const entries = entriesOf(await readRun($), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
+  const missed = entries.flatMap(t => {
+    const state = ranStateOf(record, t.file, t.name)
+    return state === 'never ran' || state === 'skipped' ? [{ ...t, state }] : []
+  })
+  if (missed.length === 0) return ''
+  const byFile = new Map<string, number>()
+  for (const t of missed) byFile.set(t.file, (byFile.get(t.file) ?? 0) + 1)
+  const files = [...byFile.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  const never = missed.filter(t => t.state === 'never ran').length
+  const counts = [...(never > 0 ? [`${never} never ran`] : []), ...(missed.length - never > 0 ? [`${missed.length - never} skipped`] : [])].join(' and ')
+  return `\nOf the graded tests this run reached, ${counts}: their grades say nothing of whether they pass. In ${files.slice(0, MAX_NAMED_FILES).map(([f, n]) => `${shortPath(f, cwd)} (${n})`).join(', ')}${files.length > MAX_NAMED_FILES ? ` and ${files.length - MAX_NAMED_FILES} more files` : ''}. test_grades with ran: "never ran" lists them.`
 }
 
 // Claude's coverage tool: the project's run, or a folder's, waited for and answered
@@ -841,7 +938,7 @@ const answerCoverage = async ($: EngineInterface, input: { path?: unknown }): Pr
   const before = await read($, coverage)
   const ran = await measure($, rel)
   if (typeof ran === 'string') return `Coverage could not be measured: ${ran}`
-  return coverageAnswer(rel, ran.command, ran.exitCode, ran.output, before, await read($, coverage))
+  return coverageAnswer(rel, ran.command, ran.exitCode, ran.output, before, await read($, coverage)) + (await notRunNote($))
 }
 
 // what a finished Grade all tests run tells Claude: the counts, then every flagged and
@@ -916,10 +1013,12 @@ const isHeld = (t: { name: string; evidence?: string; evidenceOf?: string }, tex
 const STORE_ROOM = 1_000_000
 const PART = 1_000_000
 type GradesOnDisk = { v: 2; onDisk: string; parts: number }
-const gradesDir = async ($: EngineInterface, cwd: string): Promise<string | null> => {
+const gradesDir = ($: EngineInterface, cwd: string): Promise<string | null> => keptDir($, cwd, 'grades')
+// where test-grader keeps a project's files of one kind, outside the project
+const keptDir = async ($: EngineInterface, cwd: string, kind: 'grades' | 'ran'): Promise<string | null> => {
   const home = await $.env.get('HOME')
   const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || (home ? `${home}/.claude` : '')
-  return config ? `${config}/test-grader/grades/${cwd.replace(/[^A-Za-z0-9._-]+/g, '-')}` : null
+  return config ? `${config}/test-grader/${kind}/${cwd.replace(/[^A-Za-z0-9._-]+/g, '-')}` : null
 }
 // cut where no character's two halves are parted
 const partsOf = (text: string): string[] => {
@@ -1374,6 +1473,7 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
   const run = await readRun($)
   const files = [...new Set([...(await read($, tests)).map(t => t.file), ...run.results.map(t => t.file)])].filter(f => cwd !== '' && f.startsWith(`${cwd}/`))
   const last = await read($, seen)
+  let layersChanged = false
   for (const file of files) {
     // a file not modified since last read is passed over unread
     const at = await mtime($, file)
@@ -1381,6 +1481,11 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
     const text = await $.fs.read(file).catch(() => null)
     if (text === null) continue
     if (at !== null) readAt.set(file, at)
+    const layer = layerOf(shortPath(file, cwd), text, layerRules)
+    if (layerCache.get(file) !== layer) {
+      layerCache.set(file, layer)
+      layersChanged = true
+    }
     const prior = lastText.get(file)
     lastText.set(file, text)
     const now = fingerprint(text)
@@ -1397,6 +1502,7 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
     const fresh = [...new Set(names)].filter(n => owned.get(n)!.length === 0)
     if (fresh.length > 0) await track($, file, fresh)
   }
+  if (layersChanged) await update($, layersFound, n => n + 1)
 }
 
 // A grade the session kept from before the grades were renamed (good, weak, useless), as the
@@ -1450,6 +1556,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
     if (text === null) continue
     hashes[file] = fingerprint(text)
     lastText.set(file, text)
+    layerCache.set(file, layerOf(shortPath(file, cwd), text, layerRules))
     const suites = suitesOf(text, file)
     const names = [...new Set(caseNames(text, file))]
     const owned = byCase(names, run.results.filter(t => t.file === file))
@@ -1485,6 +1592,7 @@ const listNew = async ($: EngineInterface): Promise<void> => {
     if (text === null) continue
     hashes[file] = fingerprint(text)
     lastText.set(file, text)
+    layerCache.set(file, layerOf(shortPath(file, cwd), text, layerRules))
     const names = [...new Set(caseNames(text, file))]
     made.set(file, names)
     const suites = suitesOf(text, file)
@@ -1714,6 +1822,19 @@ const openInEditor = async ($: EngineInterface, file: string, name: string): Pro
 // both once, with the newer verdict; one written this session is marked new
 // isModified: a test that was there before, edited this session (a new one is new, not modified)
 type Entry = { file: string; name: string; state: State; summary?: string; reason?: string; confidence?: Confidence; isNew: boolean; isModified?: boolean; suite?: string; evidence?: string; before?: Before }
+// the tests by layer, every layer named, an empty one too: Layers: 120 unit · 8 integration · 0 end-to-end
+const layersLine = (entries: { file: string }[], cwd: string): string => {
+  const layers = entries.map(t => layerAt(cwd, t.file))
+  return `Layers: ${LAYERS.map(l => `${layers.filter(x => x === l).length} ${LAYER_NAMES[l]}`).join(' · ')}`
+}
+// the tests the last coverage run reached but did not run, or skipped; null when it ran them all
+const notRunLine = (states: (RanState | undefined)[], at: number, now: number): string | null => {
+  const never = states.filter(s => s === 'never ran').length
+  const skipped = states.filter(s => s === 'skipped').length
+  if (never + skipped === 0) return null
+  const age = Math.max(0, Math.round((now - at) / 60_000))
+  return `The last coverage run (${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago): ${[...(never > 0 ? [`${never} never ran`] : []), ...(skipped > 0 ? [`${skipped} skipped`] : [])].join(' · ')}`
+}
 const entriesOf = (graded: ExistingRun, list: TrackedTest[], edited: string[] = []): Entry[] => {
   const merged = new Map<string, Entry>()
   for (const t of graded.results) {
@@ -1850,6 +1971,11 @@ const runEnvOf = async ($: EngineInterface, cwd: string): Promise<Record<string,
       return m && !line.trimStart().startsWith('#') ? [[m[1]!, m[2]!.replace(/^(['"])(.*)\1$/, '$2')]] : []
     }),
   )
+// the env option of a run: the project's variables, and these over them
+const runEnvIn = async ($: EngineInterface, cwd: string, env: Record<string, string> = {}): Promise<{ env?: Record<string, string> }> => {
+  const vars = { ...(await runEnvOf($, cwd)), ...env }
+  return Object.keys(vars).length > 0 ? { env: vars } : {}
+}
 const runOne = async ($: EngineInterface, file: string, name: string, env: Record<string, string> = {}): Promise<Ran | string> => {
   const cwd = await projectDir($)
   const text = await $.fs.read(file).catch(() => null)
@@ -1859,8 +1985,7 @@ const runOne = async ($: EngineInterface, file: string, name: string, env: Recor
   if (!target) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
   const argv = runArgv(target, found)
   if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
-  const vars = { ...(await runEnvOf($, cwd)), ...env }
-  const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT, ...(Object.keys(vars).length > 0 ? { env: vars } : {}) })
+  const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT, ...(await runEnvIn($, cwd, env)) })
   const command = base === cwd ? shown(argv) : `cd ${shortPath(base, cwd)} && ${shown(argv)}`
   const output = [result.stdout, result.stderr].join('\n')
   // a run that ran no test passed nothing: a Go file behind a build tag the run left out, a
@@ -1874,7 +1999,10 @@ const runOne = async ($: EngineInterface, file: string, name: string, env: Recor
 const runFromPane = async ($: EngineInterface, file: string, name: string): Promise<void> => {
   const key = `${file}:${name}`
   await update($, testRuns, all => ({ ...all, [key]: { state: 'running' as const } }))
-  const ran = await runOne($, file, name).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+  runningTests.add(key)
+  const ran = await runOne($, file, name)
+    .catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+    .finally(() => runningTests.delete(key))
   await update($, testRuns, all => ({
     ...all,
     [key]: typeof ran === 'string' ? { state: 'failed' as const, tail: ran } : { state: ran.isPassed ? ('passed' as const) : ('failed' as const), command: ran.command, tail: ran.tail },
@@ -1970,7 +2098,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   return `Measured: the test passes unchanged and fails with the mutation.${siblingsSaid.length > 0 ? ` ${siblingsSaid.join(' ')}` : ''} ${await regradeOnEvidence($, file, text, name, caseName, evidence, true)}`
 }
 
-const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown }): Promise<string> => {
+const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown; layer?: unknown; ran?: unknown }): Promise<string> => {
   const cwd = await projectDir($)
   const asked = Array.isArray(input.verdicts) ? input.verdicts.filter((v): v is State => (LISTED as readonly unknown[]).includes(v)) : []
   // by default the flagged and the unrated: both need something done
@@ -1979,10 +2107,13 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
   const scope = given === '' || given === '.' ? '' : given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
   const limit = typeof input.limit === 'number' && input.limit >= 1 ? Math.floor(input.limit) : GRADES_LIMIT
   const isWritten = input.written === true
+  const layer = (LAYERS as readonly unknown[]).includes(input.layer) ? (input.layer as Layer) : null
+  const notRun = input.ran === 'never ran' || input.ran === 'skipped' ? (input.ran as RanState) : null
+  const record = await read($, ranRecord)
   const inScope = entriesOf(await readRun($), await read($, tests), await read($, modified)).filter(
-    t => (scope === '' || t.file === scope || t.file.startsWith(`${scope}/`)) && (!isWritten || t.isNew || t.isModified === true),
+    t => (scope === '' || t.file === scope || t.file.startsWith(`${scope}/`)) && (!isWritten || t.isNew || t.isModified === true) && (layer === null || layerAt(cwd, t.file) === layer),
   )
-  const where = (isWritten ? ' written or edited this session' : '') + (scope === '' ? '' : ` in ${shortPath(scope, cwd)}`)
+  const where = (isWritten ? ' written or edited this session' : '') + (layer === null ? '' : ` of the ${LAYER_NAMES[layer]} layer`) + (scope === '' ? '' : ` in ${shortPath(scope, cwd)}`)
   if (inScope.length === 0) return `test-grader lists no tests${where}.`
   const count = (s: State): number => inScope.filter(t => t.state === s).length
   const head =
@@ -1991,13 +2122,17 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
     [['unrated', 'with no verdict'], ['reviewing', 'being graded'], ['ungraded', 'never graded']]
       .map(([s, label]) => (count(s as State) > 0 ? `, ${count(s as State)} ${label}` : ''))
       .join('') +
-    '.'
-  const chosen = inScope.filter(t => wanted.has(t.state)).sort((a, b) => LISTED.indexOf(a.state) - LISTED.indexOf(b.state) || a.file.localeCompare(b.file))
+    '.' +
+    `\n${layersLine(inScope, cwd)}.` +
+    (record ? (l => (l ? `\n${l}: test_grades with ran lists them.` : ''))(notRunLine(inScope.map(t => ranStateOf(record, t.file, t.name)), record.at, await $.clock.now())) : '')
+  const chosen = inScope.filter(t => (notRun ? ranStateOf(record, t.file, t.name) === notRun : wanted.has(t.state))).sort((a, b) => LISTED.indexOf(a.state) - LISTED.indexOf(b.state) || a.file.localeCompare(b.file))
   // the four flagged grades asked together are named as one
   const isFlaggedAll = FLAGGED.every(v => wanted.has(v))
-  const names = [...(isFlaggedAll ? ['flagged'] : []), ...[...wanted].filter(s => !isFlaggedAll || !isFlagged(verdictOf(s)))]
-    .sort((a, b) => LISTED.indexOf(a as State) - LISTED.indexOf(b as State))
-    .join(' or ')
+  const names = notRun
+    ? notRun === 'never ran' ? 'never run by the last coverage run' : 'skipped by the last coverage run'
+    : [...(isFlaggedAll ? ['flagged'] : []), ...[...wanted].filter(s => !isFlaggedAll || !isFlagged(verdictOf(s)))]
+        .sort((a, b) => LISTED.indexOf(a as State) - LISTED.indexOf(b as State))
+        .join(' or ')
   const waiting = count('reviewing') > 0 ? `\n${count('reviewing')} still being graded: ask again in a moment for their grades.` : ''
   // what the last grading run found changed, in scope: the files to look at first
   const last = await readRun($)
@@ -2012,13 +2147,18 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
   const texts = new Map<string, string | null>()
   const counted = await read($, rounds)
   const lines: string[] = []
+  // a test's layer where it is not a unit test, and the last coverage run's word where it did not run it
+  const marksOf = (t: Entry): string => {
+    const marks = [...(layerAt(cwd, t.file) === 'unit' ? [] : [LAYER_NAMES[layerAt(cwd, t.file)]]), ...[ranStateOf(record, t.file, t.name)].filter(s => s === 'never ran' || s === 'skipped')]
+    return marks.length > 0 ? ` (${marks.join(', ')})` : ''
+  }
   for (const t of shown) {
     if (!texts.has(t.file)) texts.set(t.file, await $.fs.read(t.file).catch(() => null))
     const text = texts.get(t.file)
     const at = text ? `:${caseLine(text, t.name, t.file)}` : ''
     const round = counted[roundKey(t.file, t.name)]
     lines.push(
-      `- ${shortPath(t.file, cwd)}${at} ${JSON.stringify(t.name)}: ${t.state}${unsure(t)}` +
+      `- ${shortPath(t.file, cwd)}${at} ${JSON.stringify(t.name)}: ${t.state}${unsure(t)}${marksOf(t)}` +
         (round ? (round > MAX_ROUNDS ? ` (${MAX_ROUNDS} rounds spent: test-grader has stopped on it)` : ` (round ${round} of ${MAX_ROUNDS})`) : '') +
         (t.summary ? `\n  Checks: ${t.summary}` : '') +
         (t.reason ? `\n  Why: ${t.reason}` : '') +
@@ -2248,6 +2388,8 @@ export const register: Register = (on, options) => {
     await detectProject($)
     await renameGrades($).catch(() => undefined)
     await loadGrades($).catch(() => undefined)
+    await loadRan($).catch(() => undefined)
+    await endCutOff($).catch(() => undefined)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
     watcher?.cancel()
@@ -2273,7 +2415,8 @@ export const register: Register = (on, options) => {
     await refreshCoverage($)
     if (verb === 'diff') return { text: await gradeBranch($) }
     if (verb === 'report') return { text: await writeReport($) }
-    if (verb) return { text: `Test pane opened. /test-grader takes diff (grade the test files changed on this branch) or report (write the grades to ${REPORT}.md and .json); not ${JSON.stringify(verb)}.` }
+    if (verb === 'reset-view') return { text: await resetView($) }
+    if (verb) return { text: `Test pane opened. /test-grader takes diff (grade the test files changed on this branch), report (write the grades to ${REPORT}.md and .json) or reset-view (close every row and clear the runs shown); not ${JSON.stringify(verb)}.` }
 
     return { text: 'Test pane opened.' }
   })
@@ -2412,6 +2555,12 @@ export const register: Register = (on, options) => {
     }
 
     const entries = entriesOf(graded, list, await read($, modified))
+    // each test's layer, and whether the last coverage run ran it
+    await read($, layersFound)
+    const layerLine = layersLine(entries, cwd)
+    const record = await read($, ranRecord)
+    const ranOf = new Map(entries.map(t => [`${t.file}:${t.name}`, ranStateOf(record, t.file, t.name)] as const))
+    const ranLine = record ? notRunLine([...ranOf.values()], record.at, now) : null
     // whether each file's tests can be run one at a time, by the runners where they run from
     // not waited for: a file whose folder is not looked up yet goes by the project's runners until
     // the lookup, done after this drawing, draws the pane again
@@ -2510,7 +2659,8 @@ export const register: Register = (on, options) => {
     // the characters a name's line holds: the row's room after its margin, the verdict, the gap
     // and the marks beside it; a desktop's proportional font fits a fifth more than its cells
     const nameWidth = (indent: number, t: Entry): number => {
-      const room = columns - indent - 2 - verdictWidth - 1 - (t.isNew ? ' new'.length : 0) - (t.isModified ? ' modified'.length : 0) - (t.evidence ? ' on evidence'.length : 0) - (t.confidence === 'low' || t.confidence === 'medium' ? ' medium confidence'.length : 0)
+      const notRun = ranOf.get(`${t.file}:${t.name}`)
+      const room = columns - indent - 2 - verdictWidth - 1 - (t.isNew ? ' new'.length : 0) - (t.isModified ? ' modified'.length : 0) - (t.evidence ? ' on evidence'.length : 0) - (t.confidence === 'low' || t.confidence === 'medium' ? ' medium confidence'.length : 0) - (notRun === 'never ran' || notRun === 'skipped' ? ` ${notRun}`.length : 0)
       return Math.max(12, Math.floor(room * (e.surface === 'desktop' ? 1.2 : 1)))
     }
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
@@ -2539,6 +2689,8 @@ export const register: Register = (on, options) => {
               {t.isModified && <Text color={BLUE}>modified</Text>}
               {t.evidence && <Text color={MUTED}>on evidence</Text>}
               {(t.confidence === 'low' || t.confidence === 'medium') && <Text color={MUTED}>{`${t.confidence} confidence`}</Text>}
+              {ranOf.get(`${t.file}:${t.name}`) === 'never ran' && <Text color={AMBER}>never ran</Text>}
+              {ranOf.get(`${t.file}:${t.name}`) === 'skipped' && <Text color={MUTED}>skipped</Text>}
             </Box>
             {isOpen.has(key) && (
               <Box flexDirection="column" marginLeft={verdictWidth + 1}>
@@ -2689,9 +2841,11 @@ export const register: Register = (on, options) => {
     }
     const parts = cov?.parts && cov.parts.length > 1 ? cov.parts : null
 
-    return drawable(
+    const pane = drawable(
       <Box flexDirection="column" flexGrow={1}>
         <Text bold color={VIOLET}>{counts}</Text>
+        {entries.length > 0 && <Text color={MUTED}>{layerLine}</Text>}
+        {ranLine !== null && <Text color={AMBER}>{ranLine}</Text>}
         {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
         {graded.state === 'idle' && graded.graded !== undefined && (
           <Text color={MUTED}>
@@ -2764,6 +2918,16 @@ export const register: Register = (on, options) => {
             )}
           </Box>
         </Box>
+      </Box>
+    )
+    // a tree the engine would refuse whole draws its own placeholder, and no word of why: the
+    // pane says what is wrong instead
+    const problem = problemOf(pane)
+    if (problem === undefined) return pane
+    $.ui.log(`test-grader: the pane's drawing would be refused: ${problem}`, { to: 'debug' })
+    return (
+      <Box flexDirection="column">
+        <Text color={RED}>{printable(`test-grader could not draw this pane: ${problem}. Please report it; /test-grader reset-view closes every row and clears the runs shown, and the tools still work.`)}</Text>
       </Box>
     )
   }).catch(($, e, next) => {

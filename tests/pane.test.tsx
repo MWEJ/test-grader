@@ -558,3 +558,51 @@ test('a pane with more rows open than the engine draws leaves the rest out and s
   const shown = rowsOf(JSON.stringify(tree), '/proj/src/a.test.ts').length
   expect(shown + Number(cut!.split(' ')[0])).toBe(3_000)
 })
+
+test('a coverage run and a test run a reload cut off are ended when the session starts again, not left running', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { editor: () => 0 })
+  // as the session's state held them when the module before this one was unloaded: read so
+  // until the module writes them
+  const held: Record<string, unknown> = { run: { state: 'running' }, testRuns: { '/proj/src/a.test.ts:adds': { state: 'running' } } }
+  on('state.get', async (_$, e, next) => {
+    const { key } = e as { key: string }
+    return key in held ? ({ value: { value: held[key], version: 1 } } as never) : next(e)
+  })
+  on('state.set', async (_$, e, next) => {
+    delete held[(e as { key: string }).key]
+    return next(e)
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  const buttons = new Map((await ui.findAll({ type: 'Button' })).map(b => [String(b.props?.key), String(b.props?.label)]))
+  expect(buttons.get('run')).toBe('Run coverage')
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('The coverage run was cut off by a reload of test-grader: run it again.')
+  await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('Failed\nCut off by a reload of test-grader: run it again.')
+})
+
+test('/test-grader reset-view closes every row and folder and clears the test runs shown', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n", 'lib/b.test.ts': "it('subs', () => { expect(sub(3, 2)).toBe(1) })\n" }
+  project(on, files, { editor: () => ({ stdout: 'FAIL src/a.test.ts', exitCode: 1 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'd:src' })
+  await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
+  await ui.press({ key: 'x:/proj/src/a.test.ts:adds' })
+  await clock.advance(10)
+  expect((await ui.findAll({ type: 'Text' })).some(t => String(t.text).startsWith('Failed'))).toBe(true)
+
+  const said = await $.command.run({ command: 'test-grader', args: 'reset-view' } as never)
+  expect((said as { text: string }).text).toBe('Test pane reset: every row and folder closed, and the test runs it showed cleared.')
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).not.toContain('r:/proj/src/a.test.ts:adds')
+  // opened again, the row shows no run
+  await ui.press({ key: 'd:src' })
+  await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
+  expect((await ui.findAll({ type: 'Text' })).some(t => String(t.text).startsWith('Failed'))).toBe(false)
+})

@@ -97,7 +97,7 @@ test('test_grades lists the flagged tests, worst first, each at its line with wh
   await clock.advance(10)
 
   expect(await askGrades($)).toBe(
-    '4 tests: 1 strong, 1 hollow, 2 shallow.\n' +
+    '4 tests: 1 strong, 1 hollow, 2 shallow.\nLayers: 4 unit · 0 integration · 0 end-to-end.\n' +
       'Flagged or unrated, worst first:\n' +
       '- src/math.test.ts:2 "does nothing": hollow\n  Checks: Checks does nothing.\n  Why: hollow because.\n' +
       '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
@@ -117,7 +117,7 @@ test('test_grades narrows to a folder, to the verdicts asked, and to a limit, sa
 
   const deep = await askGrades($, { path: 'src/deep/', limit: 1 })
   expect(deep).toBe(
-    '2 tests in src/deep: 0 strong, 2 shallow.\n' +
+    '2 tests in src/deep: 0 strong, 2 shallow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\n' +
       'Flagged or unrated, worst first:\n' +
       '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '1 more not listed; raise limit or narrow path to see them.\n' +
@@ -126,7 +126,7 @@ test('test_grades narrows to a folder, to the verdicts asked, and to a limit, sa
   // a file's name is not a folder: src/math.test is no prefix of src/math.test.ts
   expect(await askGrades($, { path: 'src/math.test' })).toBe('test-grader lists no tests in src/math.test.')
   const strong = await askGrades($, { verdicts: ['strong'], path: '/proj/src/math.test.ts' })
-  expect(strong).toBe('2 tests in src/math.test.ts: 1 strong, 1 hollow.\nStrong, worst first:\n- src/math.test.ts:1 "adds": strong\n  Checks: Checks adds.\n  Why: strong because.')
+  expect(strong).toBe('2 tests in src/math.test.ts: 1 strong, 1 hollow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/math.test.ts:1 "adds": strong\n  Checks: Checks adds.\n  Why: strong because.')
 })
 
 
@@ -137,7 +137,7 @@ test('test_grades before any grading says none is flagged, and how to grade the 
   await clock.advance(10)
 
   expect(await askGrades($)).toBe(
-    '4 tests: 0 strong, 4 never graded.\nNone is flagged or unrated. Grade all tests in the Test Grader pane grades the ones never graded.',
+    '4 tests: 0 strong, 4 never graded.\nLayers: 4 unit · 0 integration · 0 end-to-end.\nNone is flagged or unrated. Grade all tests in the Test Grader pane grades the ones never graded.',
   )
   expect(prompts).toHaveLength(0)
 })
@@ -187,11 +187,11 @@ test('test_grades with written lists only the tests written or edited this sessi
 
   // asked before the grader answers: nothing to list yet, and the two are being graded
   expect(await askGrades($, { written: true })).toBe(
-    '2 tests written or edited this session: 0 strong, 2 being graded.\nNone is flagged or unrated.\n2 still being graded: ask again in a moment for their grades.',
+    '2 tests written or edited this session: 0 strong, 2 being graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nNone is flagged or unrated.\n2 still being graded: ask again in a moment for their grades.',
   )
   await clock.advance(10)
   expect(await askGrades($, { written: true })).toBe(
-    '2 tests written or edited this session: 1 strong, 1 shallow.\n' +
+    '2 tests written or edited this session: 1 strong, 1 shallow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\n' +
       'Flagged or unrated, worst first:\n' +
       '- src/new.test.ts:1 "a new shallow test": shallow (round 1 of 3)\n  Checks: Checks a new shallow test.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
@@ -490,7 +490,7 @@ test('evidence the grader gives no verdict on leaves the test as it was, and the
 
   expect(answer).toBe('The grader (haiku) answered with no verdict it could read: "[]". Nothing was regraded; send it again.')
   expect(await askGrades($, { verdicts: ['ungraded'] })).toBe(
-    '2 tests: 0 strong, 2 never graded.\nUngraded, worst first:\n- src/e.test.ts:3 "first": ungraded\n- src/e.test.ts:5 "a shallow check": ungraded',
+    '2 tests: 0 strong, 2 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nUngraded, worst first:\n- src/e.test.ts:3 "first": ungraded\n- src/e.test.ts:5 "a shallow check": ungraded',
   )
 })
 
@@ -507,7 +507,7 @@ test('evidence for a test not yet listed adds it to the grades, as graded on evi
   // strong: no round to tell
   expect(answer).toBe('Now strong: strong because.')
   expect(await askGrades($, { verdicts: ['strong'] })).toBe(
-    '2 tests: 1 strong, 1 never graded.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
+    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
   )
 })
 
@@ -525,7 +525,7 @@ test('evidence for a test listed but never graded gives it the grade the tool an
 
   expect(answer).toBe('Now strong: strong because.')
   expect(await askGrades($, { verdicts: ['strong'] })).toBe(
-    '2 tests: 1 strong, 1 never graded.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
+    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
   )
 })
 
@@ -560,7 +560,7 @@ test('test_grades lists a test whose file cannot be read without a line, and one
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   await clock.advance(10)
   expect(await askGrades($, { verdicts: ['ungraded'], path: 'src/math.test.ts' })).toBe(
-    '2 tests in src/math.test.ts: 0 strong, 2 never graded.\nUngraded, worst first:\n- src/math.test.ts:1 "adds": ungraded\n- src/math.test.ts:2 "does nothing": ungraded',
+    '2 tests in src/math.test.ts: 0 strong, 2 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nUngraded, worst first:\n- src/math.test.ts:1 "adds": ungraded\n- src/math.test.ts:2 "does nothing": ungraded',
   )
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
@@ -570,7 +570,7 @@ test('test_grades lists a test whose file cannot be read without a line, and one
   delete files['src/deep/more.test.ts']
 
   expect(await askGrades($, { path: 'src/deep', limit: 1 })).toBe(
-    '2 tests in src/deep: 0 strong, 2 shallow.\n' +
+    '2 tests in src/deep: 0 strong, 2 shallow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\n' +
       'Flagged or unrated, worst first:\n' +
       '- src/deep/more.test.ts "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '1 more not listed; raise limit or narrow path to see them.\n' +

@@ -3,7 +3,9 @@ import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
 import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { goTagsOf, isBuildFailure, isNoneRun, runArgv } from '../hooks/runner'
-import { charCount, nodeCount, printable } from '../hooks/tree'
+import { charCount, nodeCount, printable, problemOf } from '../hooks/tree'
+import { layerOf, layerRulesOf } from '../hooks/layers'
+import { goRanOf, jsRanOf, mergeRan, ranStateOf } from '../hooks/ran'
 import { fits, ignoredBy, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
@@ -551,4 +553,93 @@ test('a loop\'s template as a runner\'s pattern matches each of its cases, the r
   expect(pattern.test('is (q)   what now -> true')).toBe(true)
   expect(pattern.test('is (q) what now => true')).toBe(false)
   expect(pattern.test('is q what now -> true')).toBe(false)
+})
+
+
+// a test's layer, by its path, its text, and the project's rules
+test('a test file under an e2e folder, or named for end-to-end, or driving a browser, is end-to-end', async () => {
+  expect(layerOf('backend/tests/e2e/share_test.go', null)).toBe('e2e')
+  expect(layerOf('backend/internal/server/recipe_share_e2e_test.go', null)).toBe('e2e')
+  expect(layerOf('web/cypress/login.cy.ts', null)).toBe('e2e')
+  expect(layerOf('web/tests/login.spec.ts', "import { test, expect } from '@playwright/test'\n")).toBe('e2e')
+  // an e2e tag beats an integration one
+  expect(layerOf('pkg/x_test.go', '//go:build integration || e2e\n\npackage x\n')).toBe('e2e')
+})
+
+test('a test file behind an integration tag, under an integration folder or named for it is integration; any other is unit', async () => {
+  expect(layerOf('backend/internal/data/rate_test.go', '//go:build integration\n\npackage data\n')).toBe('integration')
+  expect(layerOf('backend/cmd/x/delete_integration_test.go', null)).toBe('integration')
+  expect(layerOf('tests/integration/test_db.py', null)).toBe('integration')
+  expect(layerOf('src/test/java/StoreIT.java', null)).toBe('integration')
+  expect(layerOf('tests/test_db.py', 'import pytest\n@pytest.mark.integration\ndef test_x(): pass\n')).toBe('integration')
+  // a tag it rules out is no constraint to run under
+  expect(layerOf('pkg/x_test.go', '//go:build !integration\n\npackage x\n')).toBe('unit')
+  expect(layerOf('src/a.test.ts', "it('adds', () => {})\n")).toBe('unit')
+  // a word inside a name is not a folder: "edit" is no "it"
+  expect(layerOf('src/edit/form.test.ts', null)).toBe('unit')
+})
+
+test('a project\'s layer rules come first, the first that matches winning, its lines not rules passed over', async () => {
+  const rules = layerRulesOf('# ours\nintegration: **/*.sqlite.test.ts\nend-to-end: maestro/\nunit: e2e/fakes/\nnonsense\n')
+  expect(rules.map(r => r.layer)).toEqual(['integration', 'e2e', 'unit'])
+  expect(layerOf('mobile/src/store.sqlite.test.ts', null, rules)).toBe('integration')
+  expect(layerOf('maestro/flows/login.test.ts', null, rules)).toBe('e2e')
+  expect(layerOf('e2e/fakes/clock.test.ts', null, rules)).toBe('unit')
+  expect(layerOf('e2e/login.test.ts', null, rules)).toBe('e2e')
+})
+
+// which tests a coverage run ran
+test('go test -v lines are read by the package line that ends them, subtests too, a package outside the module passed over', async () => {
+  const out = ['=== RUN   TestA', '=== RUN   TestA/case_1', '    --- PASS: TestA/case_1 (0.00s)', '--- PASS: TestA (0.00s)', '=== RUN   TestB', '--- SKIP: TestB (0.00s)', 'PASS', 'ok  \tex.com/m/pkg/a\t0.1s', '--- FAIL: TestC (0.00s)', 'FAIL\tex.com/m\t0.1s', '--- PASS: TestD (0.00s)', 'ok  \tother.com/x\t0.1s', '?   \tex.com/m/pkg/none\t[no test files]'].join('\n')
+  expect(goRanOf(out, '/p', 'ex.com/m')).toEqual({ '/p/pkg/a': { TestA: 'passed', 'TestA/case_1': 'passed', TestB: 'skipped' }, '/p': { TestC: 'failed' }, '/p/pkg/none': {} })
+})
+
+test('Jest\'s JSON results are read by file and title, a pending or todo test skipped, a title that also ran counted as run', async () => {
+  const json = JSON.stringify({ testResults: [{ name: '/p/a.test.ts', assertionResults: [{ title: 'adds', status: 'passed' }, { title: 'later', status: 'todo' }, { title: 'twice', status: 'pending' }, { title: 'twice', status: 'failed' }, { title: 'ran first', status: 'passed' }, { title: 'ran first', status: 'skipped' }] }] })
+  expect(jsRanOf(json)).toEqual({ '/p/a.test.ts': { adds: 'passed', later: 'skipped', twice: 'failed', 'ran first': 'passed' } })
+})
+
+test('a run of one folder replaces what the record held there and keeps the rest', async () => {
+  const before = { at: 1, measured: ['/p'], by: { '/p/a': { TestA: 'passed' as const }, '/p/b': { TestB: 'passed' as const } } }
+  // a package under the folder run again that the run no longer lists is gone with the rest
+  const merged = mergeRan({ ...before, by: { ...before.by, '/p/b/old': { TestOld: 'passed' } } }, { at: 2, measured: ['/p/b'], by: { '/p/b': { TestB2: 'failed' } } })
+  expect(merged).toEqual({ at: 2, measured: ['/p', '/p/b'], by: { '/p/a': { TestA: 'passed' }, '/p/b': { TestB2: 'failed' } } })
+  expect(mergeRan(null, before)).toBe(before)
+})
+
+test('a graded test is run, skipped or never run by the record, and unknown where the run did not reach it', async () => {
+  const record = { at: 1, measured: ['/p/go', '/p/js'], by: { '/p/go/pkg': { 'TestSuite/TestSaves': 'passed' as const, 'TestTable/row_1': 'failed' as const, TestOff: 'skipped' as const }, '/p/js/a.test.ts': { '  what now -> true': 'passed' as const } } }
+  // a suite's method under its suite, a table test by its rows
+  expect(ranStateOf(record, '/p/go/pkg/s_test.go', 'TestSaves')).toBe('ran')
+  expect(ranStateOf(record, '/p/go/pkg/s_test.go', 'TestTable')).toBe('ran')
+  expect(ranStateOf(record, '/p/go/pkg/s_test.go', 'TestOff')).toBe('skipped')
+  expect(ranStateOf(record, '/p/go/pkg/s_test.go', 'TestGone')).toBe('never ran')
+  // a loop by its template
+  expect(ranStateOf(record, '/p/js/a.test.ts', '%s -> %s')).toBe('ran')
+  expect(ranStateOf(record, '/p/js/b.test.ts', 'adds')).toBe('never ran')
+  expect(ranStateOf(record, '/p/other/c.test.ts', 'adds')).toBeUndefined()
+  expect(ranStateOf(null, '/p/js/a.test.ts', 'adds')).toBeUndefined()
+})
+
+
+// what the engine would refuse whole, said with where it is
+const box = (props: Record<string, unknown>, children: unknown[] = []) => ({ type: 'Box', props, children })
+test('a tree the engine takes has no problem; one it would refuse names what and where', async () => {
+  expect(problemOf(box({ flexDirection: 'column' }, [box({ key: 'k' }, ['text', { type: 'Button', props: { key: 'b', label: '' } }])]))).toBeUndefined()
+  expect(problemOf(box({ width: Number.NaN }))).toBe('prop width is NaN at pane > Box')
+  expect(problemOf(box({}, [box({ key: 'row', color: undefined })]))).toBe('prop color is undefined at pane > Box > Box "row"')
+  expect(problemOf(box({}, [box({ key: 'row' }, ['ok \u001b[31m'])]))).toBe('a text holds a control character at pane > Box > Box "row": "ok \\u001b[31m"')
+  // half an emoji, and the engine's placeholder character, are refused as control characters are
+  expect(problemOf(box({}, ['cut \ud83c']))).toBe('a text holds a control character at pane > Box: "cut \\ud83c"')
+  expect(problemOf(box({ label: 'x\u{10eeee}' }))).toBe('prop label holds a control character at pane > Box')
+  expect(problemOf(box({}, ['a whole 🍅']))).toBeUndefined()
+  expect(problemOf(box({}, [{ type: 'Button', props: { key: '', label: 'Run' } }]))).toBe('a Button without a key and a label at pane > Box > Button ""')
+})
+
+test('a tree past the engine\'s node or depth limit is a problem, one at the limit is not', async () => {
+  expect(problemOf(box({}, Array.from({ length: 19_999 }, () => box({}))))).toBeUndefined()
+  expect(problemOf(box({}, Array.from({ length: 20_000 }, () => box({}))))).toBe('more than 20000 elements')
+  const deep = (n: number): unknown => (n === 0 ? 'leaf' : box({}, [deep(n - 1)]))
+  expect(problemOf(deep(32))).toBeUndefined()
+  expect(problemOf(deep(33))).toMatch(/^nested deeper than 32 at pane( > Box)+$/)
 })

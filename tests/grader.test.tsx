@@ -868,8 +868,9 @@ test('a grader call the engine refuses leaves each of its tests unrated with the
   await clock.advance(10)
   // the refusal's words are the host's (here the test kit's): the row gives the very refusal the pane does
   const refusal = (await ui.findAll({ type: 'Text' })).map(t => t.text).find(t => t.startsWith('The grader (haiku) call failed: '))
-  expect(refusal!.length).toBeGreaterThan('The grader (haiku) call failed: '.length)
-  expect(await askGrades($, { verdicts: ['unrated'] })).toBe(`1 tests: 0 strong, 1 with no verdict.\nUnrated, worst first:\n- src/a.test.ts:1 "adds": unrated\n  Why: ${refusal}`)
+  // the kit's own words for a call nothing answers: the reason is those, not a stand-in
+  expect(refusal).toBe('The grader (haiku) call failed: no implementation for model.complete')
+  expect(await askGrades($, { verdicts: ['unrated'] })).toBe(`1 tests: 0 strong, 1 with no verdict.\nLayers: 1 unit · 0 integration · 0 end-to-end.\nUnrated, worst first:\n- src/a.test.ts:1 "adds": unrated\n  Why: ${refusal}`)
 })
 
 test('a test Claude writes that the grader gives no verdict says why in test_grades, listed with no filter asked', async ($, on) => {

@@ -111,6 +111,10 @@ declare module 'claude-code' {
       testRuns: Record<string, { state: 'running' | 'passed' | 'failed'; command?: string; tail?: string }>
       /** how many times the project folders of the listed test files were looked up: a lookup done draws the pane again */
       basesFound: number
+      /** how many times the files' layers were read: a reading done draws the pane again */
+      layersFound: number
+      /** the tests the last coverage run ran, by a JS file's path or a Go package's folder, each with how it ended; measured: the folders it reached */
+      ranRecord: { at: number; measured: string[]; by: Record<string, Record<string, 'passed' | 'failed' | 'skipped'>> } | null
       /** the mutations test_verify measured a test let through, by file::name: the change, and the test's own text then */
       survived: Record<string, { change: string; textOf: string }[]>
       /** why each test its last grader call gave no verdict got none, by file::name; a verdict clears it */

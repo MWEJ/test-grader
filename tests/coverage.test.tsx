@@ -176,7 +176,7 @@ test('a Go coverage run reads the profile it writes: statements weighted by each
   const ui = await mount($)
   await ui.press({ key: 'run' })
   await clock.advance(10)
-  expect(runs).toEqual([['go', 'test', './...', '-cover', '-coverprofile=.test-grader-go-cover.out']])
+  expect(runs).toEqual([['go', 'test', './...', '-cover', '-coverprofile=.test-grader-go-cover.out', '-v']])
   expect(notes).toEqual(['Coverage run (test-grader) finished: statements 25% (go test -coverprofile).\nLeast covered folders (statements): pkg/b/ 0%, pkg/ 25%.'])
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('"100% statements"')
@@ -484,7 +484,7 @@ test("test_coverage on a Go folder runs that folder's packages alone and keeps t
   await clock.advance(10)
 
   const answer = await askCoverage($, clock, 'pkg/b/')
-  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`]])
+  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`, '-v']])
   expect(answer).toContain('pkg/b/: 33.3% statements, was 0%.')
   // pkg/a's 10 covered statements are kept from the last run: 20 of 40
   expect(answer).toContain('The project: 50% statements, was 25%.')
@@ -638,7 +638,7 @@ test('test_coverage on a folder of a part runs that part alone, a Go folder by i
   runs.length = 0
 
   const answer = await askCoverage($, clock, 'backend/pkg/b')
-  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`]])
+  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`, '-v']])
   expect(answer).toContain('backend/pkg/b/: 100% statements, was 0%.')
   expect(answer).toContain('backend/: 100% statements, was 25%.')
   expect(answer).not.toContain('mobile/')
@@ -693,4 +693,123 @@ test('coverage leaves out the files the project\'s ignore list names, in the tot
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
   expect(texts).toContain('pkg/b/')
   expect(texts).not.toContain('tmp/scratch/')
+})
+
+
+// A Go module with an integration test behind its build tag: go test ./... runs pkg/a's test
+// and compiles pkg/store's file out, so its test never runs
+const TAGGED_MODULE: Record<string, string> = {
+  'go.mod': 'module example.com/shop\n\ngo 1.22\n',
+  'pkg/a/a_test.go': 'package a\n\nfunc TestA(t *testing.T) {\n\tif a() != 1 {\n\t\tt.Fatal("a")\n\t}\n}\n',
+  'pkg/store/store_test.go': '//go:build integration\n\npackage it\n\nfunc TestStore(t *testing.T) {\n\tif store() != 1 {\n\t\tt.Fatal("store")\n\t}\n}\n',
+}
+const TAGGED_RUN = '=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \texample.com/shop/pkg/a\t0.01s\tcoverage: 100.0% of statements\n?   \texample.com/shop/pkg/store\t[no test files]\n'
+
+test('a coverage run marks the graded tests it never ran: in the pane, in test_grades and in its note to Claude', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...TAGGED_MODULE }
+  const { notes } = project(on, files, { editor: () => ({ stdout: TAGGED_RUN, exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(notes.at(-1)).toContain('\nOf the graded tests this run reached, 1 never ran: their grades say nothing of whether they pass. In pkg/store/store_test.go (1). test_grades with ran: "never ran" lists them.')
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('The last coverage run (0m ago): 1 never ran')
+  // the row of the test that never ran says so, the one that ran does not: both folders opened
+  await ui.press({ key: 'd:pkg/a' })
+  await ui.press({ key: 'd:pkg/store' })
+  const rows = nodesOf(await ui.drawn()).filter(n => n.type === 'Box' && String(n.props?.key ?? '').startsWith('row-r:'))
+  const marked = rows.filter(r => JSON.stringify(r).includes('"never ran"')).map(r => String(r.props?.key))
+  expect(rows).toHaveLength(2)
+  expect(marked).toEqual(['row-r:/proj/pkg/store/store_test.go:TestStore'])
+  const listed = await $.tool.call({ tool: 'mcp__test-grader__test_grades', ran: 'never ran' } as never).then(r => String((r as { result: unknown }).result))
+  expect(listed).toContain('Never run by the last coverage run, worst first:\n- pkg/store/store_test.go:5 "TestStore": ungraded (integration, never ran)')
+  expect(listed).not.toContain('TestA')
+})
+
+test('the tests a coverage run ran outlive the session, in a file of test-grader\'s own', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...TAGGED_MODULE }
+  const dir = '/home/u/.claude/test-grader/ran/-proj'
+  files[`${dir}/ran.json`] = JSON.stringify({ at: 400_000, measured: ['/proj'], by: { '/proj/pkg/a': { TestA: 'passed' } } })
+  project(on, files, { env: { HOME: '/home/u' } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await $.tool.call({ tool: 'mcp__test-grader__test_grades', verdicts: ['ungraded'] } as never).then(r => String((r as { result: unknown }).result))
+  expect(answer).toContain('\nThe last coverage run (10m ago): 1 never ran: test_grades with ran lists them.')
+  expect(answer).toContain('"TestStore": ungraded (integration, never ran)')
+  expect(answer).toContain('"TestA": ungraded\n')
+})
+
+test('a Jest coverage run reports which tests it ran, in a file of test-grader\'s own, and a skipped test is told apart', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }',
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit.skip('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n",
+    'e2e/login.test.ts': "import { test } from '@playwright/test'\ntest('logs in', async () => { expect(await login()).toBe(true) })\n",
+  }
+  const { runs } = project(on, files, {
+    env: { HOME: '/home/u' },
+    editor: argv => {
+      const out = argv.find(a => a.startsWith('--outputFile='))?.slice('--outputFile='.length)
+      if (out) files[out] = JSON.stringify({ testResults: [{ name: '/proj/src/a.test.ts', assertionResults: [{ title: 'adds', status: 'passed' }, { title: 'subtracts', status: 'pending' }] }] })
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(runs.at(-1)!.slice(-2)).toEqual(['--json', '--outputFile=/home/u/.claude/test-grader/ran/-proj/root.results.json'])
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('The last coverage run (0m ago): 1 never ran · 1 skipped')
+  expect(texts).toContain('Layers: 2 unit · 0 integration · 1 end-to-end')
+  const skipped = await $.tool.call({ tool: 'mcp__test-grader__test_grades', ran: 'skipped' } as never).then(r => String((r as { result: unknown }).result))
+  expect(skipped).toContain('- src/a.test.ts:2 "subtracts": ungraded (skipped)')
+  expect(skipped).not.toContain('logs in')
+})
+
+test('a project\'s .test-grader-layers names a layer its paths do not show, and test_grades narrows to a layer', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    '.test-grader-layers': '# the sqlite tests start a real database\nintegration: **/*.sqlite.test.ts\nnot a rule\n',
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+    'src/store.sqlite.test.ts': "it('saves', () => { expect(save(1)).toBe(1) })\n",
+  }
+  project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('Layers: 1 unit · 1 integration · 0 end-to-end')
+  const answer = await $.tool.call({ tool: 'mcp__test-grader__test_grades', verdicts: ['ungraded'], layer: 'integration' } as never).then(r => String((r as { result: unknown }).result))
+  expect(answer).toContain('1 tests of the integration layer: 0 strong, 1 never graded.')
+  expect(answer).toContain('"saves": ungraded (integration)')
+  expect(answer).not.toContain('"adds"')
+})
+
+test('a pane whose drawing the engine would refuse whole says why in red, in place of the engine\'s blank placeholder', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // 500 packages, each a bar of cells once every package is shown: past the engine's 20,000 elements
+  const profile = ['mode: set', ...Array.from({ length: 500 }, (_, i) => `example.com/shop/pkg/p${i}/a.go:3.14,5.2 4 ${i % 2}`), ''].join('\n')
+  const files: Record<string, string> = { 'go.mod': 'module example.com/shop\n\ngo 1.22\n', 'pkg/p0/a_test.go': 'package p0\n\nfunc TestA(t *testing.T) {}\n', '.test-grader-go-cover.out': profile }
+  const { logs } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('Coverage')
+
+  await ui.press({ key: 'cov:packages' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toEqual(['test-grader could not draw this pane: more than 20000 elements. Please report it; /test-grader reset-view closes every row and clears the runs shown, and the tools still work.'])
+  expect(logs).toContain("test-grader: the pane's drawing would be refused: more than 20000 elements")
+  // reset-view closes the list again, and the pane draws
+  await $.command.run({ command: 'test-grader', args: 'reset-view' } as never)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('Coverage')
 })

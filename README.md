@@ -18,7 +18,7 @@ Shallow and brittle are opposite problems: a shallow test misses bugs, and a bri
 
 ### The Test Grader pane
 
-The pane opens at session start, or with `/test-grader`. If it can't be drawn, it says why in red instead of staying blank. Claude Code refuses a whole drawing that holds an escape character, or more than 20,000 elements, and blanks text past 100,000 characters, so test-grader draws a run's output without its colour codes, and when too many folders and files are open at once, it leaves the rest of the rows out and says how many. It shows:
+The pane opens at session start, or with `/test-grader`. If it can't be drawn, it says why in red instead of staying blank. Claude Code refuses a whole drawing that holds an escape character, or more than 20,000 elements, and blanks text past 100,000 characters, so test-grader draws a run's output without its colour codes, and when too many folders and files are open at once, it leaves the rest of the rows out and says how many. Before handing a drawing over, test-grader checks it against these rules itself; one that would still be refused (a package list too long, say) is replaced by a red line naming what and where. `/test-grader reset-view` closes every row and folder and clears the test runs shown. A coverage or test run a reload of test-grader cut off is ended when the session starts again, instead of showing *Running…* for good. It shows:
 
 - **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded. A `.test-grader-ignore` file at the project's root leaves test files out of the list and of grading, one pattern per line as `.gitignore` reads them: `.agents/` (a folder at any depth), `/legacy/old/` (from the root), `**/*.snap.test.ts`, and `#` for a comment. Copies of the project in git worktrees (`.worktrees/`, `.claude/worktrees/`) and `node_modules/` are always left out. Coverage leaves out the files the list names too, in its totals, folders and packages.
 - **Tests grouped by folder and file, worst first.** The pane draws the project's folders as a tree. Each folder's row shows the counts for every test beneath it, and its line coverage when a coverage report has it. A folder holding only one subfolder shares its row, as in `gateways/api/`. When tests sit in a single folder, no folder row is drawn, and the list reads flat.
@@ -27,6 +27,8 @@ The pane opens at session start, or with `/test-grader`. If it can't be drawn, i
 - **A verdict per test.** Each test gets a one-line summary and a one-line reason. Verdicts sit in one column on the first line of the title. Pressing a row shows its details.
 - **Badges.** *new* marks a test written this session, and *modified* a test that was there before and was edited this session. A file or folder row carries a badge when a test beneath it does.
 - **A summary line.** It shows the counts of tests and strong ones, then each other grade, new and modified when there are any.
+- **Layers.** Under it, how many tests are unit, integration and end-to-end, an empty layer too: `Layers: 6,900 unit · 520 integration · 0 end-to-end` (see [Test layers](#test-layers)).
+- **Tests the last coverage run never ran.** When the last coverage run reached a graded test's file but didn't run it (a Go file its build tag left out, a test Jest doesn't match) or skipped it, an amber line counts them, and each such row says *never ran* or *skipped* (see [Which tests a coverage run ran](#which-tests-a-coverage-run-ran)).
 - **The last run.** Below the summary: how many tests it graded and how many it remembered, and what its grader calls cost: in tokens (in, of them from the prompt cache, and out), and in dollars at the Claude API's list prices for the model asked for. Haiku 5.5 is priced by each call's prompt length, higher over 100,000 tokens. An alias is priced as its family's latest model, and a call to a model with no listed price, such as a gateway's own, is counted as unpriced.
 - **Open in editor.** This button opens the test at its line (see [Opening a test in your editor](#opening-a-test-in-your-editor)).
 - **Run test.** This button runs the one test with the project's runner. The row then says whether it passed, with the command, and, when it failed, the end of what it printed (see [Running one test](#running-one-test)).
@@ -144,6 +146,15 @@ Only code counts. A test written inside a string literal or a comment, such as a
 | PHP | `*Test.php`, `*Tests.php` | `function testX`, methods under `#[Test]` or `@test`, and Pest's `it(…)` and `test(…)` |
 | Rust | files in `tests/`, `tests.rs`, `test.rs`, `*_test.rs` | functions under `#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case]` |
 
+### Test layers
+
+Each test file is unit, integration or end-to-end, by the first of these that fits:
+
+1. The project's own rules, in `.test-grader-layers` at its root, one a line, the first match winning: `integration: **/*.sqlite.test.ts`, `e2e: maestro/`, `unit: e2e/fakes/`. Patterns read as `.gitignore`'s do, and `end-to-end` may stand for `e2e`.
+2. **End-to-end:** a folder named `e2e`, `end-to-end`, `acceptance`, `playwright` or `cypress`; a name with `e2e` in it (`share_e2e_test.go`, `login.e2e.ts`) or a Cypress `.cy.ts`; a Go `//go:build` line asking for `e2e`; or a file importing Playwright, Cypress, Detox, WebdriverIO or Selenium.
+3. **Integration:** a folder named `integration` (or `integration-tests`, `it`); a name with `integration` in it, a `.int.test.ts` or a Java or Kotlin `…IT`; a Go `//go:build` line asking for `integration`; pytest's `@pytest.mark.integration`, Testcontainers, JUnit's `@Tag("integration")` or `@SpringBootTest`.
+4. **Unit:** every other.
+
 ### Language guides
 
 The `guides/` folder holds a short guide to writing tests that grade strong for each language:
@@ -175,7 +186,11 @@ By default the tool lists the flagged tests, worst first, after a line of counts
 | `verdicts` | which tests to list: `hollow`, `duplicate`, `shallow`, `brittle`, `unrated`, `reviewing`, `ungraded`, `strong`. The default is the four flagged grades and `unrated`. |
 | `path` | only the tests in this file or folder |
 | `written` | only the tests written or edited this session |
+| `layer` | only the tests of one layer: `unit`, `integration` or `e2e` |
+| `ran` | `never ran` or `skipped`: the tests the last coverage run reached but didn't run, or skipped, whatever their grade |
 | `limit` | how many tests to list at most, 50 by default. The answer says how many it left out. |
+
+After the counts come the layers, and how many tests the last coverage run never ran or skipped. Each test listed is marked with its layer when it isn't a unit test, and with *never ran* or *skipped*.
 
 The tool reads the grades the pane shows and starts no grading. Tests still being graded are counted, and the answer says to ask again in a moment. After the counts, it names the files the last grading run graded again because they changed, and those it graded for the first time, within `path` (not with `written`).
 
@@ -280,6 +295,12 @@ It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`
 Go measures statements alone, so a Go project shows statements and nothing else: Go has no line, branch or function figures to show. From the profile, the total is weighted by each file's statements, a block two test runs both cover counts once, and each folder's row shows its own statement coverage. Under the total, each package gets its own Statements bar, least covered first: the first eight, then how many more there are and the best of them. Press that line to show every package; press again for the eight alone. The figures' bars and the packages' bars start in one column. A package's bar is the coverage of all its tests together: Go measures a package's tests as one run, so a testify suite gets no figure of its own. A run that wrote no profile falls back to the plain mean of the per-package figures `go test` printed.
 
 The pane follows the report: one written by a run outside the pane, from the shell or CI, shows within 2 seconds. The run is found as the session starts.
+
+#### Which tests a coverage run ran
+
+A coverage run test-grader starts also records which tests ran: Go's runs add `-v` and read each test's `--- PASS`, `FAIL` or `SKIP` line, and Jest's and Vitest's write their JSON results to a file of test-grader's own (`--json --outputFile=…`, or Vitest's json reporter). A project's own `coverage` script is run as it is, and records nothing. A graded test in a folder the run reached that the run didn't run *never ran*; one it skipped was *skipped*. The note Claude gets after the run counts them and names their files, as does `test_coverage`. The record is kept under `~/.claude/test-grader/ran/`, so the next session has it; a run of one folder replaces only that folder's part.
+
+A test that never ran is graded on its reading alone: its grade says nothing of whether it passes. A Go integration suite behind `//go:build integration`, or end-to-end tests that need a service up, are the usual cases.
 
 #### The project is the folder the session started in
 
