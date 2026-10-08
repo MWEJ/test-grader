@@ -85,7 +85,7 @@ A grader call that the API answers with *overloaded*, *rate limited* or a server
 | **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: an edited test whose last grade was flagged, evidence and verified mutations. An edited test graded strong stays with the grader model. |
 | **Grader workers** (`graderWorkers`) | 1 to 20 | 10 | how many grader calls Grade all tests runs at once |
 
-Change them in the `/config` menu, or in `~/.claude/settings.json`:
+Change them in the `/config` menu, where a change applies to the next grader call, or in `~/.claude/settings.json`, read when Claude Code starts:
 
 ```json
 { "pluginConfigs": { "test-grader": { "graderModel": "haiku", "graderEscalate": "sonnet", "graderWorkers": 4 } } }

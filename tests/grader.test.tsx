@@ -213,6 +213,28 @@ test('a grader model set with spaces around it grades with them trimmed', { opti
 })
 
 
+test('a grader model changed in /config grades the next call, with no restart; another plugin\'s field of that name changes nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { models } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  // the settings writer: takes the value as set
+  on('config.set', async (_$, e) => ({ value: e.value }))
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  const regrade = async () => {
+    await ui.press({ key: 'regradeAll' })
+    await clock.advance(10)
+  }
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  await $.config.set({ key: 'test-grader.graderModel', value: 'sonnet' } as never)
+  await regrade()
+  await $.config.set({ key: 'other.graderModel', value: 'opus' } as never).catch(() => undefined)
+  await regrade()
+  expect(models).toEqual(['haiku', 'sonnet', 'sonnet'])
+})
+
+
 test('a blank grader model setting grades with the haiku alias', { options: { graderModel: '   ' } }, async ($, on) => {
   expect(await gradeOnce($, on)).toEqual(['haiku'])
 })

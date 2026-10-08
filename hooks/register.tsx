@@ -49,8 +49,8 @@ let parallel = 10
 // a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
 // stand for many cases each
 const MAX_REPLY = 4000
-// the model that grades, from the graderModel setting; set as the module loads, and a change
-// to the setting reloads the module
+// the model that grades, from the graderModel setting; set as the module loads, and again
+// when the person changes it in /config
 let graderModel: string = DEFAULT_MODEL
 // grades again what the first grade flagged (a regrade, evidence, a last round), when set
 let escalateModel: string | null = null
@@ -1684,10 +1684,22 @@ const suggestStrengthening = async ($: EngineInterface): Promise<void> => {
   await $.prompt.suggest({ text: `Fix the ${what} you wrote this session (test_grades lists them)` })
 }
 
+// a setting as the module keeps it: from the options it loads with, and from /config as the
+// person changes it, so a new model grades the next call without a restart
+const SETTINGS: Record<string, (value: unknown) => void> = {
+  graderModel: v => (graderModel = modelOf(v, DEFAULT_MODEL)),
+  graderEscalate: v => (escalateModel = v === 'off' ? null : modelOf(v, '') || null),
+  graderWorkers: v => (parallel = workersOf(v)),
+}
+
 export const register: Register = (on, options) => {
-  graderModel = modelOf(options.graderModel, DEFAULT_MODEL)
-  escalateModel = options.graderEscalate === 'off' ? null : modelOf(options.graderEscalate, '') || null
-  parallel = workersOf(options.graderWorkers)
+  for (const [field, apply] of Object.entries(SETTINGS)) apply(options[field])
+  on('config.set', async ($, e, next) => {
+    const result = await next(e)
+    const field = e.key.startsWith('test-grader.') ? e.key.slice('test-grader.'.length) : ''
+    if (result.deny === undefined && field in SETTINGS) SETTINGS[field]!(result.value)
+    return result
+  })
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
   on('tool.check', { tool: 'mcp__test-grader__test_evidence' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
   on('tool.call', { tool: 'mcp__test-grader__test_evidence' }, async ($, e) => ({ result: await answerEvidence($, e as never) })).catch(
