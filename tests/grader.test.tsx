@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { parseVerdicts } from '../hooks/excerpt'
-import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED, REFUSED } from './helpers'
+import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED, REFUSED, askGrades } from './helpers'
 import type { Engine, On } from './helpers'
 
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
@@ -376,7 +376,7 @@ test('a grader call that gets no answer says why in the pane, on the row and abo
   // above the list, and on the unrated row once it is opened
   expect(await texts()).toContain(why)
   await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
-  expect(await texts()).toContain(`The grader gave no verdict for this test. ${why} Grade again to retry it.`)
+  expect(await texts()).toContain(`${why} Grade again to retry it.`)
 
   // a call that answers clears it
   await ui.press({ key: 'gradeAll' })
@@ -807,4 +807,49 @@ test('a test file Grade all graded, written over by Claude with one test changed
   await clock.advance(10)
   expect(ASKED(prompts.slice(1))).toEqual(['adds'])
   expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong · 1 modified"')
+})
+
+
+test('a test the grader gives no verdict says why on its row and in test_grades, and loses the reason once graded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the first answer leaves subtracts out; the next is the grader's usual one
+  const partial = { isAnswered: true, usage: {}, text: '[{"name":"adds","summary":"Checks adds.","verdict":"strong","reason":"r"}]' }
+  project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" }, { reply: n => (n === 1 ? partial : undefined) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const why = 'The grader (haiku) left this test out of its answer: it gave 1 of the 2 verdicts asked for.'
+  expect(await askGrades($, { verdicts: ['unrated'] })).toContain(`"subtracts": unrated\n  Why: ${why}`)
+  await ui.press({ key: 'r:/proj/src/a.test.ts:subtracts' })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain(`${why} Grade again to retry it.`)
+
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10)
+  expect(await askGrades($, { verdicts: ['unrated'] })).not.toContain(why)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong')
+})
+
+test('a grader call the engine refuses leaves each of its tests unrated with the refusal as the reason', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: () => REFUSED })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(await askGrades($, { verdicts: ['unrated'] })).toContain('"adds": unrated\n  Why: The grader (haiku) call failed: ')
+})
+
+test('a test Claude writes that the grader gives no verdict says why in test_grades', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n"
+  // the reply is cut off after the first verdict
+  project(on, { 'src/a.test.ts': content }, { cut: reply => reply.slice(0, reply.indexOf('},') + 2) })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
+  await clock.advance(10)
+  expect(await askGrades($, { verdicts: ['unrated'] })).toContain(
+    '"subtracts": unrated\n  Why: The grader\'s (haiku) reply was cut off at its 4000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.',
+  )
 })

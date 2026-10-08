@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
-import { excerptOf, parseVerdicts } from '../hooks/excerpt'
+import { excerptOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -262,4 +262,44 @@ test('a shallow verdict naming no bug it would miss is graded strong, and its re
     { name: 'b', summary: 's', verdict: 'strong', reason: 'Thin. (Graded strong: no bug it would miss was named.)' },
     { name: 'c', summary: 's', verdict: 'strong', reason: '(Graded strong: no bug it would miss was named.)' },
   ])
+})
+
+
+// why a test asked about got no verdict, from the reply: what its row says, so it can be fixed
+const ASKED = ['adds', 'subtracts']
+const whyOf = (text: string, name: string): string | null => {
+  const { verdicts, isCut } = parseVerdicts(text)
+  return unratedWhy(text, verdicts, isCut, ASKED, name, 'haiku')
+}
+
+test('a test the grader gave a verdict for has no reason to be unrated', () => {
+  expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"}]', 'adds')).toBe(null)
+})
+
+test('a test a cut-off reply did not reach is unrated for the reply\'s limit, with how far it got', () => {
+  expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"},{"name":"subtr', 'subtracts')).toBe(
+    "The grader's (haiku) reply was cut off at its 4000-token limit before it reached this test: it gave 1 of the 2 verdicts asked for.",
+  )
+})
+
+test('a reply with no verdict in it says what came back', () => {
+  expect(whyOf('I cannot   help\nwith that.', 'adds')).toBe('The grader (haiku) answered with no verdict it could read: "I cannot help with that.".')
+})
+
+test('a verdict for the test that could not be read is quoted as it came back', () => {
+  expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"},{"name":"subtracts","summary":"s","verdict":"excellent","reason":"r"}]', 'subtracts')).toBe(
+    'The grader (haiku) answered for this test, but its verdict could not be read: {"name":"subtracts","summary":"s","verdict":"excellent","reason":"r"}',
+  )
+})
+
+test('a verdict under a name no test was asked by names what the grader called it', () => {
+  expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"},{"name":"math › subtracts","summary":"s","verdict":"strong","reason":"r"}]', 'subtracts')).toBe(
+    'The grader (haiku) gave no verdict under this test\'s name; it answered for "math › subtracts", which no test asked about is named.',
+  )
+})
+
+test('a test the grader left out says how many of the batch it answered', () => {
+  expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"}]', 'subtracts')).toBe(
+    'The grader (haiku) left this test out of its answer: it gave 1 of the 2 verdicts asked for.',
+  )
 })

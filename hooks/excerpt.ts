@@ -1,6 +1,6 @@
 import type { Verdict } from '../types'
 import { verdictOf } from './verdicts'
-import { DECLARATION, caseNames, caseStarts, fits, isTemplate, langOf } from './discovery'
+import { DECLARATION, among, caseNames, caseStarts, fits, isTemplate, langOf } from './discovery'
 
 // what the grader reads, and what its reply holds: pure text work, no engine calls
 
@@ -119,3 +119,31 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
 }
 
 export type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
+
+// the grader's reply limit, in tokens: a reply cut off there loses the verdicts it had not reached
+export const MAX_REPLY = 4000
+
+// Why a test asked about got no verdict from this reply, for its row to say; null when it got
+// one. The likely causes in turn: the reply cut off before it, no verdict read at all, its own
+// verdict unreadable (an unknown grade, a broken object), a verdict under another name, left out
+export const unratedWhy = (text: string, verdicts: Graded[], isCut: boolean, names: string[], name: string, model: string): string | null => {
+  if (verdicts.some(v => fits(name, v.name))) return null
+  const answered = verdicts.filter(v => among(names, v.name)).length
+  const count = `it gave ${answered} of the ${names.length} verdicts asked for`
+  if (isCut) return `The grader's (${model}) reply was cut off at its ${MAX_REPLY}-token limit before it reached this test: ${count}.`
+  if (verdicts.length === 0) {
+    const said = text.replace(/\s+/g, ' ').trim()
+    return `The grader (${model}) answered with no verdict it could read: "${said.length > 160 ? `${said.slice(0, 160)}…` : said}".`
+  }
+  // the test's own object, as it came back: its name as JSON writes it, and the braces around it
+  const at = isTemplate(name) ? -1 : text.indexOf(JSON.stringify(name))
+  if (at >= 0) {
+    const from = text.lastIndexOf('{', at)
+    const to = text.indexOf('}', at)
+    const own = text.slice(from < 0 ? at : from, to < 0 ? undefined : to + 1).replace(/\s+/g, ' ')
+    return `The grader (${model}) answered for this test, but its verdict could not be read: ${own.length > 240 ? `${own.slice(0, 240)}…` : own}`
+  }
+  const strays = verdicts.filter(v => !among(names, v.name)).map(v => JSON.stringify(v.name))
+  if (strays.length > 0) return `The grader (${model}) gave no verdict under this test's name; it answered for ${strays.slice(0, 3).join(', ')}${strays.length > 3 ? ` and ${strays.length - 3} more` : ''}, which no test asked about is named.`
+  return `The grader (${model}) left this test out of its answer: ${count}.`
+}

@@ -6,7 +6,7 @@ import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '
 import { attr, byDirOf, coverageNote, pct } from './coverage'
 import type { CoverCommand } from './coverage'
 import { TEST_FILE, among, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
-import { caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts } from './excerpt'
+import { MAX_REPLY, caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, moduleOf } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
@@ -35,6 +35,7 @@ const outbox = atom({ plugin: 'test-grader', key: 'outbox' } as const, { accepte
 const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
 const saveError = atom({ plugin: 'test-grader', key: 'saveError' } as const, null)
 const graderError = atom({ plugin: 'test-grader', key: 'graderError' } as const, null)
+const unrated = atom({ plugin: 'test-grader', key: 'unrated' } as const, {})
 const testRuns = atom({ plugin: 'test-grader', key: 'testRuns' } as const, {})
 const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
 
@@ -56,9 +57,6 @@ const PACKAGE_LABEL = 28
 const BATCH = 10
 // grader calls in flight at once, from the graderWorkers setting (1 to 20), 10 by default
 let parallel = 10
-// a grader reply's room: a verdict runs to about 75 tokens, and a batch's looped tests can
-// stand for many cases each
-const MAX_REPLY = 4000
 // the model that grades, from the graderModel setting; set as the module loads, and again
 // when the person changes it in /config
 let graderModel: string = DEFAULT_MODEL
@@ -247,6 +245,20 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
 // One grader call: these cases of this file, judged; null when the grader gave no answer. An
 // API error that may pass is tried again, waiting longer each time; a stopped run is not
 const gradeCall = async ($: EngineInterface, file: string, text: string, names: string[], { evidence, isMeasured, model, signal, spent, confirming }: GradeOptions = {}): Promise<Graded[] | null> => {
+  // why each test asked about got no verdict, for its row; a verdict clears it. A second look
+  // that gives none leaves the first grade standing, so it says nothing
+  const noteWhy = async (why: (name: string) => string | null): Promise<void> => {
+    if (confirming) return
+    await update($, unrated, all => {
+      const next = { ...all }
+      for (const name of names) {
+        const reason = why(name)
+        if (reason === null) delete next[roundKey(file, name)]
+        else next[roundKey(file, name)] = reason
+      }
+      return next
+    })
+  }
   const source = excerptOf(text, names, file)
   const underTest = await codeUnderTest($, file, text).catch(() => '')
   const ask = [
@@ -309,6 +321,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
     }
     if (reply === undefined) {
       await update($, graderError, () => `The grader (${request.model}) call failed: ${refused}`)
+      await noteWhy(() => `The grader (${request.model}) call failed: ${refused}`)
       return null
     }
     addUsage(spent, request.model, reply.usage)
@@ -324,6 +337,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
         $.ui.log(`test-grader: the grader answered with no verdict for ${file}: ${said.slice(0, 2_000)}`, { to: 'debug' })
         await update($, graderError, () => `The grader (${request.model}) answered with no verdict it could read: "${said.length > 160 ? `${said.slice(0, 160)}…` : said}".`)
       } else await update($, graderError, () => null)
+      await noteWhy(name => unratedWhy(reply.text, verdicts, isCut, names, name, request.model))
       return verdicts
     }
     if (attempt >= RETRIES || !isPassing(reply as never)) {
@@ -331,6 +345,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
       $.ui.log(`test-grader: the grader gave no answer for ${file} (${why})`, { to: 'debug' })
       // shown in the pane: a setting or an account that cannot reach the model says so there
       await update($, graderError, () => `The grader (${request.model}) gave no answer: ${why}.`)
+      await noteWhy(() => `The grader (${request.model}) gave no answer: ${why}.`)
       return null
     }
     // 2s, 4s, 8s, each with up to a second more, so parallel calls do not retry together
@@ -343,6 +358,17 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
 // done writing them, and follow up. A test graded strong after that is told as accepted.
 // Each test gets MAX_ROUNDS such rounds; past them the note says test-grader stops on it
 const roundKey = (file: string, name: string): string => `${file}::${name}`
+
+// the reasons these tests of a file have no verdict, as their last grader call left them, by name
+const unratedOf = async ($: EngineInterface, file: string): Promise<(name: string) => { reason?: string }> => {
+  const all = await read($, unrated)
+  return name => (all[roundKey(file, name)] ? { reason: all[roundKey(file, name)] } : {})
+}
+// a grading that failed outright: each of its tests says how
+const noteFailed = async ($: EngineInterface, file: string, names: string[], err: unknown): Promise<void> => {
+  const why = `Grading failed: ${err instanceof Error ? err.message : String(err)}`
+  await update($, unrated, all => ({ ...all, ...Object.fromEntries(names.map(name => [roundKey(file, name), why])) }))
+}
 
 // the round a test is on now: one more for a flagged grade, none once it is strong
 const countRound = async ($: EngineInterface, file: string, name: string, verdict: Verdict | undefined): Promise<{ round: number; wasRetried: boolean }> => {
@@ -446,7 +472,8 @@ const staleOf = async ($: EngineInterface, file: string, graded: string, names: 
 const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>, model?: string): Promise<void> => busy($, () => evaluateNow($, file, ids, model))
 const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>, model?: string, tries = 0): Promise<void> => {
   const fail = async (): Promise<void> => {
-    await update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' as const } : t)))
+    const why = await unratedOf($, file)
+    await update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' as const, ...why(t.name) } : t)))
   }
   try {
     const text = await $.fs.read(file)
@@ -454,12 +481,13 @@ const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, st
     if (verdicts === null) return fail()
     // the file changed under the grade: graded again on its new text, not kept for the old
     if (tries < MAX_STALE && (await staleOf($, file, text, [...ids.values()])) !== null) return evaluateNow($, file, ids, model, tries + 1)
+    const why = await unratedOf($, file)
     await update($, tests, list =>
       // a looped test becomes one entry per case it generates
       list.flatMap((t): TrackedTest[] => {
         if (!ids.has(t.id)) return [t]
         const found = verdicts.filter(v => fits(t.name, v.name))
-        if (found.length === 0) return [{ ...t, status: 'failed' }]
+        if (found.length === 0) return [{ ...t, status: 'failed', ...why(t.name) }]
         return found.map((v, k) => ({
           ...t,
           id: k === 0 ? t.id : `${t.id}-${k}`,
@@ -473,7 +501,8 @@ const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, st
     )
     const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
     await reportGrades($, mine)
-  } catch {
+  } catch (err) {
+    await noteFailed($, file, [...ids.values()], err)
     await fail()
   }
 }
@@ -816,14 +845,15 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
           continue
         }
         const { file, text, batch, slot } = jobs[next++]!
-        const verdicts = (await grade($, file, text, batch, { signal: stop.signal, spent }).catch(() => null)) ?? []
+        const verdicts = (await grade($, file, text, batch, { signal: stop.signal, spent }).catch(async (err: unknown) => (await noteFailed($, file, batch, err), null))) ?? []
         // cut by a stop: the batch keeps what it had
         if (stop.signal.aborted) return
         const suites = suitesOf(text, file)
+        const why = await unratedOf($, file)
         for (const name of batch) {
           const suite = suites.has(name) ? { suite: suites.get(name) } : {}
           const found = verdicts.filter(v => fits(name, v.name))
-          if (found.length === 0) slot.items.push({ file, name, ...suite })
+          if (found.length === 0) slot.items.push({ file, name, ...suite, ...why(name) })
           for (const v of found) slot.items.push({ file, name: v.name, verdict: v.verdict, summary: v.summary, reason: v.reason, ...suite })
         }
         slot.isDone = true
@@ -942,7 +972,7 @@ const regradeRows = ($: EngineInterface, file: string, text: string, names: stri
     let verdicts: Graded[] | null = null
     // the file changed under the grade: graded again on its new text, not kept for the old
     for (let tries = 0, at = text; tries <= MAX_STALE; tries++) {
-      verdicts = await grade($, file, at, names, { model }).catch(() => null)
+      verdicts = await grade($, file, at, names, { model }).catch(async (err: unknown) => (await noteFailed($, file, names, err), null))
       const now = verdicts === null || tries === MAX_STALE ? null : await staleOf($, file, at, names)
       if (now === null) break
       at = now
@@ -951,12 +981,13 @@ const regradeRows = ($: EngineInterface, file: string, text: string, names: stri
       const v = verdicts?.find(x => x.name === name)
       return v ? [{ file, name, verdict: v.verdict, reason: v.reason }] : []
     }))
+    const why = await unratedOf($, file)
     await update($, existing, r => ({
       ...r,
       results: r.results.map(t => {
         if (!pick(t)) return t
         const v = verdicts?.find(x => x.name === t.name)
-        return { file: t.file, name: t.name, ...(t.suite ? { suite: t.suite } : {}), ...(v ? { verdict: v.verdict, summary: v.summary, reason: v.reason } : {}) }
+        return { file: t.file, name: t.name, ...(t.suite ? { suite: t.suite } : {}), ...(v ? { verdict: v.verdict, summary: v.summary, reason: v.reason } : why(t.name)) }
       }),
     }))
     await saveGrades($)
@@ -1313,7 +1344,7 @@ const regradeOnEvidence = async ($: EngineInterface, file: string, text: string,
   const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
   const verdicts = await grade($, file, text, [caseName], { evidence, isMeasured, model: escalateModel ?? undefined }).catch(() => null)
   const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
-  if (!v) return 'The grader gave no verdict. Nothing was regraded; send it again.'
+  if (!v) return `${(await unratedOf($, file))(name).reason ?? 'The grader gave no verdict.'} Nothing was regraded; send it again.`
   const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence, evidenceOf: ownText(text, caseName, file) }
   const suite = suitesOf(text, file).get(caseName)
   await update($, existing, r => ({
@@ -1868,7 +1899,9 @@ export const register: Register = (on, options) => {
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
         const ran = runs[`${t.file}:${t.name}`]
-        const reason = t.state === 'unrated' ? `The grader gave no verdict for this test. ${graderFailed ?? ''}${graderFailed ? ' ' : ''}Grade again to retry it.` : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
+        // an unrated test says why, as its grader call left it; a row from before reasons were kept, what the pane knows
+        const why = t.reason ?? (graderFailed ? `The grader gave no verdict for this test. ${graderFailed}` : 'The grader gave no verdict for this test.')
+        const reason = t.state === 'unrated' ? `${why} Grade again to retry it.` : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
         drawn.push(
           <Box key={`row-${key}`} flexDirection="column" marginLeft={indent + 2}>
             <Box flexDirection="row" gap={1} alignItems="flex-start">

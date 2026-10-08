@@ -208,7 +208,8 @@ test('the pane lists an unrated test after the shallow, with its file, so it can
   expect(tree.indexOf('▾ src/more.test.ts')).toBeLessThan(tree.indexOf('"r:/proj/src/more.test.ts:lost ${x}"'))
   // its own details, the ones its Open in editor sits in, say why it has no verdict
   const details = nodesOf(drawn).findLast(n => n.type === 'Box' && n.props?.flexDirection === 'column' && holdsKey(n, 'o:/proj/src/more.test.ts:lost ${x}'))
-  expect(JSON.stringify(details)).toContain('The grader gave no verdict for this test.')
+  // the grader was asked about the loop, and answered for the other test alone
+  expect(JSON.stringify(details)).toContain('The grader (haiku) left this test out of its answer: it gave 1 of the 2 verdicts asked for. Grade again to retry it.')
   expect(holdsKey(details!, 'o:/proj/src/more.test.ts:a shallow check')).toBe(false)
 })
 

@@ -86,6 +86,8 @@ declare module 'claude-code' {
       modified: string[]
       /** each test run from the pane, by file:name: running, or how it ended and what it printed last */
       testRuns: Record<string, { state: 'running' | 'passed' | 'failed'; command?: string; tail?: string }>
+      /** why each test its last grader call gave no verdict got none, by file::name; a verdict clears it */
+      unrated: Record<string, string>
       /** why the last grader call gave no answer, with its model, until one answers */
       graderError: string | null
       /** why the grades could not be saved to outlive the session, until a save goes through */

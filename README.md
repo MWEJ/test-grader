@@ -84,6 +84,23 @@ The rubric and the file go first in each call, marked for the prompt cache, so t
 
 A grader call that the API answers with *overloaded*, *rate limited* or a server error is tried again up to three times. The waits are 2, 4 and then 8 seconds, each with up to a second more, so parallel calls do not retry together. Any other error leaves the tests unrated, and the pane says why in red above the list and on each unrated row: the model it asked and the API's answer, such as `The grader (haiku) gave no answer: api-error 404 not_found_error.` It stays until a grader call answers. A model the account or its provider does not offer is the usual cause: set `graderModel` to one it does. A call the engine refuses to send, as it does a model blocked by the account's settings or a gateway's, fails at once and says so the same way. An older Claude Code that takes less of a request (`model.complete: takes { model, prompt }`) is asked again plainly: the texts unmarked and no effort, then the model and one prompt alone, the rubric leading it; the first form it takes is kept for the session. An answer holding no verdict for the tests asked about leaves them unrated too, and the pane quotes the start of what came back; the debug log has more of it. Each call may take two minutes at most.
 
+#### Why a test is unrated
+
+An unrated test says why on its row, in `test_grades` and in the report, as its last grader call left it:
+
+| What happened | What the row says |
+| --- | --- |
+| The engine refused the call | the model and the refusal, such as a blocked model |
+| The API gave no answer | the model, the status and the API's error |
+| The reply was cut off at its 4,000-token limit | that, and how many of the batch's verdicts it gave |
+| The reply held no verdict at all | the start of what came back |
+| The reply held a verdict for the test that could not be read | that verdict as it came back, such as one with an unknown grade |
+| The grader answered under a name no test was asked by | the names it used |
+| The grader left the test out | how many of the batch's verdicts it gave |
+| The grading failed outright | the error |
+
+The reason is kept with the grades, and goes once the test is graded. `test_evidence` answers with it too, when the grader gives no verdict on the evidence.
+
 #### Grader settings
 
 | Setting | Values | Default | What it does |

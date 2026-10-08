@@ -428,7 +428,7 @@ test('evidence the grader gives no verdict on leaves the test as it was, and the
   const answer = await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
   await clock.advance(10)
 
-  expect(answer).toBe('The grader gave no verdict. Nothing was regraded; send it again.')
+  expect(answer).toBe('The grader (haiku) answered with no verdict it could read: "[]". Nothing was regraded; send it again.')
   expect(await askGrades($, { verdicts: ['ungraded'] })).toBe(
     '2 tests: 0 strong, 2 never graded.\nUngraded, worst first:\n- src/e.test.ts:3 "first": ungraded\n- src/e.test.ts:5 "a shallow check": ungraded',
   )
