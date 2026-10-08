@@ -352,6 +352,41 @@ test('a grader call the engine refuses to send, as it does a blocked model, says
   expect(JSON.stringify(await ui.drawn())).toContain('1 unrated')
 })
 
+test('a host that will not take marked blocks grades with plain texts, and keeps to them when it grades again', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const older = (r: Record<string, unknown>): boolean => 'effort' in r || ((r.promptBlocks as { cache?: boolean }[] | undefined) ?? []).some(b => b.cache)
+  const { refused, systems, prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n", 'src/b.test.ts': "it('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" }, { older })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong')
+  expect((await ui.findAll({ type: 'Text' })).some(t => t.text.includes('call failed'))).toBe(false)
+  // the rubric still reaches the grader
+  expect(systems.every(s => s.includes('Answer with JSON only.'))).toBe(true)
+  // once the plain form has worked, later calls go straight to it
+  const before = refused.length
+  expect(before).toBeGreaterThan(0)
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(4)
+  expect(refused).toHaveLength(before)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong')
+})
+
+test('a host that takes only a model and a prompt grades with the rubric in the prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const older = (r: Record<string, unknown>): boolean => String(r.system ?? '') !== '' || 'maxTokens' in r && r.maxTokens !== undefined
+  const { prompts, refused } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { older })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(refused).toHaveLength(2)
+  expect(prompts[0]).toContain('Answer with JSON only.')
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
+})
+
 test('a looped test\'s verdict, named for its case, counts as an answer and shows no error', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const content = "for (const name of ['tiny', 'huge']) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBe(1) })\n}\n"

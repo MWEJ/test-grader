@@ -28,13 +28,13 @@ export const mount = ($: Engine, rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown }
+export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean }
 
 // a command's answer: its exit code, or what it printed too
 export type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
-export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply }: Project = {}) {
+export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -48,6 +48,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   const logs: string[] = []
   // each grader call's room for its reply
   const budgets: number[] = []
+  const refused: Record<string, unknown>[] = []
   // each grader call's model, and its system prompt
   const models: string[] = []
   const systems: string[] = []
@@ -101,6 +102,11 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   })
   // grades by the body: a test asserting true is hollow, one with "shallow" in its name shallow, else strong
   on('model.complete', async (_$, e, next) => {
+    // an older host that does not take this form of request: it will not send it, so the call rejects
+    if (older?.(e as never)) {
+      refused.push(e as never)
+      return next({ ...e, maxTokens: 0 } as never)
+    }
     const prompt = String((e as { prompt?: unknown }).prompt)
     budgets.push(Number((e as { maxTokens?: unknown }).maxTokens))
     models.push(String((e as { model?: unknown }).model))
@@ -171,7 +177,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested }
+  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused }
 }
 
 

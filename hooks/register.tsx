@@ -54,6 +54,8 @@ const MAX_REPLY = 4000
 let graderModel: string = DEFAULT_MODEL
 // grades again what the first grade flagged (a regrade, evidence, a last round), when set
 let escalateModel: string | null = null
+// which form of the grader request the host took last: an older host takes only a plainer one
+let shapeTaken = 0
 
 const ORANGE = '#fb923c'
 const PINK = '#f472b6'
@@ -256,17 +258,31 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
     // the file first and marked, so the next batch of the same file reads it from the cache
     prompt: [{ text: [`Test file: ${file}`, '```', source, '```', ...(underTest ? ['', underTest] : [])].join('\n'), cache: true as const }, { text: `\n${ask}` }],
   }
+  // an older host takes less: the same request with plain texts and no effort, then the model
+  // and one prompt alone; the first it takes is kept for the session's later calls
+  const joined = (blocks: { text: string }[], by: string): string => blocks.map(b => b.text).join(by)
+  const shapes: Parameters<typeof $.model.complete>[0][] = [
+    request,
+    { model: request.model, maxTokens: request.maxTokens, timeoutMs: request.timeoutMs, system: joined(request.system, '\n\n'), prompt: joined(request.prompt, '') },
+    { model: request.model, prompt: `${joined(request.system, '\n\n')}\n\n${joined(request.prompt, '')}` },
+  ]
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) return null
-    let reply: Awaited<ReturnType<typeof $.model.complete>>
-    try {
-      reply = await $.model.complete(request, signal ? { signal } : undefined)
-    } catch (err) {
-      // a call that throws, as one through a gateway it cannot reach may, says so like any other
-      if (signal?.aborted) return null
-      const why = err instanceof Error ? err.message : String(err)
-      $.ui.log(`test-grader: the grader call failed for ${file} (${why})`, { to: 'debug' })
-      await update($, graderError, () => `The grader (${request.model}) call failed: ${why}`)
+    let reply: Awaited<ReturnType<typeof $.model.complete>> | undefined
+    let refused = ''
+    for (let s = shapeTaken; s < shapes.length && reply === undefined; s++) {
+      try {
+        reply = await $.model.complete(shapes[s]!, signal ? { signal } : undefined)
+        shapeTaken = s
+      } catch (err) {
+        // a request the host will not send rejects at once: a blocked model, or a shape it does not take
+        if (signal?.aborted) return null
+        refused = err instanceof Error ? err.message : String(err)
+        $.ui.log(`test-grader: the grader call failed for ${file} (request ${s + 1} of ${shapes.length}: ${refused})`, { to: 'debug' })
+      }
+    }
+    if (reply === undefined) {
+      await update($, graderError, () => `The grader (${request.model}) call failed: ${refused}`)
       return null
     }
     addUsage(spent, reply.usage)
