@@ -258,7 +258,17 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   }
   for (let attempt = 0; ; attempt++) {
     if (signal?.aborted) return null
-    const reply = await $.model.complete(request, signal ? { signal } : undefined)
+    let reply: Awaited<ReturnType<typeof $.model.complete>>
+    try {
+      reply = await $.model.complete(request, signal ? { signal } : undefined)
+    } catch (err) {
+      // a call that throws, as one through a gateway it cannot reach may, says so like any other
+      if (signal?.aborted) return null
+      const why = err instanceof Error ? err.message : String(err)
+      $.ui.log(`test-grader: the grader call failed for ${file} (${why})`, { to: 'debug' })
+      await update($, graderError, () => `The grader (${request.model}) call failed: ${why}`)
+      return null
+    }
     addUsage(spent, reply.usage)
     if (reply.isAnswered) {
       const { verdicts, isCut } = parseVerdicts(reply.text)
@@ -267,7 +277,7 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       }
       // an answer with no verdict for any case asked about leaves them unrated: the pane says
       // what came back, so a model that will not answer in the format can be told apart
-      if (names.length > 0 && !verdicts.some(v => names.includes(v.name))) {
+      if (names.length > 0 && !verdicts.some(v => among(names, v.name))) {
         const said = reply.text.replace(/\s+/g, ' ').trim()
         $.ui.log(`test-grader: the grader answered with no verdict for ${file}: ${said.slice(0, 2_000)}`, { to: 'debug' })
         await update($, graderError, () => `The grader (${request.model}) answered with no verdict it could read: "${said.length > 160 ? `${said.slice(0, 160)}…` : said}".`)

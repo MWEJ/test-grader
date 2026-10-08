@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED } from './helpers'
+import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED, REFUSED } from './helpers'
 
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -338,6 +338,30 @@ test('a grader call that gets no answer says why in the pane, on the row and abo
   expect(prompts).toHaveLength(2)
   expect((await texts()).some(t => t.includes('gave no answer'))).toBe(false)
   expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
+})
+
+test('a grader call the engine refuses to send, as it does a blocked model, says so in the pane, and the test is unrated', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: () => REFUSED })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts.some(t => t.startsWith('The grader (claude-haiku-5-5) call failed: '))).toBe(true)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 unrated')
+})
+
+test('a looped test\'s verdict, named for its case, counts as an answer and shows no error', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "for (const name of ['tiny', 'huge']) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBe(1) })\n}\n"
+  project(on, { 'src/round.test.ts': content }, { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge'] } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect((await ui.findAll({ type: 'Text' })).some(t => t.text.includes('no verdict it could read'))).toBe(false)
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong')
 })
 
 test('a grader answer holding no verdict for the tests asked about says what came back, until one does', async ($, on) => {

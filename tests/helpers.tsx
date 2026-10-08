@@ -100,7 +100,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     return { value: files[path] } as never
   })
   // grades by the body: a test asserting true is hollow, one with "shallow" in its name shallow, else strong
-  on('model.complete', async (_$, e) => {
+  on('model.complete', async (_$, e, next) => {
     const prompt = String((e as { prompt?: unknown }).prompt)
     budgets.push(Number((e as { maxTokens?: unknown }).maxTokens))
     models.push(String((e as { model?: unknown }).model))
@@ -118,6 +118,8 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     }
     // a reply set by the test, by the call's number: an API error, say
     const set = reply?.(prompts.length)
+    // a request the engine will not send, as a blocked model is: the call rejects
+    if (set === REFUSED) return next({ ...e, maxTokens: 0 } as never)
     if (set !== undefined) return { value: set } as never
     const names = JSON.parse(prompt.match(/test cases: (\[.*\])/)![1]!) as string[]
     return {
@@ -538,3 +540,6 @@ export const placedOf = (tree: unknown): Placed[] => {
   place(tree as Node, 0, 0)
   return placed
 }
+
+// a grader reply that stands for a request the engine refuses to send
+export const REFUSED = Symbol('refused')
