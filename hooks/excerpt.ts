@@ -120,6 +120,36 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
 
 export type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
 
+// A test the grader graded case by case (Test › xdr role, Test/xdr role, Test > xdr role) when
+// asked for the test: one verdict for it, the worst of its cases', its reason saying which case
+// earned it. A verdict under the test's own name stands, its cases' set aside
+const CASE_MARK = /^\s*(?:›|>|\/|::|-)\s*/
+const WORST: Verdict[] = ['hollow', 'duplicate', 'shallow', 'brittle', 'strong']
+export const foldCases = <V extends { name: string; verdict: Verdict; reason: string; summary: string }>(names: string[], verdicts: V[]): V[] => {
+  const caseOf = (v: V): { test: string; label: string } | null => {
+    if (among(names, v.name)) return null
+    // the longest asked name it extends, so Test_A is not taken for Test_AB's case
+    const test = names.filter(n => !isTemplate(n) && v.name.startsWith(n) && CASE_MARK.test(v.name.slice(n.length))).sort((a, b) => b.length - a.length)[0]
+    return test === undefined ? null : { test, label: v.name.slice(test.length).replace(CASE_MARK, '') }
+  }
+  const cases = new Map<string, { label: string; v: V }[]>()
+  const rest: V[] = []
+  for (const v of verdicts) {
+    const c = caseOf(v)
+    if (c === null) rest.push(v)
+    else cases.set(c.test, [...(cases.get(c.test) ?? []), { label: c.label, v }])
+  }
+  const folded = [...cases.entries()]
+    .filter(([test]) => !rest.some(v => v.name === test))
+    .map(([test, of]): V => {
+      const worst = [...of].sort((a, b) => WORST.indexOf(a.v.verdict) - WORST.indexOf(b.v.verdict))[0]!
+      const labels = of.map(c => JSON.stringify(c.label)).join(', ')
+      const reason = worst.v.verdict === 'strong' ? `Graded case by case (${labels}), each strong. ${worst.v.reason}` : `Graded case by case (${labels}); the case ${JSON.stringify(worst.label)} is ${worst.v.verdict}: ${worst.v.reason}`
+      return { ...worst.v, name: test, reason: reason.trim() }
+    })
+  return [...rest, ...folded]
+}
+
 // a name as a model may echo it back: curly quotes straight, dashes plain, an escape's
 // backslash dropped, each run of space one
 const loose = (name: string): string =>

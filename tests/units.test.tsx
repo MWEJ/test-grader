@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
-import { asAsked, excerptOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
+import { asAsked, excerptOf, foldCases, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -331,4 +331,37 @@ test('a verdict alike to two tests asked is given to neither', () => {
 
 test('a verdict under a loop\'s case keeps the case\'s name', () => {
   expect(asAsked(['adds ${a} and ${b}'], [v('adds 1 and 2')]).map(x => x.name)).toEqual(['adds 1 and 2'])
+})
+
+// a test the grader graded case by case, as one verdict under the test's own name
+const TABLE = 'TestRoleGating_BuildsItems'
+const graded = (name: string, verdict: 'strong' | 'shallow' | 'hollow' | 'brittle' | 'duplicate', reason = `${verdict} reason.`) => ({ name, summary: `Checks ${name}.`, verdict, reason })
+
+test('a table test graded per case takes its worst case\'s verdict, the reason naming that case', () => {
+  const folded = foldCases([TABLE], [graded(`${TABLE} › xdr role`, 'strong'), graded(`${TABLE} › overwatch role`, 'shallow', 'Misses an empty role.'), graded(`${TABLE} › falcon role`, 'brittle')])
+  expect(folded).toHaveLength(1)
+  expect(folded[0]!.name).toBe(TABLE)
+  expect(folded[0]!.verdict).toBe('shallow')
+  expect(folded[0]!.reason).toBe('Graded case by case ("xdr role", "overwatch role", "falcon role"); the case "overwatch role" is shallow: Misses an empty role.')
+})
+
+test('a table test whose cases are all strong is strong', () => {
+  const folded = foldCases([TABLE], [graded(`${TABLE}/xdr_role`, 'strong'), graded(`${TABLE} > falcon role`, 'strong')])
+  expect(folded.map(v => [v.name, v.verdict])).toEqual([[TABLE, 'strong']])
+  expect(folded[0]!.reason).toMatch(/^Graded case by case \("xdr_role", "falcon role"\), each strong\./)
+})
+
+test('a verdict under the test\'s own name stands, and its cases\' are set aside', () => {
+  const own = graded(TABLE, 'strong')
+  expect(foldCases([TABLE], [own, graded(`${TABLE} › xdr role`, 'hollow')])).toEqual([own])
+})
+
+test('a case goes to the longest asked name it extends, not to a shorter name it starts with', () => {
+  const folded = foldCases(['TestA', 'TestA_B'], [graded('TestA_B › one', 'hollow'), graded('TestA › two', 'strong')])
+  expect(Object.fromEntries(folded.map(v => [v.name, v.verdict]))).toEqual({ TestA: 'strong', TestA_B: 'hollow' })
+})
+
+test('a name that only starts like an asked test, with no case mark after it, is left as it is', () => {
+  const stray = graded(`${TABLE}Extra`, 'hollow')
+  expect(foldCases([TABLE], [stray, graded(`${TABLE} more words`, 'strong')]).map(v => v.name)).toEqual([`${TABLE}Extra`, `${TABLE} more words`])
 })

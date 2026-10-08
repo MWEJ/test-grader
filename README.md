@@ -100,6 +100,8 @@ An unrated test says why on its row, in `test_grades` and in the report, as its 
 | The grader left the test out | how many of the batch's verdicts it gave |
 | The grading failed outright | the error |
 
+A test whose cases run inside it, such as a Go table test with `t.Run` subtests, gets one verdict. The grader is asked for one verdict per test. When it still grades case by case (`TestX › xdr role`, `TestX/xdr_role`), the cases' verdicts count for the test: the worst of them, its reason naming the case that earned it. A verdict under the test's own name wins over its cases'.
+
 A verdict whose name differs from one test's only in its quotes, dashes, escapes or spacing counts for that test: a grader often echoes `subagent’s` as `subagent's`. Two tests that read alike that way get neither verdict.
 
 The reason is kept with the grades, and goes once the test is graded. `test_evidence` answers with it too, when the grader gives no verdict on the evidence.

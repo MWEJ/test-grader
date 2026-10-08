@@ -6,7 +6,7 @@ import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '
 import { attr, byDirOf, coverageNote, pct } from './coverage'
 import type { CoverCommand } from './coverage'
 import { TEST_FILE, among, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
-import { MAX_REPLY, asAsked, caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
+import { MAX_REPLY, asAsked, caseTextOf, foldCases, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, moduleOf } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
@@ -287,6 +287,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
         ]
       : []),
     `Review ONLY these test cases: ${JSON.stringify(names)}`,
+    'Give one verdict per name, under that name exactly. A test whose cases run inside it (t.Run subtests, table rows, subTest) gets one verdict for all its cases together, under its own name.',
     ...loopsOf(text, names, file),
   ].join('\n')
   const request = {
@@ -330,7 +331,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
     addUsage(spent, request.model, reply.usage)
     if (reply.isAnswered) {
       const parsed = parseVerdicts(reply.text)
-      const verdicts = asAsked(names, parsed.verdicts)
+      const verdicts = foldCases(names, asAsked(names, parsed.verdicts))
       const { isCut } = parsed
       if (isCut) {
         $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })

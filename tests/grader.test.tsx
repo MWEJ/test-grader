@@ -483,6 +483,25 @@ test('a test named with a curly apostrophe is graded when the grader echoes it s
   expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 strong · 1 brittle')
 })
 
+test('a Go table test the grader graded case by case is rated, worst case first, and the grader is asked for one verdict per test', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const T = 'TestRoleGating_BuildsItems'
+  const perCase = { isAnswered: true, usage: {}, text: JSON.stringify([
+    { name: `${T} › xdr role`, summary: 's', verdict: 'strong', reason: 'r' },
+    { name: `${T} › overwatch role`, summary: 's', verdict: 'brittle', reason: 'Asserts exact mock calls.' },
+  ]) }
+  const { prompts, confirms } = project(on, { 'gitops/roles_test.go': `package gitops\n\nfunc ${T}(t *testing.T) {\n\tfor _, tc := range cases {\n\t\tt.Run(tc.name, func(t *testing.T) { check(t, tc) })\n\t}\n}\n` }, { reply: () => perCase })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts[0]).toContain('gets one verdict for all its cases together, under its own name')
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 strong · 1 brittle')
+  // the flag goes to the second look under the test's name, with the case that earned it
+  const why = 'Graded case by case ("xdr role", "overwatch role"); the case "overwatch role" is brittle: Asserts exact mock calls.'
+  expect(confirms[0]!.prompt).toContain(JSON.stringify([{ name: T, verdict: 'brittle', reason: why }]))
+})
+
 // one test a first pass grades shallow, with the reply the grader gives
 const ONE = { 'src/a.test.ts': "it('totals', () => { expect(total([])).toBeDefined() })\n" }
 const answer = (o: Record<string, unknown>) => ({ isAnswered: true, usage: {}, text: JSON.stringify([{ name: 'totals', summary: 'Checks totals.', ...o }]) })
