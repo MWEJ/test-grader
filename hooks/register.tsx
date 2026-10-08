@@ -749,6 +749,11 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
     const listed = only ?? (await testFiles($, cwd))
     if (listed === null) return void (await fail('Not a git repository: there is no list of test files to grade.'))
     const files = only ? listed.filter(f => TEST_FILE.test(f)) : listed
+    // nothing to grade: the pane says why, and Claude is told nothing
+    if (!only && files.length === 0) {
+      const ignored = (await $.process.run(['git', 'check-ignore', '-q', '.'], { cwd, timeoutMs: 10_000 }).catch(() => null))?.exitCode === 0
+      return void (await fail(ignored ? `No test files in ${cwd}: git ignores this folder. Open the session in the project's root to grade its tests.` : `No test files in ${cwd}: git lists none here.`))
+    }
     const inRun = new Set(files.map(rel => `${cwd}/${rel}`))
     // a narrowed run leaves the other files' results be
     const others = only ? before.results.filter(t => !inRun.has(t.file)) : []
@@ -2051,7 +2056,7 @@ export const register: Register = (on, options) => {
         {graderFailed !== null && <Text color={RED}>{graderFailed}</Text>}
         <Box flexDirection="column" flexGrow={1} marginTop={1}>
           {entries.length === 0 && (
-            <Text color={MUTED}>No tests yet. New tests show up here as they are written; Grade all tests grades the ones already there.</Text>
+            <Text color={MUTED}>{`No tests in ${cwd} yet. New tests show up here as they are written; Grade all tests grades the ones already there.`}</Text>
           )}
           {drawn as never}
         </Box>

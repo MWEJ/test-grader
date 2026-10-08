@@ -676,3 +676,24 @@ test('grades this session held before a reload renamed them read as the nearest 
 
   expect(await verdictsDrawn(await mount($))).toEqual({ 'checks nothing': 'hollow', 'a shallow check': 'shallow', 'matches the snapshot': 'strong' })
 })
+
+// a session opened in a folder git ignores (a coverage report's, say) lists no test files there
+for (const [label, ignored, says] of [
+  ['git-ignored', 0, 'No test files in /proj: git ignores this folder. Open the session in the project\'s root to grade its tests.'],
+  ['with no tests in it', 1, 'No test files in /proj: git lists none here.'],
+] as const) {
+  test(`Grade all in a folder ${label} says why there is nothing to grade, and sends Claude no note`, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const { notes, prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, {
+      git: argv => (argv[1] === 'ls-files' ? { stdout: '' } : argv[1] === 'check-ignore' ? { stdout: '', exitCode: ignored } : undefined),
+    })
+    await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+    const ui = await mount($)
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('No tests in /proj yet. New tests show up here as they are written; Grade all tests grades the ones already there.')
+    await ui.press({ key: 'gradeAll' })
+    await clock.advance(10)
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain(says)
+    expect(notes).toEqual([])
+    expect(prompts).toEqual([])
+  })
+}
