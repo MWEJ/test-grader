@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { parseVerdicts } from '../hooks/excerpt'
 import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED, REFUSED } from './helpers'
+import type { Engine, On } from './helpers'
 
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -605,4 +606,205 @@ test('a test written this session, then graded by Grade all, then edited, shows 
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('1 test · 1 strong')
   expect(tree).not.toContain('shallow')
+})
+
+
+// What the grader reads of the code under test, language by language: the files it was sent
+// beside a test file Claude writes, by their path in the project, in the order sent
+// the test file is new, not there before Claude writes it
+const sentBeside = async ($: Engine, on: On, all: Record<string, string>, test: string): Promise<{ paths: string[]; prompt: string }> => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { [test]: content, ...files } = all
+  const { prompts } = project(on, files)
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  files[test] = content!
+  await $.tool.call({ tool: 'Write', file_path: `/proj/${test}`, content } as never)
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+  return { paths: [...prompts[0]!.matchAll(/^--- (.+) ---$/gm)].map(m => m[1]!), prompt: prompts[0]! }
+}
+
+test('a JS test\'s imports reach the grader by their extension, as .js naming the .ts source, or as a folder\'s index; four files at most, none a test file or empty', async ($, on) => {
+  const test = [
+    "import { f } from './f.js'",
+    "import { g } from './g.ts'",
+    "import { h } from './lib'",
+    "import { s } from './shared.test'",
+    "const e = require('./empty')",
+    "import { f as again } from './f.js'",
+    "import { m } from './more'",
+    "import { n } from './fifth'",
+    '',
+    "it('adds', () => { expect(f(1) + g(2)).toBe(3) })",
+    '',
+  ].join('\n')
+  const { paths, prompt } = await sentBeside($, on, {
+    'src/a.test.ts': test,
+    'src/f.ts': 'export const f = (n: number) => n // F_MARK\n',
+    'src/g.ts': 'export const g = (n: number) => n\n',
+    'src/lib/index.ts': 'export const h = 1\n',
+    'src/shared.test.ts': "it('shares', () => { expect(1).toBe(1) })\n",
+    'src/empty.ts': '  \n',
+    'src/more.ts': 'export const m = 1\n',
+    'src/fifth.ts': 'export const n = 1 // FIFTH_MARK\n',
+  }, 'src/a.test.ts')
+  expect(paths).toEqual(['src/f.ts', 'src/g.ts', 'src/lib/index.ts', 'src/more.ts'])
+  expect(prompt).toContain('export const f = (n: number) => n // F_MARK')
+  expect(prompt).not.toContain('FIFTH_MARK')
+})
+
+test('a Python test\'s from-imports reach the grader: relative ones beside it or above it, as a module or a package, and absolute ones at the root, in src/ or beside it', async ($, on) => {
+  const test = [
+    'from .helpers import make_cart',
+    'from ..shared import base',
+    'from shop.cart import Cart',
+    'from pricing import rate',
+    'from . import conftest',
+    '',
+    'def test_total():',
+    '    assert Cart([2, 3]).total() == 5',
+    '',
+  ].join('\n')
+  const { paths } = await sentBeside($, on, {
+    'tests/unit/test_cart.py': test,
+    'tests/unit/helpers.py': 'def make_cart(): ...\n',
+    'tests/shared/__init__.py': 'base = 1\n',
+    'src/shop/cart.py': 'class Cart: ...\n',
+    'tests/unit/pricing.py': 'rate = 2\n',
+  }, 'tests/unit/test_cart.py')
+  expect(paths).toEqual(['tests/unit/helpers.py', 'tests/shared/__init__.py', 'src/shop/cart.py', 'tests/unit/pricing.py'])
+})
+
+test('a Ruby test\'s require_relative files reach the grader, named with .rb or without', async ($, on) => {
+  const test = ["require 'json'", "require_relative '../../app/models/cart'", "require_relative 'support/money.rb'", '', 'class CartTest < Minitest::Test', '  def test_total', '    assert_equal 5, Cart.new([2, 3]).total', '  end', 'end', ''].join('\n')
+  const { paths } = await sentBeside($, on, {
+    'spec/models/cart_test.rb': test,
+    'app/models/cart.rb': 'class Cart; end\n',
+    'spec/models/support/money.rb': 'module Money; end\n',
+  }, 'spec/models/cart_test.rb')
+  expect(paths).toEqual(['app/models/cart.rb', 'spec/models/support/money.rb'])
+})
+
+test('a Go test\'s package reaches the grader: its other .go files, not its tests or what else the folder holds', async ($, on) => {
+  on('fs.list', async (_$, e) => {
+    if ((e as { path: string }).path !== '/proj/pkg/quota') throw new Error('missing')
+    const entry = (name: string, kind: 'file' | 'dir') => ({ name, kind, size: 1 })
+    return { value: [entry('quota.go', 'file'), entry('quota_test.go', 'file'), entry('store.go', 'file'), entry('store_test.go', 'file'), entry('README.md', 'file'), entry('internal.go', 'dir')] } as never
+  })
+  const { paths } = await sentBeside($, on, {
+    'pkg/quota/quota_test.go': 'package quota\n\nfunc TestRollover(t *testing.T) {\n\tif rollover(4) != 5 {\n\t\tt.Fatal("rollover")\n\t}\n}\n',
+    'pkg/quota/quota.go': 'package quota\n\nfunc rollover(n int) int { return n + 1 }\n',
+    'pkg/quota/store.go': 'package quota\n\ntype Store struct{}\n',
+    'pkg/quota/store_test.go': 'package quota\n\nfunc TestStore(t *testing.T) {}\n',
+    'pkg/quota/README.md': '# quota\n',
+  }, 'pkg/quota/quota_test.go')
+  expect(paths).toEqual(['pkg/quota/quota.go', 'pkg/quota/store.go'])
+})
+
+test('a Kotlin or Java test under src/test reaches the grader with the class it is named for under src/main', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the tests Claude writes, not there before
+  const written: Record<string, string> = {
+    'src/test/kotlin/shop/CartTest.kt': 'class CartTest {\n  @Test fun totals() { assertEquals(5, Cart(listOf(2, 3)).total()) }\n}\n',
+    'src/test/java/shop/CartTests.java': 'class CartTests {\n  @Test void totals() { assertEquals(5, new Cart(2, 3).total()); }\n}\n',
+  }
+  const files: Record<string, string> = { 'src/main/kotlin/shop/Cart.kt': 'class Cart(val items: List<Int>) // KOTLIN_CART\n', 'src/main/java/shop/Cart.java': 'class Cart {} // JAVA_CART\n' }
+  const { prompts } = project(on, files)
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  for (const [test, content] of Object.entries(written)) {
+    files[test] = content
+    await $.tool.call({ tool: 'Write', file_path: `/proj/${test}`, content } as never)
+    await clock.advance(10)
+  }
+  expect(prompts).toHaveLength(2)
+  expect(prompts[0]).toContain('--- src/main/kotlin/shop/Cart.kt ---\n```\nclass Cart(val items: List<Int>) // KOTLIN_CART')
+  expect(prompts[0]).not.toContain('JAVA_CART')
+  expect(prompts[1]).toContain('--- src/main/java/shop/Cart.java ---\n```\nclass Cart {} // JAVA_CART')
+})
+
+test('a Kotlin test outside src/test reaches the grader with no code under test, even with its class beside it', async ($, on) => {
+  const { paths, prompt } = await sentBeside($, on, {
+    'CartTest.kt': 'class CartTest {\n  @Test fun totals() { assertEquals(5, Cart(listOf(2, 3)).total()) }\n}\n',
+    'Cart.kt': 'class Cart(val items: List<Int>)\n',
+  }, 'CartTest.kt')
+  expect(paths).toEqual([])
+  expect(prompt).not.toContain('The code under test')
+})
+
+
+test('a grader call that ends with a reason and no status says that reason in the pane, and is not tried again', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: () => ({ isAnswered: false, reason: 'max-turns', usage: {} }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10_000)
+  expect(prompts).toHaveLength(1)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('The grader (haiku) gave no answer: max-turns.')
+})
+
+test('a grader call stopped while it waits to try again is not tried again, and the pane shows no grader error', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const overloaded = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: {} }
+  const { prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: () => overloaded })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+  await ui.press({ key: 'stopGrading' })
+  await clock.advance(10_000)
+  expect(prompts).toHaveLength(1)
+  expect((await ui.findAll({ type: 'Text' })).some(t => t.text.startsWith('The grader'))).toBe(false)
+})
+
+test('a confirm pass that leaves out a flagged test keeps the first pass\'s grade for it, and takes its own for the rest', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the confirm pass overturns one flag, and gives no grade it can read for the other
+  const confirm = (name: string) => (name === 'a shallow check' ? 'strong' : 'unknown') as never
+  const { confirms } = project(on, { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\nit('another shallow one', () => { expect(g).toBeTruthy() })\nit('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { confirm })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(ASKED(confirms.map(c => c.prompt))).toEqual(['a shallow check', 'another shallow one'])
+  expect(await verdictsDrawn(ui)).toEqual({ 'a shallow check': 'strong', 'another shallow one': 'shallow', adds: 'strong' })
+})
+
+test('a confirm pass that gets no answer leaves the first pass\'s flag standing, and the pane says the call failed', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the host refuses every form of the confirm call
+  const older = (r: Record<string, unknown>): boolean => JSON.stringify(r).includes('A first, quick pass flagged these')
+  project(on, { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\nit('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { older })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(await verdictsDrawn(ui)).toEqual({ 'a shallow check': 'shallow', adds: 'strong' })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('The grader (haiku) call failed: no implementation for model.complete')
+})
+
+test('a test file Grade all graded, written over by Claude with one test changed, has that test graded once more and marked modified, and the rest left be', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" }
+  const { prompts } = project(on, files)
+  // Write writes the file, as the real tool does once it runs
+  on('tool.call', async (_$, e) => {
+    const { file_path, content } = e as unknown as { file_path: string; content: string }
+    files[file_path.replace('/proj/', '')] = content
+    return ok as never
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(ASKED(prompts)).toEqual(['adds', 'subtracts'])
+
+  const content = files['src/a.test.ts']!.replace('toBe(3)', 'toEqual(3)')
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
+  await clock.advance(10)
+  expect(ASKED(prompts.slice(1))).toEqual(['adds'])
+  expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 2 strong · 1 modified"')
 })

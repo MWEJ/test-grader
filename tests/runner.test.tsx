@@ -14,3 +14,8 @@ test('a command is shown as typed, quoting what the shell would split', async ()
   expect(tailOf('a\n\n  \nb\nc\n', 2)).toBe('b\nc')
 })
 
+
+
+test('an RSpec test in a project with no Gemfile runs with rspec itself, at its line', async () => {
+  expect(runArgv({ rel: 'spec/a_spec.rb', kind: 'rb', plain: 'works', groups: ['Foo'], line: 4 }, {})).toEqual(['rspec', 'spec/a_spec.rb:4'])
+})

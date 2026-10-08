@@ -1319,7 +1319,7 @@ const regradeOnEvidence = async ($: EngineInterface, file: string, text: string,
   await update($, existing, r => ({
     ...r,
     results: r.results.some(t => t.file === file && t.name === name)
-      ? r.results.map(t => (t.file === file && t.name === name ? { ...t, ...judged, isPending: undefined } : t))
+      ? r.results.map(t => (t.file === file && t.name === name ? { ...t, ...judged, isPending: undefined, isUngraded: undefined } : t))
       : [...r.results, { file, name, ...(suite ? { suite } : {}), ...judged }],
   }))
   await update($, tests, list => list.map(t => (t.file === file && t.name === name && t.status !== 'pending' ? { ...t, status: 'done' as const, ...judged } : t)))
@@ -1667,8 +1667,10 @@ export const register: Register = (on, options) => {
       lastText.set(e.file_path, e.content)
       // a file written over: only the tests whose text changed are touched
       await refresh($, e.file_path, prior !== null && prior !== e.content ? changedCases(prior, e.content, e.file_path) : names)
-      // a file written afresh holds its old cases too: only the ones not tracked yet are new
-      const known = new Set((await read($, tests)).filter(t => t.file === e.file_path).map(t => t.name))
+      // a file written afresh holds its old cases too: only the ones not tracked yet, nor listed
+      // by Grade all, are new
+      const listed = [...(await read($, tests)), ...(await read($, existing)).results].filter(t => t.file === e.file_path)
+      const known = new Set(listed.map(t => t.name))
       const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
       if (fresh.length > 0) await track($, e.file_path, fresh)
     }

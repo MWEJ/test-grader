@@ -64,7 +64,7 @@ The grader is `haiku` by default: the alias, which Claude Code resolves to the H
 
 - **Strong unless shown otherwise.** The grader defaults to strong, and where it is unsure it answers strong. It judges a test against the whole file: one case is enough when other tests cover the edges, or when that case is all the test's name promises. It never marks a test down for code it cannot see.
 - **Shallow needs a named bug.** A shallow grade must name a bug the test would let through: an input, and the wrong result it would still pass. That bug is added to the reason, as the case to add. A shallow grade with none counts as strong.
-- **A flag is confirmed before it is told.** When a first, quick pass flags a test, a second, more careful call checks it: the second-look model when one is set, else the grader model at its own effort. The flag stands only if that call agrees, and its grade and reason are the ones given. Tests graded strong cost no second call.
+- **A flag is confirmed before it is told.** When a first, quick pass flags a test, a second, more careful call checks it: the second-look model when one is set, else the grader model at its own effort. The flag stands only if that call agrees, and its grade and reason are the ones given. If that call fails, the first grade stands, and the pane says the call failed. Tests graded strong cost no second call.
 - **A grade is for the text it read.** If a test's own code changes while it is being graded, by an outside edit, the grade is thrown away and the test is graded again on its new code. A change elsewhere in the file leaves the grade be.
 
 #### What the grader reads

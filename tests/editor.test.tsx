@@ -138,3 +138,95 @@ test('when nothing opens the file, the pane says so', async ($, on) => {
   expect(JSON.stringify(await ui.drawn())).toContain("Couldn't open src/e.test.ts in an editor: no such command")
 })
 
+
+
+// an EDITOR naming an editor that goes to a line, and the command that opens the test with it
+const NAMED: [string, string[]][] = [
+  ['zed', ['zed', `${E_FILE}:5`]],
+  ['subl -w', ['subl', `${E_FILE}:5`]],
+  ['/opt/idea/bin/idea64.sh', ['/opt/idea/bin/idea64.sh', '--line', '5', E_FILE]],
+]
+
+for (const [editor, opened] of NAMED) {
+  test(`an EDITOR of ${editor} opens the test at its line with ${opened[0]}`, async ($, on) => {
+    const { runs } = await openShallow($, on, { env: { EDITOR: editor }, editor: () => 0 })
+    expect(runs).toEqual([opened])
+  })
+}
+
+
+test('on Windows an EDITOR that fails falls back to start, with no registry asked', async ($, on) => {
+  const { runs } = await openShallow($, on, { env: { OS: 'Windows_NT', EDITOR: 'code' }, editor: argv => (argv[0] === 'code' ? 1 : 0) })
+  expect(runs).toEqual([
+    ['code', '--goto', `${E_FILE}:5`],
+    ['cmd', '/c', 'start', '', E_FILE],
+  ])
+})
+
+
+test('on Windows with no choice of the user\'s for the extension, its class\'s open command is the default app', async ($, on) => {
+  const exe = 'C:\\Program Files\\Sublime Text\\sublime_text.exe'
+  const { runs } = await openShallow($, on, {
+    env: { OS: 'Windows_NT' },
+    editor: argv => {
+      const asked = argv.join(' ')
+      if (asked.endsWith('\\.ts\\UserChoice /v ProgId')) return 1
+      if (asked === 'reg query HKCR\\.ts /ve') return { stdout: '\r\nHKEY_CLASSES_ROOT\\.ts\r\n    (Default)    REG_SZ    TypeScriptFile\r\n\r\n' }
+      if (asked === 'reg query HKCR\\TypeScriptFile\\shell\\open\\command /ve') return { stdout: `\r\nHKEY_CLASSES_ROOT\\TypeScriptFile\\shell\\open\\command\r\n    (Default)    REG_EXPAND_SZ    "${exe}" "%1"\r\n\r\n` }
+      return 0
+    },
+  })
+  expect(runs.at(-1)).toEqual([exe, `${E_FILE}:5`])
+})
+
+
+test('on Linux a VS Code fork in its own folder opens at the line through the command its product.json names', async ($, on) => {
+  const { runs } = await openShallow($, on, {
+    env: { HOME: '/home/m' },
+    editor: linux('codium.desktop'),
+    outside: {
+      '/usr/share/applications/codium.desktop': '[Desktop Entry]\nExec=/opt/vscodium/codium --no-sandbox %F\n',
+      '/opt/vscodium/resources/app/product.json': '{"applicationName": "codium"}',
+    },
+  })
+  expect(runs.at(-1)).toEqual(['/opt/vscodium/bin/codium', '--goto', `${E_FILE}:5`])
+})
+
+
+test('on Linux XDG_DATA_HOME is read ahead of ~/.local/share, and an Exec run through env opens its program', async ($, on) => {
+  const { runs } = await openShallow($, on, {
+    env: { HOME: '/home/m', XDG_DATA_HOME: '/data/m' },
+    editor: linux('zed.desktop'),
+    outside: {
+      '/data/m/applications/zed.desktop': '[Desktop Entry]\nExec=env BAMF_DESKTOP_FILE_HINT=/x GDK_BACKEND=x11 /usr/bin/zeditor %U\n',
+      '/home/m/.local/share/applications/zed.desktop': '[Desktop Entry]\nExec=/usr/bin/subl %F\n',
+    },
+  })
+  expect(runs.at(-1)).toEqual(['/usr/bin/zeditor', `${E_FILE}:5`])
+})
+
+
+test('on Linux with no HOME the system\'s applications folder names the default app', async ($, on) => {
+  const { runs } = await openShallow($, on, {
+    editor: linux('subl.desktop'),
+    outside: { '/usr/share/applications/subl.desktop': '[Desktop Entry]\nExec=subl %F\n' },
+  })
+  expect(runs.at(-1)).toEqual(['subl', `${E_FILE}:5`])
+})
+
+
+test('when nothing opens the file and none says why, the pane gives the last exit code', async ($, on) => {
+  const { ui } = await openShallow($, on, { editor: argv => (argv[0] === 'osascript' ? { stdout: '' } : { exitCode: 2 }) })
+  expect(JSON.stringify(await ui.drawn())).toContain("Couldn't open src/e.test.ts in an editor: exit 2")
+})
+
+
+test('when no command can be started, the pane gives the reason the last one could not', async ($, on) => {
+  const { ui } = await openShallow($, on, {
+    editor: () => {
+      throw new Error('spawn ENOENT')
+    },
+  })
+  // the reason is the host's own: here the test kit's, which has no command to run
+  expect(JSON.stringify(await ui.drawn())).toContain("Couldn't open src/e.test.ts in an editor: no implementation for process.run")
+})

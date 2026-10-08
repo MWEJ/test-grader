@@ -1,4 +1,5 @@
-import { TEST_FILE, casesIn } from '../hooks/discovery'
+import { TEST_FILE, caseLine, caseNames, casesIn, changedCases } from '../hooks/discovery'
+import { caseTextOf } from '../hooks/excerpt'
 import { expect, mock, test } from 'claude-code/testing'
 import { CONTENT, mount, project, ok, ASKED, DISCOVERED } from './helpers'
 
@@ -94,5 +95,92 @@ test('source files of each language are not test files', async () => {
   for (const file of ['src/add.ts', 'pkg/add.go', 'app/models/user.rb', 'src/lib.rs', 'src/main/java/Foo.java', 'Foo.cs', 'src/Foo.php', 'Sources/Foo.swift', 'add.py']) {
     expect([file, TEST_FILE.test(file)]).toEqual([file, false])
   }
+})
+
+
+// Two cases of one name, one inside a group and one after it: the group ends where its block
+// does, so only the first is named by it. A line inside the group that holds a brace in text,
+// or code that looks like text, must not move that end
+const TWINS: [string, string, string][] = [
+  ['a JS string with an escaped quote', 'src/a.test.ts', "describe('g', () => {\n  const s = 'it\\'s {'\n  it('same', () => {})\n})\nit('same', () => {})\n"],
+  ['a JS regex after return', 'src/a.test.ts', "describe('g', () => {\n  const opens = (s) => { return /[{]/.test(s) }\n  it('same', () => {})\n})\nit('same', () => {})\n"],
+  ['a JS regex with a slash in a class', 'src/a.test.ts', "describe('g', () => {\n  const r = /[/{]/\n  it('same', () => {})\n})\nit('same', () => {})\n"],
+  ['a Rust char literal', 'tests/a.rs', "mod g {\n    fn open() -> char { '{' }\n    #[test]\n    fn same() {}\n}\n#[test]\nfn same() {}\n"],
+  ['a Rust escaped char literal', 'tests/a.rs', "mod g {\n    fn quote() -> char { '\\\"' }\n    #[test]\n    fn same() {}\n}\n#[test]\nfn same() {}\n"],
+  ['a Rust lifetime', 'tests/a.rs', "mod g {\n    fn first<'a>(s: &'a str) -> &'a str {\n        s\n    }\n    #[test]\n    fn same() {}\n}\n#[test]\nfn same() {}\n"],
+]
+for (const [what, file, text] of TWINS) {
+  test(`a group holding ${what} ends at its own close`, () => {
+    expect(caseNames(text, file)).toEqual(['g › same', 'same'])
+  })
+}
+
+
+test('a test written inside a Rust raw string is not a test, however many hashes close it', () => {
+  const text = 'const SRC: &str = r##"\nfn a() { "# }\n#[test]\nfn in_raw() {}\n"##;\n\n#[test]\nfn real() {}\n'
+  expect(caseNames(text, 'tests/raw.rs')).toEqual(['real'])
+})
+
+test("a test written inside a Python ''' string is not a test", () => {
+  const text = "FIXTURE = '''\ndef test_in_fixture():\n    pass\n'''\n\ndef test_real():\n    assert add(1, 2) == 3\n"
+  expect(caseNames(text, 'tests/test_a.py')).toEqual(['test_real'])
+})
+
+test('a PHP method named under @test inside a comment is not a test', () => {
+  const text = '<?php\nclass FooTest extends TestCase {\n  /*\n   * @test\n   * function commented_out() {}\n   */\n  /** @test */\n  public function it_works() {}\n}\n'
+  expect(caseNames(text, 'tests/FooTest.php')).toEqual(['it_works'])
+})
+
+// a string, comment or template left open runs to the end of the file: what follows is text
+const LEFT_OPEN: [string, string, string, string][] = [
+  ['JS template', 'src/a.test.ts', "it('real', () => {})\nconst s = `\nit('in template', () => {})\n", 'real'],
+  ['JS block comment', 'src/a.test.ts', "it('real', () => {})\n/*\nit('in comment', () => {})\n", 'real'],
+  ['Python triple-quoted string', 'tests/test_a.py', 'def test_real():\n    pass\n\nDOC = """\ndef test_in_doc():\n    pass\n', 'test_real'],
+  ['Go raw string', 'a_test.go', 'func TestReal(t *testing.T) {}\nconst s = `\nfunc TestInRaw(t *testing.T) {}\n', 'TestReal'],
+  ['Rust raw string', 'tests/a.rs', '#[test]\nfn real() {}\nconst S: &str = r#"\n#[test]\nfn in_raw() {}\n', 'real'],
+]
+for (const [what, file, text, name] of LEFT_OPEN) {
+  test(`a ${what} left open at the end of a file hides the tests after it`, () => {
+    expect(caseNames(text, file)).toEqual([name])
+  })
+}
+
+
+test("a Python test's text runs to the next line indented no deeper, past a string at the margin", () => {
+  const text = 'def test_a():\n    s = """\nnot code\n"""\n    assert s\n\nHELPER = 2\n\ndef test_b():\n    assert HELPER == 2\n'
+  expect(caseTextOf(text, 'test_a', 'tests/test_a.py')).toBe('def test_a():\n    s = """\nnot code\n"""\n    assert s')
+})
+
+test('what sits between two Python tests goes with the one below it', () => {
+  const text = 'def test_a():\n    assert 1\n\nHELPER = 2\n\ndef test_b():\n    assert HELPER == 2\n'
+  expect(caseTextOf(text, 'test_b', 'tests/test_a.py')).toBe('HELPER = 2\n\ndef test_b():\n    assert HELPER == 2')
+})
+
+test('an edit to the body of a Python test followed by a blank line names that test', () => {
+  const before = 'def test_a():\n    assert f(1) == 1\n\ndef test_b():\n    assert f(2) == 2\n'
+  const after = 'def test_a():\n    assert f(1) == 100\n\ndef test_b():\n    assert f(2) == 2\n'
+  expect(changedCases(before, after, 'tests/test_a.py')).toEqual(['test_a'])
+})
+
+test("a Ruby test's text holds its closing end", () => {
+  const text = 'class FooTest < Minitest::Test\n  def test_a\n    assert true\n  end\n\n  HELPER = 1\n\n  def test_b\n    assert HELPER\n  end\nend\n'
+  expect(caseTextOf(text, 'test_a', 'test/foo_test.rb')).toBe('  def test_a\n    assert true\n  end')
+})
+
+test("a Go test's text runs to its closing brace, past a brace in a string", () => {
+  const text = 'func TestA(t *testing.T) {\n\tif f() != 1 { t.Fatal("}") }\n}\n\nfunc helper() int { return 2 }\n\nfunc TestB(t *testing.T) {}\n'
+  expect(caseTextOf(text, 'TestA', 'a_test.go')).toBe('func TestA(t *testing.T) {\n\tif f() != 1 { t.Fatal("}") }\n}')
+})
+
+test('a helper between two Go tests goes with the one below it', () => {
+  const text = 'func TestA(t *testing.T) {}\n\nfunc helper() int { return 2 }\n\nfunc TestB(t *testing.T) {}\n'
+  expect(caseTextOf(text, 'TestB', 'a_test.go')).toBe('\nfunc helper() int { return 2 }\n\nfunc TestB(t *testing.T) {}')
+})
+
+
+test('a case opens at its own line; one no longer in the file at the top', () => {
+  const text = "import { add } from './add'\n\nit('adds', () => {})\n"
+  expect(caseLine(text, 'adds', 'src/a.test.ts')).toBe(3)
+  expect(caseLine(text, 'gone', 'src/a.test.ts')).toBe(1)
 })
 

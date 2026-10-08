@@ -59,9 +59,9 @@ export const CASE_PATTERNS: Record<Kind, Pattern[]> = {
     // a Go suite's test: a Test method of the suite type (testify)
     open(/\bfunc\s+\(\s*\w+\s+\*?(\w+)\s*\)\s+(Test\w+)\s*\(/g),
   ],
-  py: [open(/^\s*(?:async\s+)?def\s+(test_\w+)/gm)],
+  py: [open(/^[ \t]*(?:async\s+)?def\s+(test_\w+)/gm)],
   rb: [
-    open(/^\s*def\s+(test_\w+)/gm),
+    open(/^[ \t]*def\s+(test_\w+)/gm),
     // RSpec's it, specify, example, scenario; Rails' and minitest/spec's test "…" do
     open(new RegExp(String.raw`^[ \t]*(?:it|specify|example|scenario|test)\s*\(?\s*(['"])((?:\\.|(?!\1)[^\\\n])+)\1`, 'gm')),
   ],

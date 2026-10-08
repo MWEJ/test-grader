@@ -225,3 +225,162 @@ test('a Go coverage run that wrote no profile falls back to the mean of the figu
   await clock.advance(10)
   expect(notes).toEqual(['Coverage run (test-grader) finished: statements 50% (go test -cover).'])
 })
+
+
+// the coverage figures drawn, each label followed by its figure
+const FIGURES = ['Lines', 'Statements', 'Branches', 'Functions']
+const figuresDrawn = async (ui: Awaited<ReturnType<typeof mount>>): Promise<string[]> => {
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.trim() !== '')
+  return texts.flatMap((t, i) => (FIGURES.includes(t) ? [t, texts[i + 1]!] : []))
+}
+
+test('an lcov.info report shows its lines, branches and functions, and each folder its lines, a file named from the root or from the project alike', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // src/a/x.ts named by its full path: 9 of 10 lines; src/b/y.ts from the project: 3 of 10
+  const lcov = 'SF:/proj/src/a/x.ts\nFNF:2\nFNH:2\nBRF:4\nBRH:1\nLF:10\nLH:9\nend_of_record\nSF:src/b/y.ts\nFNF:2\nFNH:1\nLF:10\nLH:3\nend_of_record\n'
+  const files: Record<string, string> = {
+    'src/a/x.test.ts': "it('x', () => { expect(x()).toBe(1) })\n",
+    'src/b/y.test.ts': "it('y', () => { expect(y()).toBe(1) })\n",
+    'coverage/lcov.info': lcov,
+  }
+  project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  // lines 12 of 20, branches 1 of 4, functions 3 of 4; lcov has no statements
+  expect(await figuresDrawn(ui)).toEqual(['Lines', '60%', 'Branches', '25%', 'Functions', '75%'])
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('"90% lines"')
+  expect(tree).toContain('"30% lines"')
+})
+
+
+test('a Cobertura coverage.xml from a pytest run shows its line and branch rates as lines and branches', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'pytest.ini': '[pytest]\n', 'tests/test_cart.py': 'def test_total():\n    assert total([2, 3]) == 5\n' }
+  const { notes, runs } = project(on, files, {
+    editor: () => {
+      files['coverage.xml'] = '<?xml version="1.0" ?>\n<coverage version="7.4" line-rate="0.875" branch-rate="0.5" lines-valid="8" lines-covered="7">\n</coverage>\n'
+      return 0
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(runs).toEqual([['python3', '-m', 'pytest', '--cov', '--cov-report=xml']])
+  expect(await figuresDrawn(ui)).toEqual(['Lines', '87.5%', 'Branches', '50%'])
+  expect(notes).toEqual(['Coverage run (test-grader) finished: lines 87.5% · branches 50% (coverage.xml).'])
+})
+
+
+for (const marker of ['pytest.ini', 'pyproject.toml', 'setup.cfg']) {
+  test(`a Python project marked by ${marker} measures its coverage with pytest --cov`, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const { runs } = project(on, { [marker]: '', 'tests/test_cart.py': 'def test_total():\n    assert total([2, 3]) == 5\n' }, { editor: () => 0 })
+    await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+    await (await mount($)).press({ key: 'run' })
+    await clock.advance(10)
+    expect(runs).toEqual([['python3', '-m', 'pytest', '--cov', '--cov-report=xml']])
+  })
+}
+
+
+test('a package.json naming vitest runs vitest\'s coverage, ahead of jest it also names', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'package.json': '{ "devDependencies": { "jest": "^29.0.0", "vitest": "^2.0.0" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  const { runs, notes } = project(on, files, { editor: () => ({ stdout: 'FAIL src/a.test.ts', exitCode: 1 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(runs).toEqual([['npx', 'vitest', 'run', '--coverage', '--coverage.reporter=json-summary', '--coverage.reporter=lcov']])
+  expect(notes[0]!.split('\n')[0]).toBe('Coverage run (test-grader) failed: npx vitest run --coverage exited with 1. The last 1 lines it printed:')
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('Tests exited with 1.')
+})
+
+
+test('Run coverage in a project that has since lost its way to measure it runs nothing, and the pane says so', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...JEST_PROJECT }
+  const { runs } = project(on, files, { editor: () => 0 })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  delete files['package.json']
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(runs).toEqual([])
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('No coverage script, jest, vitest, pytest or Go project found here.')
+})
+
+
+test('a coverage command that cannot be started shows why in the pane, and can be run again', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // a command the host will not start: the run rejects
+  project(on, JEST_PROJECT, {
+    editor: () => {
+      throw new Error('spawn npx ENOENT')
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  // the reason is the host's own, whole: here the test kit's, which has no command to run
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('no implementation for process.run')
+  expect(texts).not.toContain('Coverage run failed.')
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+})
+
+
+test('Run coverage pressed again while a run is under way starts no second run', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // a jest project whose coverage run holds until it is let go
+  let finish = () => {}
+  const started: string[][] = []
+  // the session, as the project helper answers it, with no process of its own
+  on('session.start', async () => ({ cwd: '/proj' }) as never)
+  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  on('command.register', async () => ({ value: {} }) as never)
+  on('tool.register', async (_$, e) => ({ value: { tool: `mcp__test-grader__${(e as { name: string }).name}` } }) as never)
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('fs.stat', async (_$, e) => {
+    if ((e as { path: string }).path !== '/proj/package.json') throw new Error('missing')
+    return { value: { mtimeMs: 1, size: 1, isFile: true, isDirectory: false } } as never
+  })
+  on('fs.read', async () => ({ value: JEST_PROJECT['package.json'] }) as never)
+  on('process.run', async (_$, e) => {
+    const { argv } = e as { argv: string[] }
+    if (argv[0] === 'git') return { value: { stdout: '', stderr: '', exitCode: 0 } } as never
+    started.push(argv)
+    await new Promise<void>(r => (finish = r))
+    return { value: { stdout: '', stderr: '', exitCode: 0 } } as never
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  // the press lasts as long as the run
+  const first = ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(started).toHaveLength(1)
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Running…')
+
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(started).toHaveLength(1)
+
+  // once it ends, the button runs again
+  finish()
+  await first
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+  const second = ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(started).toHaveLength(2)
+  finish()
+  await second
+})
