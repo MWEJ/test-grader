@@ -266,9 +266,11 @@ test('Grade all tests again grades only the files changed since their last gradi
 
   expect(prompts).toHaveLength(3)
   expect(prompts[2]).toContain('src/a.test.ts')
+  // in the changed file, adds is as it was graded: it keeps its grade, and the new test alone is graded
+  expect(prompts[2]).toContain('Review ONLY these test cases: ["subtracts"]')
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('3 tests · 2 strong · 1 shallow')
-  expect(tree).toContain('2 graded · 1 remembered')
+  expect(tree).toContain('1 graded · 2 remembered')
 })
 
 
@@ -288,8 +290,9 @@ test('a finished Grade all tests saves grades a later session reads back whole, 
   // what a later session reads back: every grade, its words, and each file's fingerprint
   expect(unkeep(store['grades:/proj'] as never)).toEqual({
     results: [
-      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because.' },
-      { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'shallow because. It would miss: a wrong edge.' },
+      // with each test's own text as graded, fingerprinted: a later run keeps its grade while that is the same
+      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because.', textOf: fingerprint(files['src/a.test.ts']!.trimEnd()) },
+      { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'shallow because. It would miss: a wrong edge.', textOf: fingerprint(files['src/b.test.ts']!.trimEnd()) },
     ],
     hashes: { '/proj/src/a.test.ts': fingerprint(files['src/a.test.ts']!), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) },
     finishedAt: 1_000_001,
@@ -362,10 +365,10 @@ test('grades too many to keep whole are kept without their summaries; failing th
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   // whole, the value runs past the limit; lean, it fits
-  room.limit = 130
+  room.limit = 160
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect((store['grades:/proj'] as { files: Record<string, { tests: string[][] }> }).files['/proj/src/a.test.ts']!.tests).toEqual([['adds', 'g', '', 'strong because.']])
+  expect((store['grades:/proj'] as { files: Record<string, { tests: string[][] }> }).files['/proj/src/a.test.ts']!.tests).toEqual([['adds', 'g', '', 'strong because.', '', '', '', '', fingerprint(files['src/a.test.ts']!.trimEnd())]])
   expect(logs).toContain('test-grader: the grades were kept without their summaries: test-grader: $.store.set: the store is full')
   expect(JSON.stringify(await ui.drawn())).not.toContain('could not be saved')
 
@@ -698,7 +701,7 @@ for (const [label, ignored, says] of [
   })
 }
 
-test('Regrade all shows the grader the grades an unchanged file had, and a changed file none', async ($, on) => {
+test('Regrade all shows the grader the grades an unchanged file had to keep, and a changed file\'s as the grades before its change', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = {
     'src/same.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
@@ -716,7 +719,10 @@ test('Regrade all shows the grader the grades an unchanged file had, and a chang
   await clock.advance(10)
   const firstOf = (file: string) => prompts.slice(before).find(p => p.includes(`Test file: /proj/src/${file}`) && !p.includes('A first, quick pass flagged these'))!
   expect(firstOf('same.test.ts')).toContain('These were graded before, on this same text: [{"name":"a shallow check","verdict":"shallow","reason":"shallow because. It would miss: a wrong edge."}]')
-  expect(firstOf('edited.test.ts')).not.toContain('These were graded before')
+  const edited = firstOf('edited.test.ts')
+  expect(edited).not.toContain('on this same text')
+  expect(edited).toContain('These were graded before their text last changed: [{"name":"adds","verdict":"strong","reason":"strong because."}]')
+  expect(edited).toContain('Where a change met the earlier concern, say so in reason.')
 })
 
 test("a run's note names the files changed since their last grading, and those graded for the first time, but not on a project's first run", async ($, on) => {

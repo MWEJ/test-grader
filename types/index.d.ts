@@ -18,7 +18,11 @@ export type TrackedTest = {
   evidence?: string
   /** the test's own text, fingerprinted, when the evidence was accepted: the verdict holds while it is unchanged */
   evidenceOf?: string
+  /** its grade before an edit had it graded again, for the fixer to see whether that concern was met */
+  before?: Before
 }
+/** a grade a test had before it was graded again */
+export type Before = { verdict: Verdict; reason?: string }
 
 export type Coverage = {
   lines: number | null
@@ -34,7 +38,9 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; confidence?: Confidence; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string; evidenceOf?: string }
+// textOf: the test's own text, fingerprinted, when it was graded: a changed file's test whose own text is the same keeps its grade
+// before: its grade before it was last graded again
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; confidence?: Confidence; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string; evidenceOf?: string; textOf?: string; before?: Before }
 
 /** Grade all tests: how far a run has got, and what the last one found */
 // hashes: each graded file's contents, as fingerprinted when its results were made
@@ -63,7 +69,7 @@ export type ExistingRun = {
 }
 
 /** a test's grade as Claude is told it */
-export type GradeReport = { file: string; name: string; verdict?: Verdict; reason?: string }
+export type GradeReport = { file: string; name: string; verdict?: Verdict; reason?: string; before?: Before }
 
 export type CoverageRun = { state: 'idle' | 'running' | 'failed'; message?: string }
 

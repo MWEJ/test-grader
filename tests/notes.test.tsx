@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { mount, project, FOLLOW, appended, ok, E_TEST, EVIDENCE_TOOL, GRADES_TOOL, GRADED, JEST_PROJECT, SUMMARY, turns, turnStart, turnEnd } from './helpers'
+import { mount, project, FOLLOW, appended, ok, E_TEST, EVIDENCE_TOOL, GRADES_TOOL, GRADED, JEST_PROJECT, SUMMARY, turns, turnStart, turnEnd, TURN } from './helpers'
 
 // the kit answers every append "no implementation": a note that does not go through
 test('a note the session does not take says so in the pane, and why', async ($, on) => {
@@ -281,3 +281,99 @@ test('after a turn that leaves flagged tests it wrote, the prompt box offers to 
   expect(suggested).toEqual(['Fix the shallow test you wrote this session (test_grades lists them)', 'Fix the 2 flagged tests you wrote this session (test_grades lists them)'])
 })
 
+
+
+test('a test flagged again after an edit, for another reason, shows its grade before in the note, and the grader was told that grade', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  // shallow as written; once it asserts truthiness, brittle
+  const { notes, prompts } = project(on, files, { rule: (_name, prompt) => (prompt.includes('toBeTruthy') ? 'brittle' : 'shallow') })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const before = files['src/a.test.ts']!
+  files['src/a.test.ts'] = "it('a shallow check', () => { expect(f()).toBeTruthy() })\n"
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: before, new_string: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+
+  expect(prompts.at(-1)).toContain('These were graded before their text last changed: [{"name":"a shallow check","verdict":"shallow","reason":"shallow because. It would miss: a wrong edge."}]')
+  expect(notes.at(-1)).toContain('- brittle · src/a.test.ts · a shallow check — brittle because.\n  Before: shallow — shallow because. It would miss: a wrong edge.')
+})
+
+// a subagent at work, as the session lists it
+const AT_WORK = [{ id: 'a1', description: 'fix tests', type: 'general-purpose', status: 'running' }]
+
+test('grades of tests written while a subagent works wait for it to finish, then go as one note', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('turn.complete', () => ({ text: '' }) as never)
+  const files: Record<string, string> = {}
+  const { notes } = project(on, files)
+  let agents: unknown[] = AT_WORK
+  on('agent.list', async () => ({ value: agents }) as never)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  const write = async (rel: string, content: string) => {
+    files[rel] = content
+    await $.tool.call({ tool: 'Write', file_path: `/proj/${rel}`, content } as never)
+    await clock.advance(10)
+  }
+  await write('src/a.test.ts', "it('a shallow check', () => { expect(f).toBeDefined() })\n")
+  await write('src/b.test.ts', "it('does nothing', () => {})\n")
+  expect(notes).toEqual([])
+
+  // the subagent's turn ends: it no longer works, and the grades go
+  agents = []
+  await $.turn.complete(TURN)
+  await clock.advance(10)
+  expect(notes).toHaveLength(1)
+  expect(notes[0]).toContain('- hollow · src/b.test.ts · does nothing')
+  expect(notes[0]).toContain('- shallow · src/a.test.ts · a shallow check')
+})
+
+test('grades held for a subagent go after ten minutes even while it still works', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('turn.complete', () => ({ text: '' }) as never)
+  const files: Record<string, string> = {}
+  const { notes } = project(on, files)
+  on('agent.list', async () => ({ value: AT_WORK }) as never)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  files['src/a.test.ts'] = "it('does nothing', () => {})\n"
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+
+  await clock.advance(9 * 60_000)
+  await $.turn.complete(TURN)
+  expect(notes).toEqual([])
+  await clock.advance(60_000)
+  await $.turn.complete(TURN)
+  expect(notes).toHaveLength(1)
+})
+
+
+test('a test Claude wrote, flagged and edited, shows its grade before when it is flagged again, and none once strong', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  const { notes, prompts } = project(on, files, { rule: (_name, prompt) => (prompt.includes('toBe(42)') ? 'strong' : prompt.includes('toBeTruthy') ? 'brittle' : 'shallow') })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  const edit = async (to: string) => {
+    const from = files['src/a.test.ts']!
+    files['src/a.test.ts'] = to
+    await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: from, new_string: to } as never)
+    await clock.advance(10)
+  }
+
+  await edit("it('a shallow check', () => { expect(f()).toBeTruthy() })\n")
+  expect(prompts.at(-1)).toContain('These were graded before their text last changed: [{"name":"a shallow check","verdict":"shallow"')
+  expect(notes.at(-1)).toContain('— brittle because.\n  Before: shallow — shallow because. It would miss: a wrong edge.')
+
+  await edit("it('a shallow check', () => { expect(f()).toBe(42) })\n")
+  expect(notes.at(-1)).toBe('Now graded strong (test-grader):\n- strong · src/a.test.ts · a shallow check')
+})

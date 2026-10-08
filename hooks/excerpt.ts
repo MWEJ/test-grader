@@ -67,10 +67,14 @@ export const othersOf = (source: string, names: string[], file: string): string[
 
 // a case's own text, from its start to the next case's (a looped case's: its loop's); null
 // when the file no longer has it
-export const caseTextOf = (source: string, name: string, file: string): string | null => {
+export const caseTextOf = (source: string, name: string, file: string): string | null => caseTextsOf(source, file)(name)
+// the same for many names of one file, its cases found once
+export const caseTextsOf = (source: string, file: string): ((name: string) => string | null) => {
   const starts = caseStarts(source, file)
-  const i = starts.findIndex(s => fits(s.name, name))
-  return i < 0 ? null : source.slice(starts[i]!.at, starts[i + 1]?.at ?? source.length).trimEnd()
+  return name => {
+    const i = starts.findIndex(s => fits(s.name, name))
+    return i < 0 ? null : source.slice(starts[i]!.at, starts[i + 1]?.at ?? source.length).trimEnd()
+  }
 }
 
 // The asked names that are cases a loop generates, each set under the loop's own name in the

@@ -130,3 +130,16 @@ test('test_grades names the files the last run found changed, within the path as
   expect(await grades({})).toContain('The last run graded again, changed since their last grading: src/a/x.test.ts.')
   expect(await grades({ path: 'src/b' })).not.toContain('changed since')
 })
+
+
+test('test_grade on a changed file shows, for a test flagged anew, its grade before the change', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  project(on, files, { rule: (_name, prompt) => (prompt.includes('toBeTruthy') ? 'brittle' : 'shallow') })
+  await start($)
+  await askGrade($, clock)
+
+  files['src/a.test.ts'] = "it('a shallow check', () => { expect(f()).toBeTruthy() })\n"
+  const answer = await askGrade($, clock)
+  expect(answer).toContain('- brittle · src/a.test.ts · a shallow check — brittle because.\n  Before: shallow — shallow because. It would miss: a wrong edge.')
+})
