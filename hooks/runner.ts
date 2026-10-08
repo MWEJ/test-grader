@@ -1,5 +1,6 @@
 // The command that runs one test, by its language and the project's runner: pure, so the
 // engine calls stay in register.tsx
+import { isTemplate, templateSource } from './discovery'
 import type { Kind } from './discovery'
 
 // what the project runs its tests with, as found at its root
@@ -27,6 +28,8 @@ export const goTagsOf = (text: string): string[] => {
 
 const SPEC = /\.spec\.[cm]?[jt]sx?$/
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+// a name as a runner's pattern: a loop's template matches each of its cases
+const patternOf = (name: string): string => (isTemplate(name) ? templateSource(name) : escapeRegex(name))
 // a test's class: its innermost group, else the file's name less its extension
 const classOf = (t: RunTarget): string => t.groups[t.groups.length - 1] ?? t.rel.slice(t.rel.lastIndexOf('/') + 1).replace(/\.\w+$/, '')
 
@@ -35,20 +38,20 @@ export const runArgv = (t: RunTarget, runners: Runners): string[] | null => {
   const dir = t.rel.includes('/') ? t.rel.slice(0, t.rel.lastIndexOf('/')) : '.'
   switch (t.kind) {
     case 'js': {
-      const full = escapeRegex([...t.groups, t.plain].join(' '))
+      const full = [...t.groups.map(escapeRegex), patternOf(t.plain)].join(' ')
       if (runners.js === 'vitest') return ['npx', 'vitest', 'run', t.rel, '-t', `^${full}$`]
       if (runners.js === 'jest') return ['npx', 'jest', t.rel, '-t', `^${full}$`]
       // node's own runner, for a package whose scripts run node --test; its Playwright, if it has
       // one, runs the .spec files
       if (runners.js === 'node' && !(runners.hasPlaywright && SPEC.test(t.rel)))
-        return ['node', ...(runners.isTsx ? ['--import', 'tsx'] : []), '--test', '--test-name-pattern', `${escapeRegex(t.plain)}$`, t.rel]
+        return ['node', ...(runners.isTsx ? ['--import', 'tsx'] : []), '--test', '--test-name-pattern', `${patternOf(t.plain)}$`, t.rel]
       if (runners.js === 'playwright' || runners.js === 'node') return ['npx', 'playwright', 'test', `${t.rel}:${t.line}`]
       return null
     }
     case 'py':
       return ['python3', '-m', 'pytest', '-q', [t.rel, ...t.groups, t.plain].join('::')]
     case 'go':
-      return ['go', 'test', `./${dir}`, '-count=1', ...(t.tags?.length ? ['-tags', t.tags.join(',')] : []), '-run', t.suite ? `/^${t.plain}$` : `^${t.plain}$`]
+      return ['go', 'test', `./${dir}`, '-count=1', '-v', ...(t.tags?.length ? ['-tags', t.tags.join(',')] : []), '-run', t.suite ? `/^${t.plain}$` : `^${t.plain}$`]
     case 'rb':
       if (t.rel.endsWith('_spec.rb')) return [...(runners.isBundled ? ['bundle', 'exec'] : []), 'rspec', `${t.rel}:${t.line}`]
       return ['ruby', '-Itest', t.rel, '-n', `/^${escapeRegex(t.plain.replace(/ /g, '_'))}$|^test_${escapeRegex(t.plain.replace(/ /g, '_'))}$/`]
@@ -93,8 +96,18 @@ export const PROJECT_MARKS: Partial<Record<Kind, string[]>> = {
 export const isSetupFailure = (tail: string): boolean =>
   /cannot find main module|go\.mod file not found|no Go files in|command not found|No tests found|no tests ran|no tests to run|no test files|ENOENT|Cannot find module|could not be found|not recognized as an internal or external command/i.test(tail)
 
-// a run's output that says it ran no test at all, though it exited 0: Go's [no tests to run]
-export const isNoneRun = (output: string): boolean => /\[no tests to run\]|testing: warning: no tests to run|^ok\s.*\[no test files\]/m.test(output)
+// a run's output that says it ran no test at all, though it may have exited 0: every test
+// skipped or none matched. Go's [no tests to run], or -v lines with no test passed or failed (a
+// t.Skip); Jest's and Vitest's Tests line, and pytest's summary, with nothing passed or failed;
+// Node's runner's pass 0 and fail 0
+const NOTHING_PASSED = '(?![^\\n]*\\b\\d+ (?:passed|failed)\\b)'
+export const isNoneRun = (output: string): boolean =>
+  /\[no tests to run\]|testing: warning: no tests to run|^ok\s.*\[no test files\]/m.test(output) ||
+  (/^=== RUN /m.test(output) && !/^\s*--- (?:PASS|FAIL):/m.test(output)) ||
+  new RegExp(`^Tests:\\s+${NOTHING_PASSED}[^\\n]*\\btotal\\b`, 'm').test(output) ||
+  new RegExp(`^\\s*Tests\\s+${NOTHING_PASSED}[^\\n]*\\(\\d+\\)\\s*$`, 'm').test(output) ||
+  new RegExp(`^=+ ${NOTHING_PASSED}[^\\n]*\\bin [\\d.]+s\\b[^\\n]*=+$`, 'm').test(output) ||
+  (/^[#ℹ] pass 0$/m.test(output) && /^[#ℹ] fail 0$/m.test(output))
 
 export const isBuildFailure = (tail: string): boolean =>
   /\[build failed\]|\[setup failed\]|^# \S+\n\S+\.go:\d+:\d+: |\berror TS\d+:|\bSyntaxError\b|\bIndentationError\b|\berror\[E\d+\]|COMPILATION ERROR|Compilation failed|\berror CS\d+:|\berror: cannot find symbol|^e: .*\.kt:/m.test(tail)

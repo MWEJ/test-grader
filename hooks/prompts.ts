@@ -110,6 +110,7 @@ export const VERIFY_SCHEMA = {
     find: { type: 'string', description: 'Exact text in the mutate file (the code under test, never the test file), found there exactly once, to replace' },
     replace: { type: 'string', description: 'What to put in its place: a plausible bug' },
     siblings: { type: 'boolean', description: `Also run the file's other tests with the mutation (up to ${VERIFY_SIBLINGS}) and report which of them fail too: whether this test alone catches the change` },
+    env: { type: 'object', additionalProperties: { type: 'string' }, description: "Variables for the runs, over the project's .test-grader-env: an emulator's address a test skips without, say" },
   },
   required: ['file', 'test', 'mutate', 'find', 'replace'],
 }

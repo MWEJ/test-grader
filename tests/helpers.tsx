@@ -31,7 +31,7 @@ export const mount = ($: Engine, rows = 60) =>
 export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict; cwd?: () => string; slow?: { paths: Set<string>; until: Promise<void> } }
 
 // a command's answer: its exit code, or what it printed too
-export type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
+export type Shell = (argv: string[], env?: Record<string, string>) => number | { stdout?: string; stderr?: string; exitCode?: number }
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
 export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm, cwd, slow }: Project = {}) {
@@ -96,7 +96,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
       // a command that cannot start (editor throws) is refused with its error, as the host refuses one
       let said: ReturnType<Shell>
       try {
-        said = editor(argv)
+        said = editor(argv, (e as { init?: { env?: Record<string, string> } }).init?.env ?? {})
       } catch (err) {
         return { deny: err instanceof Error ? err.message : String(err) } as never
       }
@@ -508,8 +508,8 @@ export const RUNS: [string, RunTarget, Runners, string[] | null][] = [
   ['node --test', { rel: 'src/a.test.js', kind: 'js', plain: 'adds', groups: [], line: 3 }, { js: 'node' }, ['node', '--test', '--test-name-pattern', 'adds$', 'src/a.test.js']],
   ['a .spec file beside node --test, by Playwright', { rel: 'tests/a.spec.ts', kind: 'js', plain: 'logs in', groups: [], line: 7 }, { js: 'node', hasPlaywright: true }, ['npx', 'playwright', 'test', 'tests/a.spec.ts:7']],
   ['pytest in a class', { rel: 'tests/test_a.py', kind: 'py', plain: 'test_a', groups: ['TestA'], line: 2 }, {}, ['python3', '-m', 'pytest', '-q', 'tests/test_a.py::TestA::test_a']],
-  ['go', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestA', groups: [], line: 1 }, {}, ['go', 'test', './pkg', '-count=1', '-run', '^TestA$']],
-  ['go suite', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestB', groups: [], line: 1, suite: 'Suite' }, {}, ['go', 'test', './pkg', '-count=1', '-run', '/^TestB$']],
+  ['go', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestA', groups: [], line: 1 }, {}, ['go', 'test', './pkg', '-count=1', '-v', '-run', '^TestA$']],
+  ['go suite', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestB', groups: [], line: 1, suite: 'Suite' }, {}, ['go', 'test', './pkg', '-count=1', '-v', '-run', '/^TestB$']],
   ['rspec', { rel: 'spec/a_spec.rb', kind: 'rb', plain: 'works', groups: ['Foo'], line: 4 }, { isBundled: true }, ['bundle', 'exec', 'rspec', 'spec/a_spec.rb:4']],
   ['minitest', { rel: 'test/a_test.rb', kind: 'rb', plain: 'rails way', groups: [], line: 4 }, {}, ['ruby', '-Itest', 'test/a_test.rb', '-n', '/^rails_way$|^test_rails_way$/']],
   ['cargo', { rel: 'tests/a.rs', kind: 'rs', plain: 'adds', groups: ['tests'], line: 3 }, {}, ['cargo', 'test', 'adds']],

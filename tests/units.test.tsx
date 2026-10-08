@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
 import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
-import { goTagsOf, isBuildFailure, isNoneRun } from '../hooks/runner'
+import { goTagsOf, isBuildFailure, isNoneRun, runArgv } from '../hooks/runner'
 import { charCount, nodeCount, printable } from '../hooks/tree'
 import { fits, ignoredBy, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
@@ -527,4 +527,28 @@ test('a run that exited 0 having run no test is told apart from one that passed'
   expect(isNoneRun('ok  \texample.com/shop/x\t0.01s [no tests to run]')).toBe(true)
   expect(isNoneRun('testing: warning: no tests to run\nPASS\nok  \tx\t0.1s')).toBe(true)
   expect(isNoneRun('ok  \texample.com/shop/x\t0.01s')).toBe(false)
+})
+
+test('a run every test of which was skipped, or none matched, ran no test, whatever the runner', async () => {
+  // Go -v: the test skipped itself
+  expect(isNoneRun('=== RUN   TestA\n--- SKIP: TestA (0.00s)\nPASS\nok  \tx\t0.1s')).toBe(true)
+  expect(isNoneRun('=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \tx\t0.1s')).toBe(false)
+  // Jest, Vitest and pytest summaries with nothing passed or failed
+  expect(isNoneRun('Tests:       16 skipped, 16 total')).toBe(true)
+  expect(isNoneRun('Tests:       16 skipped, 1 passed, 17 total')).toBe(false)
+  expect(isNoneRun('      Tests  17 skipped (17)')).toBe(true)
+  expect(isNoneRun('      Tests  1 failed | 16 skipped (17)')).toBe(false)
+  expect(isNoneRun('============ 3 deselected in 0.02s ============')).toBe(true)
+  expect(isNoneRun('============ 1 passed, 3 deselected in 0.02s ============')).toBe(false)
+  // Node's runner
+  expect(isNoneRun('# tests 0\n# pass 0\n# fail 0')).toBe(true)
+  expect(isNoneRun('# tests 1\n# pass 1\n# fail 0')).toBe(false)
+})
+
+test('a loop\'s template as a runner\'s pattern matches each of its cases, the rest of the name kept literal', async () => {
+  const [argv] = [runArgv({ rel: 'src/q.test.ts', kind: 'js', plain: '%s -> %s', groups: ['is (q)'], line: 2 }, { js: 'jest' })]
+  const pattern = new RegExp(argv![4]!)
+  expect(pattern.test('is (q)   what now -> true')).toBe(true)
+  expect(pattern.test('is (q) what now => true')).toBe(false)
+  expect(pattern.test('is q what now -> true')).toBe(false)
 })

@@ -331,6 +331,9 @@ export const DECLARATION = /^(?:export\s+)?(?:declare\s+)?(?:(?:const|let|var|fu
 // the template it fits
 const HOLE = /\$\{[^}]*\}|%[sdifjoOpP#]|\$[A-Za-z_][\w.]*/
 export const isTemplate = (name: string): boolean => HOLE.test(name)
+// a template as a regular expression's source, unanchored: its holes match any text
+export const templateSource = (template: string): string =>
+  template.split(new RegExp(HOLE.source, 'g')).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.+?')
 export const fits = (template: string, name: string): boolean => {
   if (!isTemplate(template)) return template === name
   const parts = template.split(new RegExp(HOLE.source, 'g')).map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))

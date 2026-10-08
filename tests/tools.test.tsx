@@ -985,10 +985,10 @@ test('test_verify on a Go test of a module below the root runs it from the modul
   await clock.advance(10)
   await answer
 
-  expect(runs.slice(0, 2)).toEqual([['go', 'test', './tests/config', '-count=1', '-run', '^TestPins$'], ['go', 'test', './tests/config', '-count=1', '-run', '^TestPins$']])
+  expect(runs.slice(0, 2)).toEqual([['go', 'test', './tests/config', '-count=1', '-v', '-run', '^TestPins$'], ['go', 'test', './tests/config', '-count=1', '-v', '-run', '^TestPins$']])
   expect(runsIn.slice(0, 2)).toEqual(['/proj/backend', '/proj/backend'])
   // the measured evidence names the command as run
-  expect(prompts.at(-1)).toContain('cd backend && go test ./tests/config -count=1 -run')
+  expect(prompts.at(-1)).toContain('cd backend && go test ./tests/config -count=1 -v -run')
 })
 
 test('test_verify on a test that could not run says so, not that it fails, and mutates nothing', async ($, on) => {
@@ -1022,7 +1022,7 @@ test('test_verify on a Go test behind a build tag runs it with the tags its file
   await clock.advance(10)
 
   expect(await answer).toMatch(/^Measured: the test passes unchanged and fails with the mutation\./)
-  expect(runs[0]).toEqual(['go', 'test', './tests/config', '-count=1', '-tags', 'integration', '-run', '^TestPins$'])
+  expect(runs[0]).toEqual(['go', 'test', './tests/config', '-count=1', '-v', '-tags', 'integration', '-run', '^TestPins$'])
 })
 
 test('test_verify on a test whose run ran no test says it could not run it, not that a mutation got through', async ($, on) => {
@@ -1035,7 +1035,7 @@ test('test_verify on a test whose run ran no test says it could not run it, not 
 
   const answer = await verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
 
-  expect(answer).toMatch(/^Could not run the test, so nothing was measured\. .*\[no tests to run\]$/s)
+  expect(answer).toMatch(/^Could not run the test, so nothing was measured: the run ran no test .*\[no tests to run\]$/s)
   expect(writes).toEqual([])
 })
 
@@ -1051,6 +1051,78 @@ test('Run test whose run ran no test fails in its row, not passes', async ($, on
   await clock.advance(10)
 
   expect(await runLine(ui)).toMatch(/^Failed: cd backend && go test /)
+})
+
+
+// a Go test that skips itself without its emulator's address, as a Firestore test does
+const skipsWithout = (files: Record<string, string>) => (argv: string[], env: Record<string, string> = {}) =>
+  argv[0] !== 'go'
+    ? 1
+    : env.FIRESTORE_EMULATOR_HOST
+      ? goRun(files)(argv)
+      : { stdout: '=== RUN   TestPins\n    run_test.go:3: FIRESTORE_EMULATOR_HOST not set\n--- SKIP: TestPins (0.00s)\nPASS\nok  \texample.com/shop/tests/config\t0.01s', exitCode: 0 }
+
+test('test_verify on a test that skips itself says it could not run it, and measures it once given the variable it needs', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND }
+  const { writes } = project(on, files, { editor: skipsWithout(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const at = { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' }
+
+  expect(await verifyWith($, at)).toMatch(/^Could not run the test, so nothing was measured: the run ran no test \(it skipped itself/)
+  expect(writes).toEqual([])
+  const given = $.tool.call({ tool: 'mcp__test-grader__test_verify', ...at, env: { FIRESTORE_EMULATOR_HOST: '127.0.0.1:8090' } } as never).then(r => String((r as { result: unknown }).result))
+  await clock.advance(10)
+  expect(await given).toMatch(/^Measured: the test passes unchanged and fails with the mutation\./)
+})
+
+test('every test run takes the variables the project names in .test-grader-env', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND, '.test-grader-env': '# for the data tests\nexport FIRESTORE_EMULATOR_HOST="127.0.0.1:8090"\n' }
+  project(on, files, { editor: skipsWithout(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
+  await clock.advance(10)
+  expect(await answer).toMatch(/^Measured: the test passes unchanged and fails with the mutation\./)
+})
+
+test('test_verify on one case of a loop runs that case by its own name, its leading spaces kept', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }',
+    'src/q.ts': 'export const isQ = (s: string) => s.trim().startsWith("what")\n',
+    'src/q.test.ts': "describe('isQuestionShaped', () => {\n  it.each([['  what now', true]])('%s -> %s', (s, want) => { expect(isQ(s)).toBe(want) })\n})\n",
+  }
+  // jest as it runs: the case runs only when -t names it, and fails once trim() is gone
+  const { runs } = project(on, files, {
+    editor: argv =>
+      argv[1] !== 'jest' ? 1 : argv[4] !== '^isQuestionShaped   what now -> true$' ? { stdout: 'Tests:       1 skipped, 1 total', exitCode: 0 } : files['src/q.ts']!.includes('trim()') ? { stdout: 'Tests:       1 passed, 1 total', exitCode: 0 } : { stdout: 'Tests:       1 failed, 1 total', exitCode: 1 },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await verifyWith($, { file: 'src/q.test.ts', test: 'isQuestionShaped   what now -> true', mutate: 'src/q.ts', find: 's.trim()', replace: 's' })
+  expect(answer).toMatch(/^Measured: the test passes unchanged and fails with the mutation\./)
+  expect(runs[0]).toEqual(['npx', 'jest', 'src/q.test.ts', '-t', '^isQuestionShaped   what now -> true$'])
+})
+
+
+test('test_verify whose mutation makes the test skip itself measures nothing, and regrades nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...ADDING }
+  // with the mutation the test is skipped: jest exits 0, having run none
+  const { prompts } = project(on, files, { editor: argv => (argv[1] !== 'jest' ? 1 : files['src/add.ts']!.includes('a + b') ? { stdout: 'Tests:       1 passed, 1 total', exitCode: 0 } : { stdout: 'Tests:       1 skipped, 1 total', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await verifyWith($, { file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b' })
+
+  expect(answer).toBe('With the mutation the test did not run (it skipped itself, or was not found), so it measures nothing. The end of the output:\nTests:       1 skipped, 1 total\nThe file is back as it was; nothing was regraded.')
+  expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
+  expect(prompts).toHaveLength(0)
 })
 
 

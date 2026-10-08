@@ -1830,14 +1830,27 @@ const targetOf = (cwd: string, file: string, text: string, name: string): RunTar
   const found = cases.find(c => c.name === name) ?? cases.find(c => fits(c.name, name))
   if (!found) return null
   const suite = suitesOf(text, file).get(found.plain)
-  return { rel: shortPath(file, cwd), kind: kindOf(file), plain: found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}), ...(kindOf(file) === 'go' && goTagsOf(text).length > 0 ? { tags: goTagsOf(text) } : {}) }
+  // a loop's case asked by its own name, with or without its groups ahead of it, runs alone;
+  // asked by its template, every case of the loop runs
+  const own = [name.slice(found.groups.join(' ').length + 1), name].find(n => n !== '' && isTemplate(found.plain) && !isTemplate(n) && fits(found.plain, n) && (n === name || name.startsWith(`${found.groups.join(' ')} `)))
+  return { rel: shortPath(file, cwd), kind: kindOf(file), plain: own ?? found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}), ...(kindOf(file) === 'go' && goTagsOf(text).length > 0 ? { tags: goTagsOf(text) } : {}) }
 }
 
 // One test run by the project's runner: whether it passed, and the end of what it printed
 const RUN_TAIL = 12
 const RUN_TIMEOUT = 300_000
-type Ran = { isPassed: boolean; command: string; tail: string }
-const runOne = async ($: EngineInterface, file: string, name: string): Promise<Ran | string> => {
+type Ran = { isPassed: boolean; isNoneRun?: boolean; command: string; tail: string }
+// the variables every test run gets, from .test-grader-env at the project's root (NAME=value a
+// line), as a Makefile would set them: an emulator's address, say
+const ENV_FILE = '.test-grader-env'
+const runEnvOf = async ($: EngineInterface, cwd: string): Promise<Record<string, string>> =>
+  Object.fromEntries(
+    ((await $.fs.read(`${cwd}/${ENV_FILE}`).catch(() => '')) ?? '').split('\n').flatMap(line => {
+      const m = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*?)\s*$/.exec(line)
+      return m && !line.trimStart().startsWith('#') ? [[m[1]!, m[2]!.replace(/^(['"])(.*)\1$/, '$2')]] : []
+    }),
+  )
+const runOne = async ($: EngineInterface, file: string, name: string, env: Record<string, string> = {}): Promise<Ran | string> => {
   const cwd = await projectDir($)
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}.`
@@ -1846,11 +1859,14 @@ const runOne = async ($: EngineInterface, file: string, name: string): Promise<R
   if (!target) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
   const argv = runArgv(target, found)
   if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
-  const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT })
+  const vars = { ...(await runEnvOf($, cwd)), ...env }
+  const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT, ...(Object.keys(vars).length > 0 ? { env: vars } : {}) })
   const command = base === cwd ? shown(argv) : `cd ${shortPath(base, cwd)} && ${shown(argv)}`
   const output = [result.stdout, result.stderr].join('\n')
-  // a run that ran no test passed nothing: a Go file behind a build tag the run left out, a name not found
-  return { isPassed: result.exitCode === 0 && !isNoneRun(output), command, tail: tailOf(output, RUN_TAIL) }
+  // a run that ran no test passed nothing: a Go file behind a build tag the run left out, a
+  // test that skipped itself, a name not found
+  const isNone = isNoneRun(output)
+  return { isPassed: result.exitCode === 0 && !isNone, ...(isNone ? { isNoneRun: true } : {}), command, tail: tailOf(output, RUN_TAIL) }
 }
 
 // a test run from the pane: its row shows it running, then passed or failed with the end of
@@ -1865,8 +1881,9 @@ const runFromPane = async ($: EngineInterface, file: string, name: string): Prom
   }))
 }
 
-const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: unknown; mutate?: unknown; find?: unknown; replace?: unknown; siblings?: unknown }): Promise<string> => {
+const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: unknown; mutate?: unknown; find?: unknown; replace?: unknown; siblings?: unknown; env?: unknown }): Promise<string> => {
   const cwd = await projectDir($)
+  const env = input.env && typeof input.env === 'object' ? Object.fromEntries(Object.entries(input.env).filter((e): e is [string, string] => typeof e[1] === 'string')) : {}
   const file = inProject(cwd, String(input.file ?? ''))
   const name = String(input.test ?? '')
   const target = inProject(cwd, String(input.mutate ?? ''))
@@ -1883,9 +1900,10 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   const count = original.split(find).length - 1
   if (count !== 1) return `The text to find is in ${shortPath(target, cwd)} ${count} times, not once: give a piece found exactly once. Nothing was run.`
 
-  const clean = await runOne($, file, name)
+  const clean = await runOne($, file, name, env)
   if (typeof clean === 'string') return `${clean} Nothing was run.`
   // a test that never ran (no module, no runner, code that does not build) is not a failing one
+  if (clean.isNoneRun) return `Could not run the test, so nothing was measured: the run ran no test (it skipped itself, or no test matched its name). A test that skips without a service or variable needs it set: pass env, or name it in ${ENV_FILE}. ${clean.command} printed:\n${clean.tail}`
   if (!clean.isPassed && (isSetupFailure(clean.tail) || isBuildFailure(clean.tail))) return `Could not run the test, so nothing was measured. ${clean.command} printed:\n${clean.tail}`
   if (!clean.isPassed) return `The test fails unchanged, so a mutation shows nothing. ${clean.command} printed:\n${clean.tail}`
   let mutated: Ran | string
@@ -1896,10 +1914,10 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   const alsoFailed: string[] = []
   try {
     await $.fs.write(target, original.replace(find, replace))
-    mutated = await runOne($, file, name).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
+    mutated = await runOne($, file, name, env).catch((err: unknown) => (err instanceof Error ? err.message : String(err)))
     if (typeof mutated !== 'string' && !mutated.isPassed && !isBuildFailure(mutated.tail)) {
       for (const other of tried) {
-        const ran = await runOne($, file, other).catch(() => null)
+        const ran = await runOne($, file, other, env).catch(() => null)
         if (ran !== null && typeof ran !== 'string' && !ran.isPassed) alsoFailed.push(other)
       }
     }
@@ -1908,7 +1926,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   }
   const failsAnyway = new Set<string>()
   for (const other of alsoFailed) {
-    const ran = await runOne($, file, other).catch(() => null)
+    const ran = await runOne($, file, other, env).catch(() => null)
     if (ran === null || typeof ran === 'string' || !ran.isPassed) failsAnyway.add(other)
   }
   const caught = alsoFailed.filter(n => !failsAnyway.has(n))
@@ -1928,6 +1946,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   if (!mutated.isPassed && isBuildFailure(mutated.tail)) {
     return `The mutated code did not build, so the test never ran: that measures nothing. Pick a change that compiles and alters behaviour. The end of the output:\n${mutated.tail}\nThe file is back as it was; nothing was regraded.`
   }
+  if (mutated.isNoneRun) return `With the mutation the test did not run (it skipped itself, or was not found), so it measures nothing. The end of the output:\n${mutated.tail}\nThe file is back as it was; nothing was regraded.`
   if (mutated.isPassed) {
     // the grader hears of it at the test's next grading
     const change = `${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}`
