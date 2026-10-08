@@ -459,3 +459,94 @@ test('a new session takes the folder it starts in, not the last one\'s', async (
   await $.session.start({ source: 'startup', cwd: '/proj/coverage', surface: null, isInteractive: true } as never)
   expect(buttonsOf(await ui.drawn()).has('run')).toBe(false)
 })
+
+
+// Claude's coverage tool: a run waited for, answered with a folder's figure before and after
+const askCoverage = async ($: Engine, clock: { advance: (ms: number) => Promise<void> }, path?: string) => {
+  const answer = $.tool.call({ tool: 'mcp__test-grader__test_coverage', ...(path === undefined ? {} : { path }) } as never)
+  await clock.advance(10)
+  return String((await answer).result)
+}
+const PROFILE = '.test-grader-go-cover.out'
+
+test("test_coverage on a Go folder runs that folder's packages alone and keeps the rest of the module's last figures", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // the last whole run: pkg/a 10 of 10, pkg/b 0 of 30
+  const files: Record<string, string> = { ...GO_MODULE, [PROFILE]: GO_PROFILE }
+  const { runs } = project(on, files, {
+    editor: () => {
+      // the folder's run: its profile holds pkg/b alone, now 10 of its 30 covered
+      files[PROFILE] = ['mode: set', 'example.com/shop/pkg/b/b.go:3.14,5.2 10 1', 'example.com/shop/pkg/b/b.go:6.1,9.2 20 0', ''].join('\n')
+      return { stdout: 'ok  example.com/shop/pkg/b  coverage: 33.3% of statements\n', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await askCoverage($, clock, 'pkg/b/')
+  expect(runs).toEqual([['go', 'test', './pkg/b/...', '-cover', `-coverprofile=${PROFILE}`]])
+  expect(answer).toContain('pkg/b/: 33.3% statements, was 0%.')
+  // pkg/a's 10 covered statements are kept from the last run: 20 of 40
+  expect(answer).toContain('The project: 50% statements, was 25%.')
+  expect(files[PROFILE]).toContain('example.com/shop/pkg/a/a.go:3.14,5.2 4 1')
+  expect(files[PROFILE]).not.toContain('example.com/shop/pkg/b/b.go:3.14,9.2 30 0')
+})
+
+test("test_coverage on a folder of a jest project runs the whole coverage and answers with the folder's figure and its least covered folders", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const lcov = (a: number) => `SF:src/a/x.ts\nLF:10\nLH:${a}\nend_of_record\nSF:src/a/deep/z.ts\nLF:10\nLH:2\nend_of_record\nSF:src/b/y.ts\nLF:10\nLH:3\nend_of_record\n`
+  const files: Record<string, string> = { ...JEST_PROJECT, 'coverage/lcov.info': lcov(5) }
+  const { runs } = project(on, files, {
+    editor: () => {
+      files['coverage/lcov.info'] = lcov(9)
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await askCoverage($, clock, '/proj/src/a')
+  expect(runs.map(argv => argv.slice(0, 3).join(' '))).toEqual(['npx jest --coverage'])
+  expect(answer).toContain('src/a/: 55% lines, was 35%.')
+  expect(answer).toContain('The project: 46.7% lines, was 33.3%.')
+  // the folders under it alone, not src/b
+  expect(answer).toContain('Least covered folders in src/a/ (lines): src/a/deep/ 20% (2 of 10).')
+  expect(answer).not.toContain('src/b/')
+})
+
+test('test_coverage says when a folder has no measured code, and runs nothing for a path outside the project', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...JEST_PROJECT }
+  const { runs } = project(on, files, {
+    editor: () => {
+      files['coverage/lcov.info'] = 'SF:src/a/x.ts\nLF:10\nLH:9\nend_of_record\n'
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  expect(await askCoverage($, clock, '/elsewhere')).toBe('/elsewhere is outside the project (/proj).')
+  expect(runs).toEqual([])
+  expect(await askCoverage($, clock, 'docs')).toContain('docs/ has no figure in the report: none of its code was measured.')
+})
+
+test('test_coverage whose tests fail gives the figures of what ran and the end of what it printed', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...JEST_PROJECT }
+  project(on, files, {
+    editor: () => {
+      files['coverage/lcov.info'] = 'SF:src/a/x.ts\nLF:10\nLH:4\nend_of_record\n'
+      return { stdout: 'FAIL src/a.test.ts\n  ● adds › expected 3, got 4\n', exitCode: 1 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  const answer = await askCoverage($, clock)
+  expect(answer).toContain('It exited with 1: the figures are from the tests that ran.')
+  expect(answer).toContain('The project: 40% lines.')
+  expect(answer).toContain('● adds › expected 3, got 4')
+  expect(JSON.stringify(await ui.drawn())).toContain('Tests exited with 1.')
+})

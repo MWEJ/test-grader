@@ -52,7 +52,7 @@ export const GRADING_SECTION = [
   '- No snapshots unless the snapshot is small and reviewed; assert on what the code does, not on how it does it.',
   'Grades arrive as notes; nothing waits on them. When you have finished writing or editing tests for the task, call test_grades with written: true. Fix each flagged test as its grade asks, worst first: rewrite a hollow one, delete or merge a duplicate, add the missing case to a shallow one, and loosen a brittle one to assert on behaviour.',
   'Where one is better than rated, prove it: test_verify runs it, applies a mutation to the code under test, runs it again and puts the file back, and sends what it measured as evidence; with siblings: true it also says which other tests in the file catch the change. Or send test_evidence: run the test unchanged (it must pass), apply the mutation, run again (it must fail), revert, and quote both results. Where a grade looks wrong, test_context shows what the grader read for that test.',
-  `Each change is graded again; call test_grades again to see the new grades. Tests listed as being graded: wait a moment and ask again. Tests listed as unrated or never graded: test_grade grades them and answers with the result. After ${MAX_ROUNDS} rounds on one test, tell the person what is left instead.`,
+  `Each change is graded again; call test_grades again to see the new grades. Tests listed as being graded: wait a moment and ask again. Tests listed as unrated or never graded: test_grade grades them and answers with the result. When you write tests to raise coverage, call test_coverage with the folder once you are done, for its new figure. After ${MAX_ROUNDS} rounds on one test, tell the person what is left instead.`,
 ].join('\n')
 
 // A guide for each language, in the mod's guides folder (guides/js.md, guides/go.md, ...): the
@@ -146,6 +146,19 @@ export const GRADE_SCHEMA = {
   properties: {
     path: { type: 'string', description: 'Only the test files in this file or folder, absolute or relative to the project; default the whole project' },
     again: { type: 'boolean', description: 'Grade every test in scope again, the rated ones too' },
+  },
+}
+
+// the session's tool to measure coverage now, of the project or a folder of it, and wait for the figures
+export const COVERAGE_TOOL = 'test_coverage'
+export const COVERAGE_DESCRIPTION =
+  "Run the project's coverage now and wait for it: a folder's figure (with path) before and after the run, the project's, and the least covered folders under it. " +
+  'In a Go project a folder\'s run measures only its packages (go test ./<folder>/...), far faster than the whole module, and the rest keep their last figures; elsewhere the whole run is made and the folder\'s figure read from it. ' +
+  'Call it when you have finished writing tests to raise coverage, with the folder you worked on.'
+export const COVERAGE_SCHEMA = {
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: 'A folder, absolute or relative to the project; default the whole project' },
   },
 }
 

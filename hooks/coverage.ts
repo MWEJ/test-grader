@@ -63,3 +63,37 @@ export const coverageNote = (command: CoverCommand, exitCode: number, output: st
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
   return [`Coverage run (test-grader) failed: ${command.label} exited with ${exitCode}. The last ${lines.length} lines it printed:`, ...lines].join('\n')
 }
+
+// what Claude's coverage tool answers: a folder's figure (the project's, rel '') now and before
+// the run, the project's beside it, and the least covered folders under it, lowest first
+const UNDER = 8
+export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: number, output: string, before: Coverage | null, after: Coverage | null): string => {
+  const kind = after && after.lines === null && after.statements !== null ? 'statements' : 'lines'
+  const of = (cov: Coverage | null, dir: string): number | null => {
+    const d = cov?.byDir?.[dir]
+    return d && d.total > 0 ? pct((d.covered / d.total) * 100) : null
+  }
+  const figure = (where: string, dir: string): string => {
+    const now = of(after, dir)
+    const was = of(before, dir)
+    if (now === null) return `${where} has no figure in the report: none of its code was measured.`
+    return `${where}: ${now}% ${kind}${was === null ? '' : was === now ? ', unchanged' : `, was ${was}%`}.`
+  }
+  const where = rel === '' ? 'The project' : `${rel}/`
+  const lines = [`Coverage (test-grader), by ${command.label}:`]
+  if (exitCode !== 0) lines.push(`It exited with ${exitCode}: the figures are from the tests that ran.`)
+  lines.push(figure(where, rel))
+  if (rel !== '') lines.push(figure('The project', ''))
+  const under = Object.entries(after?.byDir ?? {})
+    .filter(([dir, d]) => d.total > 0 && dir !== rel && (rel === '' ? dir !== '' : dir.startsWith(`${rel}/`)))
+    .map(([dir, d]) => ({ dir, p: (d.covered / d.total) * 100, d }))
+    .sort((a, b) => a.p - b.p || a.dir.localeCompare(b.dir))
+    .slice(0, UNDER)
+  if (under.length > 0) lines.push(`Least covered folders${rel === '' ? '' : ` in ${rel}/`} (${kind}): ${under.map(u => `${u.dir}/ ${Math.round(u.p)}% (${u.d.covered} of ${u.d.total})`).join(', ')}.`)
+  if (!after) lines.splice(1, lines.length - 1, `${command.label} wrote no report test-grader reads.`)
+  if (exitCode !== 0) {
+    const tail = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
+    lines.push(`The last ${tail.length} lines it printed:`, ...tail)
+  }
+  return lines.join('\n')
+}

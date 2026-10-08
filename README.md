@@ -50,7 +50,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Accepted tests are told too.** When a test that was flagged is graded strong, the note says so.
 - **Three rounds per test.** A test still flagged after three rounds is reported once more, telling Claude to tell you what is left. After that, test-grader stops on it. Evidence the grader rejects counts as a round too.
 - **A suggestion after the turn.** When a turn ends with flagged tests Claude wrote, the prompt box offers "Fix the 2 flagged tests you wrote this session", once for each set of such tests. It is only a suggestion: nothing is sent unless you send it.
-- **The pane follows the files as they change.** Every 2 seconds, the listed test files are checked for changes made outside Claude's Write and Edit: by the shell, an editor or a checkout. Their new and removed tests show at once, and changed tests are graded again. A file whose modification time has not changed is not read again. Right after each shell command, and every 10 seconds otherwise, the project's test files are listed again: a new one shows ungraded, with no grader call, and a removed one leaves the pane with its grades. The same check runs at the end of each turn.
+- **The pane follows the files as they change.** Every 2 seconds, the listed test files are checked for changes made outside Claude's Write and Edit: by the shell, an editor or a checkout. Their new and removed tests show at once, and changed tests are graded again. A file whose modification time has not changed is not read again. Right after each shell command, and every 10 seconds otherwise, the project's test files are listed again. A new one is graded as if Claude had written it: a test file made by the shell, or by a subagent whose worktree was merged in, is graded and shows as new. When more than 10 new test files turn up at once, a checkout or a pull brought them: they show ungraded, with no grader call, for Grade all to grade. A removed file leaves the pane with its grades. If the watcher lists a file before Claude's write of it is seen, the write still grades its tests. The same check runs at the end of each turn.
 - **Grade all tests** grades the whole project. It grades only the tests not rated yet: every test of a file changed since its last grading, and in an unchanged file only the tests with no verdict (the rated ones keep theirs). Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, the files changed since their last grading and those graded for the first time (once the project has been graded before), then the flagged tests, worst first: hollow, then duplicate, shallow and brittle. No turn starts for it.
 - **Stop** cuts a run short. No more grader calls start, the tests not yet graded keep what they had, and the pane says how far the run got. The next run grades the rest.
 - **Regrade all** grades every file again, unchanged ones included.
@@ -187,6 +187,16 @@ Claude can grade tests itself, as Grade all tests does, and wait for the result:
 | `again` | grade every test in scope again, the rated ones too, as Regrade all does |
 
 By default it grades the tests not rated yet and keeps the grades that stand, so it is the way to retry unrated tests. While another run is under way it says so and grades nothing.
+
+#### Measuring coverage now: `test_coverage`
+
+Claude can run the project's coverage itself and wait for the figures, for instance after writing tests to raise a folder's coverage. The answer gives the folder's figure before and after the run, the project's figure, and the least covered folders under it. Claude is told to call it, with the folder, once it is done writing tests for coverage. The pane shows the run as Run coverage does.
+
+| Input | What it does |
+| --- | --- |
+| `path` | a folder, absolute or relative to the project. The default is the whole project. |
+
+In a Go project a folder's run measures its packages alone (`go test ./<folder>/... -cover -coverprofile=…`), far faster than the whole module. Its blocks replace that folder's in the last profile, so every other package keeps its last figures. Elsewhere the project's whole coverage run is made, and the folder's figure is read from its report. If the tests fail, the answer gives the figures of what ran and the end of what it printed. The tool runs the project's tests, so Claude Code asks you before it runs.
 
 #### What the grader read: `test_context`
 

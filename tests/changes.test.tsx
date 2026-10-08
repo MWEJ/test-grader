@@ -120,7 +120,7 @@ test('a listed test file changed by other means shows its new tests within one w
 })
 
 
-test('a test file a shell command makes is listed ungraded as soon as the command ends, with no grader call', async ($, on) => {
+test('a test file a shell command makes is graded as soon as the command ends, as a written one is', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
   const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
@@ -135,9 +135,55 @@ test('a test file a shell command makes is listed ungraded as soon as the comman
   await clock.advance(10)
 
   const tree = JSON.stringify(await ui.drawn())
-  expect(tree).toContain('4 tests')
-  expect(tree).toContain('d.test.ts')
+  expect(tree).toContain('4 tests · 2 strong · 2 ungraded · 2 new')
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('Test file: /proj/src/d.test.ts')
+  expect(prompts[0]).toContain('["subtracts","negates"]')
+})
+
+
+test('test files a checkout brings, more than a session writes at once, are listed ungraded with no grader call', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  for (let i = 0; i < 11; i++) files[`src/n${i}.test.ts`] = `it('case ${i}', () => { expect(f(${i})).toBe(${i}) })\n`
+  await $.tool.call({ tool: 'Bash', command: 'git checkout other' } as never)
+  await clock.advance(10)
+
+  expect(JSON.stringify(await ui.drawn())).toContain('13 tests · 0 strong · 13 ungraded')
   expect(prompts).toEqual([])
+})
+
+
+test('a test file the watcher listed ungraded before Claude\'s write of it was seen is still graded', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
+  const { prompts } = project(on, files)
+  // the write lands with ten more files from a checkout, and the watcher lists them all before
+  // the write's hook goes on: too many to grade unasked, all listed ungraded
+  on('tool.call', async (_$, e) => {
+    if ((e as { tool: string }).tool === 'Write') {
+      for (let i = 0; i < 11; i++) files[`src/n${i}.test.ts`] = `it('case ${i}', () => { expect(f(${i})).toBe(${i}) })\n`
+      await $.tool.call({ tool: 'Bash', command: 'true' } as never)
+      await clock.advance(10)
+    }
+    return { result: {}, text: 'ok', isError: false, isReadOnly: false } as never
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/n0.test.ts', content: "it('case 0', () => { expect(f(0)).toBe(0) })\n" } as never)
+  await clock.advance(10)
+
+  expect(prompts.map(p => p.match(/Test file: (\S+)/)?.[1])).toEqual(['/proj/src/n0.test.ts'])
+  // graded as the test Claude wrote: new, not as one of the project's
+  expect(JSON.stringify(await ui.drawn())).toContain('13 tests · 1 strong · 12 ungraded · 1 new')
 })
 
 

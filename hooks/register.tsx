@@ -3,16 +3,16 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Confidence, Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '../types'
 
-import { attr, byDirOf, coverageNote, pct } from './coverage'
+import { attr, byDirOf, coverageAnswer, coverageNote, pct } from './coverage'
 import type { CoverCommand } from './coverage'
 import { TEST_FILE, among, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
-import { goProfileOf, moduleOf } from './gocover'
+import { goProfileOf, mergeProfile, moduleOf } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
 import type { KeptGrades, SavedGrades } from './kept'
 import { costOf } from './prices'
-import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, CONTEXT_DESCRIPTION, CONTEXT_MAX, VERIFY_SIBLINGS, CONTEXT_SCHEMA, CONTEXT_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
+import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, CONTEXT_DESCRIPTION, COVERAGE_DESCRIPTION, COVERAGE_SCHEMA, COVERAGE_TOOL, CONTEXT_MAX, VERIFY_SIBLINGS, CONTEXT_SCHEMA, CONTEXT_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
 import { isBuildFailure, runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
@@ -660,21 +660,51 @@ const detectCommand = async ($: EngineInterface, cwd: string): Promise<CoverComm
   return undefined
 }
 
-const runCoverage = async ($: EngineInterface): Promise<void> => {
+// A coverage run, the pane showing it under way: the project's, or (rel, a folder's path in the
+// project) in a Go project that folder's packages alone, merged into the module's last profile.
+// What it ran and how it ended, or why it could not run
+const NO_COVERAGE = 'No coverage script, jest, vitest, pytest or Go project found here.'
+const measure = async ($: EngineInterface, rel = ''): Promise<{ command: CoverCommand; exitCode: number; output: string } | string> => {
   const cwd = await projectDir($)
   const setRun = (state: 'idle' | 'running' | 'failed', message?: string) => update($, run, () => ({ state, message }))
   try {
-    const command = await detectCommand($, cwd)
-    if (!command) return void (await setRun('failed', 'No coverage script, jest, vitest, pytest or Go project found here.'))
+    const base = await detectCommand($, cwd)
+    if (!base) return (await setRun('failed', NO_COVERAGE), NO_COVERAGE)
+    const isGoFolder = rel !== '' && base.goOutput !== undefined
+    const command: CoverCommand = isGoFolder ? { argv: ['go', 'test', `./${rel}/...`, '-cover', `-coverprofile=${GO_PROFILE}`], label: `go test ./${rel}/... -coverprofile` } : base
+    const whole = isGoFolder ? await $.fs.read(`${cwd}/${GO_PROFILE}`).catch(() => null) : null
     await setRun('running')
     const result = await $.process.run(command.argv, { cwd, timeoutMs: 600_000 })
     if (command.goOutput) await $.fs.write(`${cwd}/${command.goOutput}`, result.stdout)
+    const part = whole === null ? null : await $.fs.read(`${cwd}/${GO_PROFILE}`).catch(() => null)
+    if (whole !== null && part !== null) await $.fs.write(`${cwd}/${GO_PROFILE}`, mergeProfile(whole, part, moduleOf(await $.fs.read(`${cwd}/go.mod`).catch(() => '')), rel))
     await refreshCoverage($)
     await setRun(result.exitCode === 0 ? 'idle' : 'failed', result.exitCode === 0 ? undefined : `Tests exited with ${result.exitCode}.`)
-    await share($, coverageNote(command, result.exitCode, [result.stdout, result.stderr].join('\n'), await read($, coverage)))
+    return { command, exitCode: result.exitCode, output: [result.stdout, result.stderr].join('\n') }
   } catch (err) {
-    await setRun('failed', err instanceof Error ? err.message : String(err))
+    const message = err instanceof Error ? err.message : String(err)
+    await setRun('failed', message)
+    return message
   }
+}
+
+const runCoverage = async ($: EngineInterface): Promise<void> => {
+  const ran = await measure($)
+  if (typeof ran !== 'string') await share($, coverageNote(ran.command, ran.exitCode, ran.output, await read($, coverage)))
+}
+
+// Claude's coverage tool: the project's run, or a folder's, waited for and answered
+const answerCoverage = async ($: EngineInterface, input: { path?: unknown }): Promise<string> => {
+  if ((await read($, run)).state === 'running') return 'A coverage run is already under way; wait for it to finish, then ask again.'
+  const cwd = await projectDir($)
+  const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  const abs = given === '' || given === '.' ? cwd : given.startsWith('/') ? given : `${cwd}/${given}`
+  if (abs !== cwd && !abs.startsWith(`${cwd}/`)) return `${given} is outside the project (${cwd}).`
+  const rel = abs === cwd ? '' : abs.slice(cwd.length + 1)
+  const before = await read($, coverage)
+  const ran = await measure($, rel)
+  if (typeof ran === 'string') return `Coverage could not be measured: ${ran}`
+  return coverageAnswer(rel, ran.command, ran.exitCode, ran.output, before, await read($, coverage))
 }
 
 // what a finished Grade all tests run tells Claude: the counts, then every flagged and
@@ -1135,6 +1165,12 @@ const prune = async ($: EngineInterface): Promise<void> => {
   await saveGrades($)
 }
 
+// whether the session's first listing is done, in this load of the module: a test file turning
+// up after it was made during the session, and is graded; before it, it is one of the project's
+let isListedAll = false
+// more new test files than this at once came by a checkout or a pull: listed, left to Grade all
+const AUTO_FILES = 10
+
 // The project's tests as the pane first shows them: every case of every test file git
 // tracks, with its result from before when it has one, ungraded otherwise. No grader call
 const listAll = async ($: EngineInterface): Promise<void> => {
@@ -1161,6 +1197,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
   // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
   // fingerprint, so a change made between sessions is still caught at a turn's end
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
+  isListedAll = true
 }
 
 // A test file the pane does not list yet, made by the shell, an editor or a checkout, is
@@ -1175,14 +1212,25 @@ const listNew = async ($: EngineInterface): Promise<void> => {
   const known = new Set([...run.results.map(t => t.file), ...(await read($, tests)).map(t => t.file)])
   const cases: ExistingTest[] = []
   const hashes: Record<string, string> = {}
+  const made = new Map<string, string[]>()
   for (const file of files) {
     if (known.has(file)) continue
     const text = await $.fs.read(file).catch(() => null)
     if (text === null) continue
     hashes[file] = fingerprint(text)
     lastText.set(file, text)
+    const names = [...new Set(caseNames(text, file))]
+    made.set(file, names)
     const suites = suitesOf(text, file)
-    for (const name of new Set(caseNames(text, file))) cases.push({ file, name, isUngraded: true, ...(suites.has(name) ? { suite: suites.get(name) } : {}) })
+    for (const name of names) cases.push({ file, name, isUngraded: true, ...(suites.has(name) ? { suite: suites.get(name) } : {}) })
+  }
+  // made during the session (by the shell, a subagent's worktree merged in): graded as if Claude
+  // had written them, unless so many came at once that a checkout brought them
+  if (isListedAll && made.size > 0 && made.size <= AUTO_FILES) {
+    await update($, seen, all => ({ ...all, ...hashes }))
+    for (const [file, names] of made) if (names.length > 0) await track($, file, names)
+    cases.length = 0
+    for (const file of made.keys()) delete hashes[file]
   }
   const gone: string[] = []
   for (const file of known) {
@@ -1784,6 +1832,10 @@ export const register: Register = (on, options) => {
   )
 
   // what the grader reads: files the session can read already, so no permission asked
+  on('tool.call', { tool: 'mcp__test-grader__test_coverage' }, async ($, e) => ({ result: await answerCoverage($, e as never) })).catch(
+    (_$, _e, next) => ({ result: `The coverage tool could not answer (${next.error.kind}); ask again.` }),
+  )
+
   on('tool.check', { tool: 'mcp__test-grader__test_context' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
   on('tool.call', { tool: 'mcp__test-grader__test_context' }, async ($, e) => ({ result: await answerContext($, e as never) })).catch(
     (_$, _e, next) => ({ result: `The context tool could not answer (${next.error.kind}); ask again.` }),
@@ -1810,6 +1862,9 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: GRADE_TOOL, description: GRADE_DESCRIPTION, inputSchema: GRADE_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the grade tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await $.tool
+      .register({ name: COVERAGE_TOOL, description: COVERAGE_DESCRIPTION, inputSchema: COVERAGE_SCHEMA })
+      .catch(error => $.ui.log(`test-grader: the coverage tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await $.tool
       .register({ name: CONTEXT_TOOL, description: CONTEXT_DESCRIPTION, inputSchema: CONTEXT_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the context tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
@@ -1864,13 +1919,15 @@ export const register: Register = (on, options) => {
       const names = caseNames(e.content, e.file_path)
       await update($, seen, all => ({ ...all, [e.file_path]: fingerprint(e.content) }))
       lastText.set(e.file_path, e.content)
+      // a file written afresh holds its old cases too: only the ones it did not hold, not tracked
+      // yet nor graded, are new. A row listed but never graded (the watcher may list the file
+      // before this hook runs) is not a grade: its test is graded like any other new one, once
+      const listed = [...(await read($, tests)), ...(await read($, existing)).results.filter(t => !t.isUngraded)].filter(t => t.file === e.file_path)
+      const known = new Set([...listed.map(t => t.name), ...(prior === null || prior === e.content ? [] : caseNames(prior, e.file_path))])
+      const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
+      if (fresh.length > 0) await update($, existing, r => ({ ...r, results: r.results.filter(t => !(t.isUngraded && t.file === e.file_path && fresh.includes(t.name))) }))
       // a file written over: only the tests whose text changed are touched
       await refresh($, e.file_path, prior !== null && prior !== e.content ? changedCases(prior, e.content, e.file_path) : names)
-      // a file written afresh holds its old cases too: only the ones not tracked yet, nor listed
-      // by Grade all, are new
-      const listed = [...(await read($, tests)), ...(await read($, existing)).results].filter(t => t.file === e.file_path)
-      const known = new Set(listed.map(t => t.name))
-      const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
       if (fresh.length > 0) await track($, e.file_path, fresh)
     }
 

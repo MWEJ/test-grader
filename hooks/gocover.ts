@@ -45,3 +45,12 @@ export const goProfileOf = (profile: string, module: string | null, cwd: string)
   const byPackage = [...packages].filter(([, p]) => p.total > 0).map(([name, p]) => ({ name, ...p }))
   return { statements: total > 0 ? (covered / total) * 100 : null, byFile, byPackage }
 }
+
+// A folder's run (go test ./<folder>/...) merged into the module's last profile: the blocks of
+// the folder's files, and of every folder under it, are the new run's; the rest are kept
+export const mergeProfile = (whole: string, part: string, module: string | null, rel: string): string => {
+  const isInFolder = (line: string): boolean => module !== null && (line.match(/^(.+\.go):/)?.[1] ?? '').startsWith(`${module}/${rel}/`)
+  const blocks = (profile: string): string[] => profile.split('\n').filter(l => l.trim() !== '' && !l.startsWith('mode:'))
+  const mode = part.match(/^mode: .+$/m)?.[0] ?? whole.match(/^mode: .+$/m)?.[0] ?? 'mode: set'
+  return [mode, ...blocks(whole).filter(l => !isInFolder(l)), ...blocks(part), ''].join('\n')
+}
