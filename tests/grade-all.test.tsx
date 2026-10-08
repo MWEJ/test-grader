@@ -269,7 +269,7 @@ test('Grade all tests again grades only the files changed since their last gradi
 })
 
 
-test('a finished Grade all tests saves its grades and each file\'s fingerprint under the project', async ($, on) => {
+test('a finished Grade all tests saves grades a later session reads back whole, with each file\'s fingerprint and when it finished', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = {
     'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
