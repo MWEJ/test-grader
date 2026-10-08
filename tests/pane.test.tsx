@@ -478,7 +478,7 @@ test('more than 60 tests written in a session are all listed', async ($, on) => 
   await clock.advance(10)
   const tree = JSON.stringify(await (await mount($)).drawn())
   expect(tree).toContain('70 tests · 70 strong · 70 new')
-  // each drawn as its own row, not only counted: a cap on rows would leave some out
+  // each drawn as its own row, not only counted: a cap on rows (at 60, say) would leave some out
   expect(rowsOf(tree, '/proj/src/many.test.ts').sort()).toEqual(Array.from({ length: 70 }, (_, i) => `case ${i}`).sort())
 })
 
