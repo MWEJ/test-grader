@@ -4,6 +4,10 @@ import { placedOf } from './helpers'
 import type { Placed } from './helpers'
 import type { Node } from './helpers'
 
+// the tests a drawn pane lists as rows under this file, in the order drawn
+const rowsOf = (tree: string, file: string): string[] =>
+  [...new Set([...tree.matchAll(new RegExp(`"key":"r:${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:([^"]*)"`, 'g'))].map(m => m[1]!))]
+
 for (const surface of ['desktop', 'terminal'] as const) {
   test(`pane tracks and rates new tests on ${surface}`, async ($, on) => {
     const clock = mock.clock(on, { now: 1_000_000 })
@@ -134,8 +138,8 @@ test('a single file starts open, and every one of its tests is listed, however m
 
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('▾ src/big.test.ts')
-  expect(tree).toContain('"case 0"')
-  expect(tree).toContain('"case 79"')
+  // a row for each, in file order, none dropped or doubled
+  expect(rowsOf(tree, '/proj/src/big.test.ts')).toEqual(Array.from({ length: 80 }, (_, i) => `case ${i}`))
   expect(tree).not.toContain('more test')
 })
 
@@ -472,7 +476,10 @@ test('more than 60 tests written in a session are all listed', async ($, on) => 
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   await $.tool.call({ tool: 'Write', file_path: '/proj/src/many.test.ts', content } as never)
   await clock.advance(10)
-  expect(JSON.stringify(await (await mount($)).drawn())).toContain('70 tests · 70 strong · 70 new')
+  const tree = JSON.stringify(await (await mount($)).drawn())
+  expect(tree).toContain('70 tests · 70 strong · 70 new')
+  // each drawn as its own row, not only counted: a cap on rows would leave some out
+  expect(rowsOf(tree, '/proj/src/many.test.ts').sort()).toEqual(Array.from({ length: 70 }, (_, i) => `case ${i}`).sort())
 })
 
 

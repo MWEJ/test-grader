@@ -582,3 +582,27 @@ test('a change elsewhere in the file while a test is graded keeps that test\'s g
   const ui = await mount($)
   expect(JSON.stringify(await ui.drawn())).toContain('1 shallow')
 })
+
+
+test('a test written this session, then graded by Grade all, then edited, shows its new grade, not Grade all\'s older one', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const weak = "it('totals', () => { expect(total([2, 3])).toBeDefined() })\n"
+  const files: Record<string, string> = {}
+  project(on, files, { rule: (_n, prompt) => (prompt.includes('toBeDefined') ? 'shallow' : 'strong') })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  files['src/a.test.ts'] = weak
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: weak } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 shallow')
+
+  files['src/a.test.ts'] = weak.replace('toBeDefined()', 'toBe(5)')
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'toBeDefined()', new_string: 'toBe(5)' } as never)
+  await clock.advance(10)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('1 test · 1 strong')
+  expect(tree).not.toContain('shallow')
+})

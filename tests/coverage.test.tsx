@@ -143,3 +143,53 @@ test('a coverage report written outside the pane shows within one watch period, 
   expect(tree).toContain('91.3%')
   expect(tree).not.toContain('82.5%')
 })
+
+
+// a Go module of two packages, and the profile a coverage run writes for it: pkg/a has 10 of
+// its 10 statements covered, pkg/b 0 of 30; a block of a covered once of two runs counts once
+const GO_MODULE: Record<string, string> = {
+  'go.mod': 'module example.com/shop\n\ngo 1.22\n',
+  'pkg/a/a_test.go': 'package a\n\nfunc TestA(t *testing.T) {}\n',
+  'pkg/b/b_test.go': 'package b\n\nfunc TestB(t *testing.T) {}\n',
+}
+const GO_PROFILE = [
+  'mode: set',
+  'example.com/shop/pkg/a/a.go:3.14,5.2 4 1',
+  'example.com/shop/pkg/a/a.go:7.14,9.2 6 0',
+  'example.com/shop/pkg/a/a.go:7.14,9.2 6 1',
+  'example.com/shop/pkg/b/b.go:3.14,9.2 30 0',
+  '',
+].join('\n')
+
+test('a Go coverage run reads the profile it writes: statements weighted by each file\'s size, a block run twice counted once, and each folder\'s own figure', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...GO_MODULE }
+  const { notes, runs } = project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = GO_PROFILE
+      // per package, as go test prints it: their plain mean would be 50%
+      return { stdout: 'ok  example.com/shop/pkg/a  coverage: 100.0% of statements\nok  example.com/shop/pkg/b  coverage: 0.0% of statements\n', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(runs).toEqual([['go', 'test', './...', '-cover', '-coverprofile=.test-grader-go-cover.out']])
+  expect(notes).toEqual(['Coverage run (test-grader) finished: statements 25% (go test -coverprofile).\nLeast covered folders (statements): pkg/b/ 0%, pkg/ 25%.'])
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('"100% statements"')
+  expect(tree).toContain('"0% statements"')
+  expect(tree).not.toContain('% lines')
+})
+
+test('a Go coverage run that wrote no profile falls back to the mean of the figures it printed', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...GO_MODULE }
+  const { notes } = project(on, files, { editor: () => ({ stdout: 'ok  a  coverage: 40.0% of statements\nok  b  coverage: 60.0% of statements\n', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(notes).toEqual(['Coverage run (test-grader) finished: statements 50% (go test -cover).'])
+})

@@ -263,9 +263,14 @@ test('a test a measured mutation made fail is never graded hollow, while evidenc
 
   const claimed = await sendEvidence($, { file: 'src/a.test.ts', test: 'a shallow check', evidence: 'Measured by test-grader, not claimed: it failed.' })
   expect(claimed).toMatch(/^Still hollow: /)
+  expect(await askGrades($, { verdicts: ['hollow'] })).toContain('"a shallow check": hollow')
   const measured = await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b' } as never).then(r => String((r as { result: unknown }).result))
   expect(measured).toContain('Now strong: ')
-  expect(measured).toContain('so it is not hollow')
+  // the grade kept is strong: test_grades and the pane say so, not only the tool's answer
+  expect(await askGrades($, { verdicts: ['hollow'] })).not.toContain('"a shallow check"')
+  await ui.press({ key: 'r:/proj/src/a.test.ts:a shallow check' })
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text).some(t => t.includes('so it is not hollow'))).toBe(true)
+  expect(JSON.stringify(await ui.drawn())).toContain('"on evidence"')
 })
 
 

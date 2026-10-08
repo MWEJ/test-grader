@@ -9,6 +9,7 @@ import { caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts } from './excerpt'
 import type { Graded } from './excerpt'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
 import { costOf } from './prices'
+import { goProfileOf, moduleOf } from './gocover'
 import { FIX, FLAGGED, isFlagged, verdictOf } from './verdicts'
 import { runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
@@ -634,6 +635,12 @@ const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
     const head = (await $.fs.read(xmlPath)).slice(0, 2000)
     return { lines: attr(head, 'line-rate'), statements: null, branches: attr(head, 'branch-rate'), functions: null, source: 'coverage.xml', updatedAt: xmlAt }
   }
+  const profileAt = await mtime($, `${cwd}/${GO_PROFILE}`)
+  if (profileAt !== null) {
+    const goMod = await $.fs.read(`${cwd}/go.mod`).catch(() => '')
+    const { statements, byFile } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd)
+    if (statements !== null) return { byDir: byDirOf(byFile, cwd), lines: null, statements: pct(statements), branches: null, functions: null, source: 'go test -coverprofile', updatedAt: profileAt }
+  }
   const goAt = await mtime($, goPath)
   if (goAt !== null) {
     const text = await $.fs.read(goPath)
@@ -657,7 +664,8 @@ const refreshCoverage = async ($: EngineInterface): Promise<void> => {
 
 // The coverage report as the watch last saw it, by each report's modification time: a report
 // a run outside the pane writes shows in the pane within one watch period
-const REPORTS = ['coverage/coverage-summary.json', 'coverage/lcov.info', 'coverage.xml', '.test-grader-go-coverage.txt']
+const GO_PROFILE = '.test-grader-go-cover.out'
+const REPORTS = ['coverage/coverage-summary.json', 'coverage/lcov.info', 'coverage.xml', GO_PROFILE, '.test-grader-go-coverage.txt']
 let reportsAt = ''
 const refreshCoverageIfChanged = async ($: EngineInterface): Promise<void> => {
   const cwd = await $.session.cwd()
@@ -688,7 +696,9 @@ const detectCommand = async ($: EngineInterface, cwd: string): Promise<CoverComm
   if ((await exists('pytest.ini')) || (await exists('pyproject.toml')) || (await exists('setup.cfg'))) {
     return { argv: ['python3', '-m', 'pytest', '--cov', '--cov-report=xml'], label: 'pytest --cov' }
   }
-  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover'], label: 'go test ./... -cover', goOutput: '.test-grader-go-coverage.txt' }
+  // the profile gives each file's statements, so the total is weighted by package size and
+  // the folders can be told apart; the printed lines are kept for a run that wrote no profile
+  if (await exists('go.mod')) return { argv: ['go', 'test', './...', '-cover', `-coverprofile=${GO_PROFILE}`], label: 'go test ./... -coverprofile', goOutput: '.test-grader-go-coverage.txt' }
   return undefined
 }
 
@@ -705,7 +715,7 @@ const coverageNote = (command: CoverCommand, exitCode: number, output: string, c
   if (exitCode === 0) {
     const least = leastCovered(cov)
     return figures
-      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).${least.length > 0 ? `\nLeast covered folders (lines): ${least.join(', ')}.` : ''}`
+      ? `Coverage run (test-grader) finished: ${figures} (${cov!.source}).${least.length > 0 ? `\nLeast covered folders (${cov!.lines === null && cov!.statements !== null ? 'statements' : 'lines'}): ${least.join(', ')}.` : ''}`
       : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
@@ -1047,10 +1057,12 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   const now = await read($, tests)
   const redoTests = now.filter(t => isRedo(t) && t.status !== 'pending' && among(present, t.name))
   const redoNew = new Map(redoTests.map(t => [t.id, t.name]))
+  // stamped now: its new grade is newer than any Grade all run's, and is the one shown
+  const at = await $.clock.now()
   await update($, tests, list =>
     list
       .filter(t => t.file !== file || t.status === 'pending' || among(present, t.name))
-      .map(t => (redoNew.has(t.id) ? { ...t, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
+      .map(t => (redoNew.has(t.id) ? { ...t, at, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
   )
   // a test its last grade flagged gets the second look, when one is set; the rest the grader
   for (const isSecond of [true, false]) {
@@ -2040,7 +2052,7 @@ export const register: Register = (on, options) => {
         <Box key={`h-${key}`} flexDirection="row" gap={1} marginLeft={indent}>
           <Button key={key} plain label={`${open ? '▾' : '▸'} ${clamp(label, Math.max(16, columns - groupCounts.length - 10 - indent))}`} onPress={onPress} />
           <Text color={stateColor(worst)}>{groupCounts}</Text>
-          {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% lines`}</Text>}
+          {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% ${cov?.lines === null && cov?.statements !== null ? 'statements' : 'lines'}`}</Text>}
           {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
           {of.some(t => t.isModified) && <Text color={BLUE}>modified</Text>}
         </Box>

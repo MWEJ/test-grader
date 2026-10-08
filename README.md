@@ -204,9 +204,11 @@ The pane offers **Run coverage** when it finds a way to measure it, in this orde
 | `package.json` with vitest | `npx vitest run --coverage` |
 | `package.json` with jest | `npx jest --coverage` |
 | `pytest.ini`, `pyproject.toml` or `setup.cfg` | `pytest --cov` |
-| `go.mod` | `go test ./... -cover` |
+| `go.mod` | `go test ./... -cover -coverprofile=.test-grader-go-cover.out` |
 
-It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or the Go output. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
+It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or Go's coverage profile. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
+
+Go measures statements alone, so a Go project shows statements and nothing else: Go has no line, branch or function figures to show. From the profile, the total is weighted by each file's statements, a block two test runs both cover counts once, and each folder's row shows its own statement coverage. A run that wrote no profile falls back to the plain mean of the per-package figures `go test` printed.
 
 The pane follows the report: one written by a run outside the pane, from the shell or CI, shows within 2 seconds.
 
