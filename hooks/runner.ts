@@ -56,3 +56,9 @@ export const shown = (argv: readonly string[]): string => argv.map(a => (/^[\w./
 
 // the last lines a run printed, the empty ones left out
 export const tailOf = (output: string, lines: number): string => output.split('\n').filter(l => l.trim() !== '').slice(-lines).join('\n')
+
+// a run's output that says the code did not build or load, not that a test failed: Go's
+// [build failed] and compiler lines, TypeScript's error TS, a SyntaxError, Rust's error[E…],
+// javac's and Kotlin's compilation errors, Swift's and C#'s compiler errors
+export const isBuildFailure = (tail: string): boolean =>
+  /\[build failed\]|\[setup failed\]|^# \S+\n\S+\.go:\d+:\d+: |\berror TS\d+:|\bSyntaxError\b|\bIndentationError\b|\berror\[E\d+\]|COMPILATION ERROR|Compilation failed|\berror CS\d+:|\berror: cannot find symbol|^e: .*\.kt:/m.test(tail)

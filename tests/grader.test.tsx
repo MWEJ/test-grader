@@ -6,7 +6,7 @@ import type { Engine, On } from './helpers'
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const helper = "const helper = (n: number) => n * 2\n"
-  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => { expect(add(${i}, 1)).toBe(${i + 1}) })\n`).join('')
+  const old = Array.from({ length: 1200 }, (_, i) => `it('old case ${i}', () => { expect(add(${i}, 1)).toBe(${i + 1}) })\n`).join('')
   const added = "it('subtracts numbers', () => {\n  expect(sub(5, 3)).toBe(2)\n})\n"
   const content = helper + old + added
   expect(content.length).toBeGreaterThan(20_000)
@@ -69,7 +69,7 @@ test('a test generated in a loop is graded case by case: the loop and its data r
 
 test('in a long file, a looped test reaches the grader with the data above it', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const old = Array.from({ length: 1200 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
   const added = "\nconst SIZES = [['tiny', 1], ['huge', 9]]\nfor (const [name, n] of SIZES) {\n  it(`rounds ${name}`, () => { expect(round(n)).toBe(n) })\n}\n"
   const prompts: string[] = []
   on('session.cwd', async () => ({ value: '/proj' }) as never)
@@ -88,13 +88,13 @@ test('in a long file, a looped test reaches the grader with the data above it', 
 
   expect(prompts[0]).toContain("const SIZES = [['tiny', 1], ['huge', 9]]")
   expect(prompts[0]).toContain('for (const [name, n] of SIZES) {')
-  expect(prompts[0]).not.toContain('old case 399')
+  expect(prompts[0]).not.toContain('add(399, 1)')
 })
 
 
 test('in a long file, a looped test graded again by its cases\' names still reaches the grader with its loop, and is told which loop they come from', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const old = Array.from({ length: 1200 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
   const loop = "\nfor (const name of ['tiny', 'huge']) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBe(-7) })\n}\n"
   const files: Record<string, string> = { 'src/round.test.ts': old + loop }
   const { prompts } = project(on, files, { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge'] } })
@@ -113,7 +113,7 @@ test('in a long file, a looped test graded again by its cases\' names still reac
   expect(ASKED([regrade])).toEqual(['rounds huge', 'rounds tiny'])
   expect(regrade).toContain("for (const name of ['tiny', 'huge']) {")
   expect(regrade).toContain('expect(round(name)).toBe(-8)')
-  expect(regrade).not.toContain('old case 399')
+  expect(regrade).not.toContain('add(399, 1)')
   // told, after the source, which loop the cases come from
   expect(regrade.slice(regrade.lastIndexOf('```'))).toContain('rounds ${name}')
 })
@@ -181,7 +181,7 @@ test('a grader call has room in its reply for a looped test\'s every case', asyn
 // out, and brings the helpers they use from wherever in the file they are declared
 test('in a long file, a long case reaches the grader whole, with the helpers it uses from between other tests', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const old = (from: number) => Array.from({ length: 200 }, (_, i) => `it('old case ${from + i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const old = (from: number) => Array.from({ length: 600 }, (_, i) => `it('old case ${from + i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
   const helper = "\nconst MOCK_HOME = '/home/someone'\nfunction mockProject(dir: string) {\n  const off = listen(() => {\n    return dir\n  })\n  return { dir, home: MOCK_HOME, off }\n}\n"
   const unused = "\nconst NEVER_USED = 'left out'\n"
   const steps = Array.from({ length: 80 }, (_, i) => `  expect(step(p, ${i})).toBe(${i * 2})\n`).join('')

@@ -127,7 +127,7 @@ test('the results of Grade all tests, Regrade all and a coverage run are notes t
   // each whole: the counts, then what needs work and how to dispute it; the coverage figures
   const graded = [
     'Test grading (test-grader) finished: 2 graded · 1 strong · 1 shallow.',
-    'Need work, worst first:',
+    'Need work, worst first (hollow, then duplicate, then shallow, then brittle):',
     '- shallow · src/b.test.ts · a shallow check — shallow because. It would miss: a wrong edge.',
     'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   ].join('\n')

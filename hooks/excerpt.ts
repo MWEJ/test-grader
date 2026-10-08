@@ -1,10 +1,10 @@
-import type { Verdict } from '../types'
+import type { Confidence, Verdict } from '../types'
 import { verdictOf } from './verdicts'
 import { DECLARATION, among, caseNames, caseStarts, fits, isTemplate, langOf } from './discovery'
 
 // what the grader reads, and what its reply holds: pure text work, no engine calls
 
-export const MAX_SOURCE = 12_000
+export const MAX_SOURCE = 40_000
 // of a file too long to send whole: at most this much of its head (imports, helpers), and of
 // any one case under review
 export const MAX_HEAD = 12_000
@@ -55,6 +55,16 @@ export const excerptOf = (source: string, names: string[], file: string): string
   return out.join('\n\n')
 }
 
+// Of a file sent as an excerpt, the tests it leaves out, by name: the grader reads what the
+// siblings cover (TestX_ThresholdBoundary) before it calls a case missing
+const MAX_OTHERS = 80
+export const othersOf = (source: string, names: string[], file: string): string[] => {
+  const others = [...new Set(caseNames(source, file))].filter(n => !names.some(name => fits(n, name)))
+  if (others.length === 0) return []
+  const shown = others.slice(0, MAX_OTHERS).map(n => JSON.stringify(n)).join(', ')
+  return [`The tests left out, by name: ${shown}${others.length > MAX_OTHERS ? ` and ${others.length - MAX_OTHERS} more` : ''}. A case one of them covers by its name is not missing.`]
+}
+
 // a case's own text, from its start to the next case's (a looped case's: its loop's); null
 // when the file no longer has it
 export const caseTextOf = (source: string, name: string, file: string): string | null => {
@@ -77,7 +87,8 @@ export const loopsOf = (source: string, names: string[], file: string): string[]
 
 // the verdicts in a grader reply; of one cut off before its closing ], each object that
 // arrived whole (isCut)
-export const parseVerdicts = (text: string): { verdicts: { name: string; summary: string; verdict: Verdict; reason: string }[]; isCut: boolean } => {
+const CONFIDENCES: readonly unknown[] = ['high', 'medium', 'low']
+export const parseVerdicts = (text: string): { verdicts: Graded[]; isCut: boolean } => {
   const start = text.indexOf('[')
   if (start < 0) return { verdicts: [], isCut: false }
   const objects: unknown[] = []
@@ -111,14 +122,15 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
     if (typeof o.name !== 'string' || !verdict) return []
     const reason = String(o.reason ?? '')
     const missed = typeof o.missed === 'string' ? o.missed.trim() : ''
+    const sure = typeof o.confidence === 'string' && CONFIDENCES.includes(o.confidence.trim().toLowerCase()) ? { confidence: o.confidence.trim().toLowerCase() as Confidence } : {}
     // shallow only with a bug the grader can name; told whoever fixes it, as the case to add
-    if (verdict === 'shallow' && missed === '') return [{ name: o.name, summary: String(o.summary ?? ''), verdict: 'strong', reason: `${reason} (Graded strong: no bug it would miss was named.)`.trim() }]
-    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: verdict === 'shallow' ? `${reason} It would miss: ${missed}` : reason }]
+    if (verdict === 'shallow' && missed === '') return [{ name: o.name, summary: String(o.summary ?? ''), verdict: 'strong', reason: `${reason} (Graded strong: no bug it would miss was named.)`.trim(), ...sure }]
+    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: verdict === 'shallow' ? `${reason} It would miss: ${missed}` : reason, ...sure }]
   })
   return { verdicts, isCut: !isClosed }
 }
 
-export type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
+export type Graded = { name: string; summary: string; verdict: Verdict; reason: string; confidence?: Confidence }
 
 // A test the grader graded case by case (Test › xdr role, Test/xdr role, Test > xdr role) when
 // asked for the test: one verdict for it, the worst of its cases', its reason saying which case

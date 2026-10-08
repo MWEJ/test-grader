@@ -6,7 +6,7 @@ test('evidence the grader accepts turns a shallow test strong, and the row says 
   const clock = mock.clock(on, { now: 1_000_000 })
   const { prompts, tools } = project(on, { 'src/e.test.ts': E_TEST }, { rule: swayed })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
-  expect([...tools].sort()).toEqual(['test_evidence', 'test_grade', 'test_grades', 'test_verify'])
+  expect([...tools].sort()).toEqual(['test_context', 'test_evidence', 'test_grade', 'test_grades', 'test_verify'])
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
@@ -381,6 +381,25 @@ test('test_verify whose run with the mutation fails to start puts the file back 
   const answer = await verifyWith($, { file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b' })
 
   expect(answer).toMatch(/^The run with the mutation failed to start: .*spawn npx ENOENT\. The file is back as it was; nothing was regraded\.$/)
+  expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
+  expect(prompts).toHaveLength(0)
+})
+
+
+test('test_verify whose mutation does not build refuses it as measuring nothing, puts the file back and regrades nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...ADDING }
+  const { prompts } = project(on, files, {
+    editor: argv =>
+      files['src/add.ts']!.includes('a - c') ? { stdout: "src/add.ts(1,48): error TS2304: Cannot find name 'c'.", exitCode: 1 } : { stdout: `PASS ${argv[2]}` },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await verifyWith($, { file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - c' })
+
+  expect(answer).toMatch(/^The mutated code did not build, so the test never ran: that measures nothing\./)
+  expect(answer).toContain("error TS2304: Cannot find name 'c'.")
   expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
   expect(prompts).toHaveLength(0)
 })
@@ -784,4 +803,94 @@ test('/test-grader report gives the line coverage, lists the strong tests last, 
   const json = JSON.parse(files['test-grader-report.json']!) as { coverage: unknown; tests: { line: number | null }[] }
   expect(json.coverage).toEqual({ lines: 82.5, branches: 61.2, functions: 75, statements: 80 })
   expect(json.tests.map(t => t.line)).toEqual([2, null, null, 1])
+})
+
+
+test('a grade the grader was not sure of says so on its row and in test_grades', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const unsure = { isAnswered: true, usage: {}, text: '[{"name":"a shallow check","summary":"s","verdict":"strong","reason":"Checks the sum.","confidence":"low"}]' }
+  project(on, { ...ADDING }, { reply: () => unsure })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toContain('low confidence')
+  expect(await askGrades($, { verdicts: ['strong'] })).toContain('src/a.test.ts:3 "a shallow check": strong (low confidence)')
+})
+
+const contextOf = ($: Engine, input: Record<string, string>) =>
+  $.tool.call({ tool: 'mcp__test-grader__test_context', ...input } as never).then(r => String((r as { result: unknown }).result))
+
+test('test_context shows the grader the whole short file, the code under test and the test\'s last grade', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { ...ADDING })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const said = await contextOf($, { file: 'src/a.test.ts', test: 'a shallow check' })
+  expect(said).toContain(`The test file, whole (${ADDING['src/a.test.ts']!.length} characters):\n\`\`\`\n${ADDING['src/a.test.ts']}\n\`\`\``)
+  expect(said).toContain('export const add = (a: number, b: number) => a + b')
+  expect(said).toContain('Review ONLY these test cases: ["a shallow check"]')
+  expect(said).toContain('Its last grade: shallow: shallow because. It would miss: a wrong edge.')
+})
+
+test('test_context of a long file shows the excerpt and names the tests it leaves out', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  const many = Array.from({ length: 1200 }, (_, i) => `it('case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  project(on, { 'src/long.test.ts': `import { add } from './add'\n\n${many}`, 'src/add.ts': ADDING['src/add.ts']! })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  const said = await contextOf($, { file: '/proj/src/long.test.ts', test: 'case 7' })
+  expect(said).toMatch(/The test file, as an excerpt \(\d+ of \d+ characters\):/)
+  expect(said).toContain('expect(add(7, 1)).toBe(8)')
+  expect(said).not.toContain('expect(add(8, 1))')
+  expect(said).toContain('The tests left out, by name: "case 0", "case 1"')
+  expect(said).toContain('It has no grade yet.')
+})
+
+test('test_context of a test the file does not hold says so', async ($, on) => {
+  project(on, { ...ADDING })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  expect(await contextOf($, { file: 'src/a.test.ts', test: 'adds' })).toBe('There is no test named "adds" in src/a.test.ts.')
+  expect(await contextOf($, { file: 'src/gone.test.ts', test: 'adds' })).toBe('There is no file src/gone.test.ts.')
+})
+
+// three tests of add: the sum one and the sign one catch a - b, the other does not; broken
+// fails with the code unchanged too
+const SIBLINGS: Record<string, string> = {
+  ...ADDING,
+  'src/a.test.ts': "import { add } from './add'\n\nit('a shallow check', () => {\n  expect(add(1, 2)).toBe(3)\n})\nit('adds a sign', () => {\n  expect(add(-1, 2)).toBe(1)\n})\nit('is a function', () => {\n  expect(typeof add).toBe('function')\n})\nit('broken', () => {\n  expect(add(1, 1)).toBe(3)\n})\n",
+}
+const siblingsShell = (files: Record<string, string>): Shell => argv => {
+  const said = argv.join(' ')
+  const isMutated = files['src/add.ts']!.includes('a - b')
+  const fails = said.includes('broken') || (isMutated && (said.includes('a shallow check') || said.includes('adds a sign')))
+  return fails ? { stdout: 'FAIL src/a.test.ts\n  ● expected', exitCode: 1 } : { stdout: 'PASS src/a.test.ts' }
+}
+
+test('test_verify with siblings names the other tests that fail with the mutation too, leaving out one that fails anyway', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...SIBLINGS }
+  const { prompts } = project(on, files, { editor: siblingsShell(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b', siblings: true } as never).then(r => String((r as { result: unknown }).result))
+
+  expect(answer).toContain('Other tests in the file also failed with it: "adds a sign" (of 3 run). "broken" failed unchanged too, so it is not counted.')
+  expect(prompts.at(-1)).toContain('Other tests in the file also failed with it: \\"adds a sign\\"')
+  expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
+})
+
+test('test_verify with siblings says when this test alone catches the change', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...SIBLINGS, 'src/a.test.ts': SIBLINGS['src/a.test.ts']!.replace("it('adds a sign', () => {\n  expect(add(-1, 2)).toBe(1)\n})\n", '') }
+  project(on, files, { editor: siblingsShell(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b', siblings: true } as never).then(r => String((r as { result: unknown }).result))
+  expect(answer).toContain('No other test in the file failed with it (2 run): this test alone catches the change.')
 })

@@ -1,4 +1,6 @@
 export type Verdict = 'strong' | 'shallow' | 'brittle' | 'hollow' | 'duplicate'
+/** how sure the grader was: medium or low when another reviewer could fairly grade it otherwise; none from before it was asked */
+export type Confidence = 'high' | 'medium' | 'low'
 
 export type TrackedTest = {
   id: string
@@ -9,6 +11,7 @@ export type TrackedTest = {
   summary?: string
   verdict?: Verdict
   reason?: string
+  confidence?: Confidence
   /** a Go suite test's suite */
   suite?: string
   /** what the session sent to have it regraded, when its verdict was given on evidence */
@@ -31,7 +34,7 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string; evidenceOf?: string }
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; confidence?: Confidence; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string; evidenceOf?: string }
 
 /** Grade all tests: how far a run has got, and what the last one found */
 // hashes: each graded file's contents, as fingerprinted when its results were made

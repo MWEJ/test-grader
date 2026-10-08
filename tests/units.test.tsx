@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
-import { asAsked, excerptOf, foldCases, parseVerdicts, unratedWhy } from '../hooks/excerpt'
+import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
+import { isBuildFailure } from '../hooks/runner'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -202,9 +203,9 @@ test('a file with no lines adds no folder to the coverage by folder', () => {
 
 
 test('a long Python file is excerpted with its left-out tests noted in a Python comment', () => {
-  const cases = Array.from({ length: 400 }, (_, i) => `def test_${i}():\n    assert f(${i}) == ${i}\n`).join('')
+  const cases = Array.from({ length: 1500 }, (_, i) => `def test_${i}():\n    assert f(${i}) == ${i}\n`).join('')
   const source = `import f\n\n${cases}`
-  expect(source.length).toBeGreaterThan(12_000)
+  expect(source.length).toBeGreaterThan(40_000)
   expect(excerptOf(source, ['test_5'], 'tests/test_f.py')).toBe(['import f', '# … other tests left out …', 'def test_5():\n    assert f(5) == 5', '# … other tests left out …'].join('\n\n'))
 })
 
@@ -364,4 +365,68 @@ test('a case goes to the longest asked name it extends, not to a shorter name it
 test('a name that only starts like an asked test, with no case mark after it, is left as it is', () => {
   const stray = graded(`${TABLE}Extra`, 'hollow')
   expect(foldCases([TABLE], [stray, graded(`${TABLE} more words`, 'strong')]).map(v => v.name)).toEqual([`${TABLE}Extra`, `${TABLE} more words`])
+})
+
+// of a file sent as an excerpt, the tests left out, named for the grader
+const GO_FILE = 'internal/scale_test.go'
+const goTests = (names: string[]) => names.map(n => `func ${n}(t *testing.T) {\n\tcheck(t)\n}\n`).join('\n')
+
+test('an excerpt names the tests it leaves out, not the ones asked about', () => {
+  const source = goTests(['TestDelta_LargeIncrease', 'TestDelta_ThresholdBoundary', 'TestDelta_Zero'])
+  expect(othersOf(source, ['TestDelta_LargeIncrease'], GO_FILE)).toEqual([
+    'The tests left out, by name: "TestDelta_ThresholdBoundary", "TestDelta_Zero". A case one of them covers by its name is not missing.',
+  ])
+})
+
+test('an excerpt of a file whose every test is asked about names none left out', () => {
+  expect(othersOf(goTests(['TestA', 'TestB']), ['TestA', 'TestB'], GO_FILE)).toEqual([])
+})
+
+test('an excerpt names at most 80 tests left out, and counts the rest', () => {
+  const names = Array.from({ length: 83 }, (_, i) => `TestCase${i}`)
+  const [line] = othersOf(goTests(['TestAsked', ...names]), ['TestAsked'], GO_FILE)
+  expect(line).toContain('"TestCase79" and 3 more.')
+  expect(line).not.toContain('"TestCase80"')
+})
+
+// a mutated run's output, told apart: the code did not build, or a test failed
+for (const [what, tail] of [
+  ['Go', 'FAIL\texample.com/shop/internal/gitops [build failed]'],
+  ['Go compiler', '# example.com/shop/internal/gitops\ninternal/gitops/plan.go:12:3: undefined: stepss'],
+  ['TypeScript', "src/add.ts(1,40): error TS2304: Cannot find name 'c'."],
+  ['JavaScript', 'SyntaxError: Unexpected token )'],
+  ['Rust', 'error[E0425]: cannot find value `x` in this scope'],
+] as const) {
+  test(`a ${what} build failure is told apart from a failing test`, () => {
+    expect(isBuildFailure(tail)).toBe(true)
+  })
+}
+
+test('a failing test is not taken for a build failure', () => {
+  expect(isBuildFailure('--- FAIL: TestPlan (0.00s)\n    plan_test.go:40: got 3 steps, want 4\nFAIL\texample.com/shop/internal/gitops\t0.012s')).toBe(false)
+  expect(isBuildFailure('FAIL src/a.test.ts\n  ● adds\n    Expected: 3\n    Received: -1')).toBe(false)
+})
+
+// how sure the grader was, read from its reply and kept with the grades
+test('a verdict keeps the confidence the grader gave, whatever its case', () => {
+  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"brittle","reason":"r","confidence":"Low"},{"name":"b","summary":"s","verdict":"strong","reason":"r","confidence":"high"}]')
+  expect(verdicts.map(v => v.confidence)).toEqual(['low', 'high'])
+})
+
+test('a confidence the grader left out or wrote as no known level is left off the verdict', () => {
+  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"strong","reason":"r"},{"name":"b","summary":"s","verdict":"strong","reason":"r","confidence":"very"}]')
+  expect(verdicts.map(v => 'confidence' in v)).toEqual([false, false])
+})
+
+test('a medium or low confidence is kept with the grades, and a high one left out as the default', () => {
+  const saved: SavedGrades = {
+    results: [
+      { file: '/p/a.test.ts', name: 'low', verdict: 'shallow', reason: 'r', confidence: 'low' },
+      { file: '/p/a.test.ts', name: 'medium', verdict: 'strong', confidence: 'medium' },
+      { file: '/p/a.test.ts', name: 'high', verdict: 'strong', confidence: 'high' },
+    ],
+    hashes: { '/p/a.test.ts': 'h' },
+  }
+  const back = unkeep(JSON.parse(JSON.stringify(keep(saved, false))))
+  expect(back.results.map(t => [t.name, t.confidence])).toEqual([['low', 'low'], ['medium', 'medium'], ['high', undefined]])
 })

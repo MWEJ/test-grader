@@ -51,7 +51,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Three rounds per test.** A test still flagged after three rounds is reported once more, telling Claude to tell you what is left. After that, test-grader stops on it. Evidence the grader rejects counts as a round too.
 - **A suggestion after the turn.** When a turn ends with flagged tests Claude wrote, the prompt box offers "Fix the 2 flagged tests you wrote this session", once for each set of such tests. It is only a suggestion: nothing is sent unless you send it.
 - **The pane follows the files as they change.** Every 2 seconds, the listed test files are checked for changes made outside Claude's Write and Edit: by the shell, an editor or a checkout. Their new and removed tests show at once, and changed tests are graded again. A file whose modification time has not changed is not read again. Right after each shell command, and every 10 seconds otherwise, the project's test files are listed again: a new one shows ungraded, with no grader call, and a removed one leaves the pane with its grades. The same check runs at the end of each turn.
-- **Grade all tests** grades the whole project. It grades only the tests not rated yet: every test of a file changed since its last grading, and in an unchanged file only the tests with no verdict (the rated ones keep theirs). Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, then the flagged tests, worst first. No turn starts for it.
+- **Grade all tests** grades the whole project. It grades only the tests not rated yet: every test of a file changed since its last grading, and in an unchanged file only the tests with no verdict (the rated ones keep theirs). Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, the files changed since their last grading and those graded for the first time (once the project has been graded before), then the flagged tests, worst first: hollow, then duplicate, shallow and brittle. No turn starts for it.
 - **Stop** cuts a run short. No more grader calls start, the tests not yet graded keep what they had, and the pane says how far the run got. The next run grades the rest.
 - **Regrade all** grades every file again, unchanged ones included.
 - **↻ Regrade** on a folder's, a file's or a suite's row grades just those files again, the rest of the project's grades left as they are. Claude's note names what was graded, as in "finished for src/api/".
@@ -66,11 +66,15 @@ The grader is `haiku` by default: the alias, which Claude Code resolves to the H
 - **Strong unless shown otherwise.** The grader defaults to strong, and where it is unsure it answers strong. It judges a test against the whole file: one case is enough when other tests cover the edges, or when that case is all the test's name promises. It never marks a test down for code it cannot see.
 - **Shallow needs a named bug.** A shallow grade must name a bug the test would let through: an input, and the wrong result it would still pass. That bug is added to the reason, as the case to add. A shallow grade with none counts as strong.
 - **A flag is confirmed before it is told.** When a first, quick pass flags a test, a second, more careful call checks it: the second-look model when one is set, else the grader model at its own effort. The flag stands only if that call agrees, and its grade and reason are the ones given. If that call fails, the first grade stands, and the pane says the call failed. Tests graded strong cost no second call.
+- **Strict mocks count as assertions.** A gomock controller fails a test on any call it was not told to expect, and an `EXPECT()` with no `Times` means exactly once; mockery and Mockito's strict stubs work the same way. The grader is told so, and never calls such a test hollow or shallow for passing if the mock is never called.
+- **A contract is not an implementation detail.** Exact names, order or shapes that callers rely on, such as the steps a plan holds or the keys of a payload, are behaviour: asserting them is not brittle.
+- **Each grade says how sure it is.** The grader rates its confidence: high when the source shows the verdict plainly, medium when it rests on code it can only partly see or on a judgement call, low when another careful reviewer could fairly grade it otherwise. A medium or low grade says so on its row ("low confidence"), in `test_grades` and in Claude's notes, so a grade that may read otherwise on a regrade can be told from a settled one.
+- **A regrade keeps grades steady.** The grader gives no fixed answers, so the same test can read differently from one run to the next. When Regrade all, a row's Regrade or `test_grade` with `again` grades a file unchanged since its last grading, the grader is shown each test's last grade and reason, and is told to keep it unless it finds it wrong, saying what the last grade got wrong.
 - **A grade is for the text it read.** If a test's own code changes while it is being graded, by an outside edit, the grade is thrown away and the test is graded again on its new code. A change elsewhere in the file leaves the grade be.
 
 #### What the grader reads
 
-- **The test file.** A file under 12,000 characters is sent whole. A longer file is sent as an excerpt: the file's head, every test under review in full, and the helpers and constants those tests use, wherever in the file they are declared. Other tests are left out, and the grader is told it is reading an excerpt.
+- **The test file.** A file under 40,000 characters is sent whole, so the grader sees what the other tests cover. A longer file is sent as an excerpt: the file's head, every test under review in full, and the helpers and constants those tests use, wherever in the file they are declared. Other tests are left out, but named (up to 80): the grader is told a case one of them covers by its name, such as `TestDelta_ThresholdBoundary`, is not missing.
 - **The code under test.** The grader judges each assertion against what that code really does. It reads up to four files, 16,000 characters in all:
   - in JavaScript and TypeScript, the files the test imports by a relative path;
   - in Python, `from … import` modules;
@@ -129,7 +133,7 @@ Only code counts. A test written inside a string literal or a comment, such as a
 | Language | Test files | Tests |
 | --- | --- | --- |
 | JavaScript and TypeScript | `*.test.*`, `*.spec.*`, files in `__tests__/`, `test/` or `tests/` | `it(…)`, `test(…)` and `Deno.test(…)`, with `.only`, `.skip`, `.concurrent`, `.todo`, `.fails` and `.each` |
-| Go | `*_test.go` | `func TestX(…)`, and testify suite methods `func (s *Suite) TestX()` |
+| Go | `*_test.go` | `func TestX(…)`, and testify suite methods `func (s *Suite) TestX()`; not `TestMain`, which sets the package's tests up |
 | Python | `test_*.py`, `*_test.py` | `def test_x`, in a class or not |
 | Ruby | `*_test.rb`, `test_*.rb`, `*_spec.rb` | `def test_x`, `test "…" do`, and RSpec's `it`, `specify`, `example` and `scenario` |
 | Swift | `*Test.swift`, `*Tests.swift` | `func testX()`, and Swift Testing's `@Test func` |
@@ -184,6 +188,15 @@ Claude can grade tests itself, as Grade all tests does, and wait for the result:
 
 By default it grades the tests not rated yet and keeps the grades that stand, so it is the way to retry unrated tests. While another run is under way it says so and grades nothing.
 
+#### What the grader read: `test_context`
+
+When a grade looks wrong, `test_context` shows exactly what a plain grade of that test sends the grader: the test file (whole, or the excerpt and the names of the tests it leaves out), the code under test it was given, the project's rules, what it is asked, and the test's last grade. It tells a misjudged test from a grader that could not see the helper or the sibling test it needed. It asks for no permission.
+
+| Input | What it does |
+| --- | --- |
+| `file` | the test file, absolute or relative to the project |
+| `test` | the test's name, as `test_grades` lists it |
+
 #### Sending evidence: `test_evidence`
 
 When a test is better or worse than its rating, Claude can send evidence. The best evidence is a mutation of the code that makes this test fail, with the command run and the output before and after. The grader cannot run code. It checks each claim against the source and the code under test, and it rejects evidence that only says the test passes, or that it has coverage. A verdict given on evidence is marked as such in the pane, and it holds while the test's own code is unchanged: edits to other tests, Grade all and Regrade all leave it be. An edit to the test itself grades it again, without the evidence.
@@ -193,11 +206,11 @@ When a test is better or worse than its rating, Claude can send evidence. The be
 `test_verify` measures the evidence instead of taking Claude's word for it:
 
 1. It runs the test unchanged with the project's runner. The test must pass.
-2. It replaces one exact piece of text in one file of the code under test. The piece must be found exactly once, and the file must not be a test file.
+2. It replaces one exact piece of text (`find`) in the `mutate` file, the code under test. The piece must be found in that file exactly once, and the file must not be a test file.
 3. It runs the test again.
 4. It puts the file back as it was, and checks that it is.
 
-If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. A test a measured mutation made fail is never graded hollow. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
+If the mutated code did not build (Go's `[build failed]` or a compiler error, TypeScript's `error TS…`, a `SyntaxError`, Rust's `error[E…]`, a Java, Kotlin or C# compilation error), the test never ran, so the tool refuses it as measuring nothing and asks for a change that compiles. If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. A test a measured mutation made fail is never graded hollow. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. With `siblings: true`, the file's other tests (up to 20) are run too while the mutation is in place, and the answer and the evidence say which of them also fail: "this test alone catches the change", or which others do. A test that also fails on the unchanged code is run again to check, and is not counted. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
 
 ### Running one test
 

@@ -184,3 +184,8 @@ test('a case opens at its own line; one no longer in the file at the top', () =>
   expect(caseLine(text, 'gone', 'src/a.test.ts')).toBe(1)
 })
 
+
+test("Go's TestMain sets a package's tests up and is not listed as one", () => {
+  const text = 'package gitops\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(m.Run())\n}\n\nfunc TestMainline(t *testing.T) {\n\tcheck(t)\n}\n'
+  expect(caseNames(text, 'internal/gitops/main_test.go')).toEqual(['TestMainline'])
+})

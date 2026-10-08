@@ -27,7 +27,10 @@ export const RUBRIC = [
   'expect(error.message.startsWith("Invalid amount")) where the message prefix is what callers rely on: strong.',
   'expect(total(items)).toBeDefined(): shallow, missed: "total([{price: 2}, {price: 3}]) returning 4 would pass".',
   'expect(fn).toHaveBeenCalledTimes(3) on an internal helper: brittle. expect(true).toBe(true): hollow.',
-  'Return a JSON array: [{"name": string, "summary": string, "verdict": "strong"|"shallow"|"brittle"|"hollow"|"duplicate", "reason": string, "missed": string}], missed empty unless the verdict is "shallow"',
+  'Strict mocks assert by themselves: a gomock controller fails the test on any call it was not told to expect, and an EXPECT() with no Times means exactly once; mockery, Mockito strict stubs and the like work the same way. A test built on them checks its calls even with no assertion after them: never call it hollow or shallow for "passing if the mock is never called".',
+  'Exact names, order or shapes are behaviour, not implementation details, when they are the contract callers rely on: which steps a plan holds, the keys of a payload, the order of a public list. Asserting them is not brittle; brittle is pinning what could change without any caller noticing.',
+  'confidence: "high" when the source shows the verdict plainly; "medium" when it rests on code you can only partly see, or on a judgement call; "low" when another careful reviewer could fairly give a different verdict.',
+  'Return a JSON array: [{"name": string, "summary": string, "verdict": "strong"|"shallow"|"brittle"|"hollow"|"duplicate", "reason": string, "missed": string, "confidence": "high"|"medium"|"low"}], missed empty unless the verdict is "shallow"',
 ].join('\n')
 
 // the rounds Claude gets to fix a flagged test, as the notes and the system prompt promise
@@ -48,7 +51,7 @@ export const GRADING_SECTION = [
   '- Make it deterministic: fixed clocks, seeds and data; no sleeps, no order dependence, no shared mutable state.',
   '- No snapshots unless the snapshot is small and reviewed; assert on what the code does, not on how it does it.',
   'Grades arrive as notes; nothing waits on them. When you have finished writing or editing tests for the task, call test_grades with written: true. Fix each flagged test as its grade asks, worst first: rewrite a hollow one, delete or merge a duplicate, add the missing case to a shallow one, and loosen a brittle one to assert on behaviour.',
-  'Where one is better than rated, prove it: test_verify runs it, applies a mutation to the code under test, runs it again and puts the file back, and sends what it measured as evidence. Or send test_evidence: run the test unchanged (it must pass), apply the mutation, run again (it must fail), revert, and quote both results.',
+  'Where one is better than rated, prove it: test_verify runs it, applies a mutation to the code under test, runs it again and puts the file back, and sends what it measured as evidence; with siblings: true it also says which other tests in the file catch the change. Or send test_evidence: run the test unchanged (it must pass), apply the mutation, run again (it must fail), revert, and quote both results. Where a grade looks wrong, test_context shows what the grader read for that test.',
   `Each change is graded again; call test_grades again to see the new grades. Tests listed as being graded: wait a moment and ask again. Tests listed as unrated or never graded: test_grade grades them and answers with the result. After ${MAX_ROUNDS} rounds on one test, tell the person what is left instead.`,
 ].join('\n')
 
@@ -92,17 +95,19 @@ export const EVIDENCE_SCHEMA = {
 // put back. What was run and what came of it goes to the grader as evidence. It changes files
 // and runs commands, so the person is asked before it runs
 export const VERIFY_TOOL = 'test_verify'
+export const VERIFY_SIBLINGS = 20
 export const VERIFY_DESCRIPTION =
   'Have test-grader measure whether a test catches a bug: it runs the test unchanged (it must pass), applies your mutation to the code under test (replace one exact piece of text in one file), runs the test again (it should fail), and puts the file back. ' +
-  'What it measured is sent to the grader as evidence, and the test regraded. Use it for a test you believe is better than its grade: pick a mutation that breaks the behaviour the test asserts.'
+  'What it measured is sent to the grader as evidence, and the test regraded. Use it for a test you believe is better than its grade: pick a mutation that breaks the behaviour the test asserts and still compiles; a mutation that does not build measures nothing, and is refused.'
 export const VERIFY_SCHEMA = {
   type: 'object',
   properties: {
     file: { type: 'string', description: 'The test file, absolute or relative to the project' },
     test: { type: 'string', description: 'The test name, as test_grades lists it' },
     mutate: { type: 'string', description: 'The file of code under test to change for the second run (not a test file)' },
-    find: { type: 'string', description: 'Exact text in that file, found exactly once, to replace' },
+    find: { type: 'string', description: 'Exact text in the mutate file (the code under test, never the test file), found there exactly once, to replace' },
     replace: { type: 'string', description: 'What to put in its place: a plausible bug' },
+    siblings: { type: 'boolean', description: `Also run the file's other tests with the mutation (up to ${VERIFY_SIBLINGS}) and report which of them fail too: whether this test alone catches the change` },
   },
   required: ['file', 'test', 'mutate', 'find', 'replace'],
 }
@@ -143,3 +148,20 @@ export const GRADE_SCHEMA = {
     again: { type: 'boolean', description: 'Grade every test in scope again, the rated ones too' },
   },
 }
+
+// the session's tool to see what the grader reads for a test: to tell a misjudged test from a
+// grader that could not see what it needed
+export const CONTEXT_TOOL = 'test_context'
+export const CONTEXT_MAX = 60_000
+export const CONTEXT_DESCRIPTION =
+  'Show exactly what test-grader\'s grader reads for one test: the test file as sent (whole, or the excerpt and the tests it leaves out), the code under test it was given, the project\'s rules, and what it is asked, with the test\'s last grade. ' +
+  'Use it when a grade looks wrong, to see whether the grader could see the helper, the sibling test or the code it needed.'
+export const CONTEXT_SCHEMA = {
+  type: 'object',
+  properties: {
+    file: { type: 'string', description: 'The test file, absolute or relative to the project' },
+    test: { type: 'string', description: 'The test name, as test_grades lists it' },
+  },
+  required: ['file', 'test'],
+}
+

@@ -178,7 +178,7 @@ test('a finished run leaves Claude a note: the counts, then every shallow, hollo
 
   expect(notes).toEqual([
     'Test grading (test-grader) finished: 4 graded · 1 strong · 1 hollow · 1 shallow · 1 unrated.\n' +
-      'Need work, worst first:\n' +
+      'Need work, worst first (hollow, then duplicate, then shallow, then brittle):\n' +
       '- hollow · src/math.test.ts · does nothing — hollow because.\n' +
       '- shallow · src/more.test.ts · a shallow check — shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.\n' +
@@ -697,3 +697,44 @@ for (const [label, ignored, says] of [
     expect(prompts).toEqual([])
   })
 }
+
+test('Regrade all shows the grader the grades an unchanged file had, and a changed file none', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'src/same.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+    'src/edited.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+  }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  files['src/edited.test.ts'] = "it('adds', () => { expect(add(2, 2)).toBe(4) })\n"
+
+  const before = prompts.length
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10)
+  const firstOf = (file: string) => prompts.slice(before).find(p => p.includes(`Test file: /proj/src/${file}`) && !p.includes('A first, quick pass flagged these'))!
+  expect(firstOf('same.test.ts')).toContain('These were graded before, on this same text: [{"name":"a shallow check","verdict":"shallow","reason":"shallow because. It would miss: a wrong edge."}]')
+  expect(firstOf('edited.test.ts')).not.toContain('These were graded before')
+})
+
+test("a run's note names the files changed since their last grading, and those graded for the first time, but not on a project's first run", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = {
+    'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+    'src/b.test.ts': "it('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n",
+  }
+  const { notes } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(notes.at(-1)).toBe('Test grading (test-grader) finished: 2 graded · 2 strong.')
+
+  files['src/a.test.ts'] = "it('adds', () => { expect(add(2, 2)).toBe(4) })\n"
+  files['src/c.test.ts'] = "it('multiplies', () => { expect(mul(2, 3)).toBe(6) })\n"
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(notes.at(-1)).toContain('Changed since their last grading: src/a.test.ts.\nGraded for the first time: src/c.test.ts.')
+})

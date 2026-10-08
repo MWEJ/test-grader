@@ -55,7 +55,8 @@ const ATTRS = String.raw`(?:\s*(?:@\w+(?:${ARGS})?|\[[^\]\n]*\]|#\[[^\]\n]*\]))*
 export const CASE_PATTERNS: Record<Kind, Pattern[]> = {
   js: [open(JS_CASE)],
   go: [
-    open(/\bfunc\s+(Test\w+)\s*\(/g),
+    // TestMain(m *testing.M) sets the package's tests up: it is not one
+    open(/\bfunc\s+(Test(?!Main\b)\w+)\s*\(/g),
     // a Go suite's test: a Test method of the suite type (testify)
     open(/\bfunc\s+\(\s*\w+\s+\*?(\w+)\s*\)\s+(Test\w+)\s*\(/g),
   ],
