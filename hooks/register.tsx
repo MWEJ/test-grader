@@ -7,7 +7,7 @@ import { TEST_FILE, among, caseLine, caseNames, casesAround, changedCases, cases
 import type { Kind } from './discovery'
 import { clamp, excerptOf, parseVerdicts } from './excerpt'
 import type { Graded } from './excerpt'
-import { modelOf, workersOf } from './settings'
+import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
 import { FIX, FLAGGED, isFlagged, verdictOf } from './verdicts'
 import { runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
@@ -27,6 +27,7 @@ const rounds = atom({ plugin: 'test-grader', key: 'rounds' } as const, {})
 const outbox = atom({ plugin: 'test-grader', key: 'outbox' } as const, { accepted: [], going: [], spent: [] })
 const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
 const saveError = atom({ plugin: 'test-grader', key: 'saveError' } as const, null)
+const graderError = atom({ plugin: 'test-grader', key: 'graderError' } as const, null)
 const testRuns = atom({ plugin: 'test-grader', key: 'testRuns' } as const, {})
 const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
 
@@ -50,7 +51,7 @@ let parallel = 10
 const MAX_REPLY = 4000
 // the model that grades, from the graderModel setting; set as the module loads, and a change
 // to the setting reloads the module
-let graderModel: string = 'haiku'
+let graderModel: string = DEFAULT_MODEL
 // grades again what the first grade flagged (a regrade, evidence, a last round), when set
 let escalateModel: string | null = null
 
@@ -260,6 +261,7 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
     const reply = await $.model.complete(request, signal ? { signal } : undefined)
     addUsage(spent, reply.usage)
     if (reply.isAnswered) {
+      await update($, graderError, () => null)
       const { verdicts, isCut } = parseVerdicts(reply.text)
       if (isCut) {
         $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
@@ -267,7 +269,10 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       return verdicts
     }
     if (attempt >= RETRIES || !isPassing(reply as never)) {
-      $.ui.log(`test-grader: the grader gave no answer for ${file} (${reply.reason}${'status' in reply ? ` ${reply.status ?? ''} ${reply.error}` : ''})`, { to: 'debug' })
+      const why = `${reply.reason}${'status' in reply ? ` ${reply.status ?? ''} ${reply.error}` : ''}`
+      $.ui.log(`test-grader: the grader gave no answer for ${file} (${why})`, { to: 'debug' })
+      // shown in the pane: a setting or an account that cannot reach the model says so there
+      await update($, graderError, () => `The grader (${request.model}) gave no answer: ${why}.`)
       return null
     }
     // 2s, 4s, 8s, each with up to a second more, so parallel calls do not retry together
@@ -936,19 +941,25 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   if (known.size > 0) await update($, modified, all => [...new Set([...all, ...known])].slice(-MAX_TESTS))
 
   const now = await read($, tests)
-  const redoNew = new Map(now.filter(t => isRedo(t) && t.status !== 'pending' && among(present, t.name)).map(t => [t.id, t.name]))
+  const redoTests = now.filter(t => isRedo(t) && t.status !== 'pending' && among(present, t.name))
+  const redoNew = new Map(redoTests.map(t => [t.id, t.name]))
   await update($, tests, list =>
     list
       .filter(t => t.file !== file || t.status === 'pending' || among(present, t.name))
       .map(t => (redoNew.has(t.id) ? { ...t, status: 'pending' as const, verdict: undefined, summary: undefined, reason: undefined } : t)),
   )
-  if (redoNew.size > 0) soon($, () => evaluate($, file, redoNew, escalateModel ?? undefined))
+  // a test its last grade flagged gets the second look, when one is set; the rest the grader
+  for (const isSecond of [true, false]) {
+    const ids = new Map(redoTests.filter(t => isFlagged(t.verdict) === isSecond).map(t => [t.id, t.name]))
+    if (ids.size > 0) soon($, () => evaluate($, file, ids, isSecond ? (escalateModel ?? undefined) : undefined))
+  }
 
   const run = await read($, existing)
   const kept = run.results.filter(t => t.file !== file || among(present, t.name))
   // a test the session's own list grades again is not graded twice: its newer grade wins the row
   const redoing = new Set(redoNew.values())
-  const redo = kept.filter(t => isRedo(t) && !t.isPending && !redoing.has(t.name)).map(t => t.name)
+  const redoRows = kept.filter(t => isRedo(t) && !t.isPending && !redoing.has(t.name))
+  const redo = redoRows.map(t => t.name)
   if (kept.length === run.results.length && redo.length === 0) return
   const pick = (t: ExistingTest): boolean => t.file === file && redo.includes(t.name)
   await update($, existing, r => ({
@@ -956,14 +967,18 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
     results: r.results.filter(t => t.file !== file || among(present, t.name)).map(t => (pick(t) ? { ...t, isPending: true } : t)),
   }))
   if (redo.length === 0) return
-  soon($, () => regradeRows($, file, text, redo))
+  for (const isSecond of [true, false]) {
+    const names = redoRows.filter(t => isFlagged(t.verdict) === isSecond).map(t => t.name)
+    if (names.length > 0) soon($, () => regradeRows($, file, text, names, isSecond ? (escalateModel ?? undefined) : undefined))
+  }
 }
 
-// these rows of a file, as Grade all lists them, graded again, their reviewing marks cleared
-const regradeRows = ($: EngineInterface, file: string, text: string, names: string[]): Promise<void> =>
+// these rows of a file, as Grade all lists them, graded again, their reviewing marks cleared;
+// model: the second look, for rows a grade flagged
+const regradeRows = ($: EngineInterface, file: string, text: string, names: string[], model?: string): Promise<void> =>
   busy($, async () => {
     const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
-    const verdicts = await grade($, file, text, names, { model: escalateModel ?? undefined }).catch(() => null)
+    const verdicts = await grade($, file, text, names, { model }).catch(() => null)
     await reportGrades($, names.flatMap(name => {
       const v = verdicts?.find(x => x.name === name)
       return v ? [{ file, name, verdict: v.verdict, reason: v.reason }] : []
@@ -1638,7 +1653,7 @@ const suggestStrengthening = async ($: EngineInterface): Promise<void> => {
 }
 
 export const register: Register = (on, options) => {
-  graderModel = modelOf(options.graderModel, 'haiku')
+  graderModel = modelOf(options.graderModel, DEFAULT_MODEL)
   escalateModel = options.graderEscalate === 'off' ? null : modelOf(options.graderEscalate, '') || null
   parallel = workersOf(options.graderWorkers)
   // the evidence tool: it changes only this mod's own verdicts, so no permission prompt
@@ -1833,6 +1848,7 @@ export const register: Register = (on, options) => {
     const noteFailed = await read($, noteError)
     const openFailed = await read($, openError)
     const saveFailed = await read($, saveError)
+    const graderFailed = await read($, graderError)
     const runs = await read($, testRuns)
     const now = await $.clock.now()
 
@@ -1932,7 +1948,7 @@ export const register: Register = (on, options) => {
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
         const ran = runs[`${t.file}:${t.name}`]
-        const reason = t.state === 'unrated' ? 'The grader gave no verdict for this test. Grade again to retry it.' : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
+        const reason = t.state === 'unrated' ? `The grader gave no verdict for this test. ${graderFailed ?? ''}${graderFailed ? ' ' : ''}Grade again to retry it.` : t.state === 'ungraded' ? 'Not graded yet: Grade all tests grades it.' : t.reason
         drawn.push(
           <Box key={`row-${key}`} flexDirection="column" marginLeft={indent + 2}>
             <Box flexDirection="row" gap={1} alignItems="flex-start">
@@ -2053,6 +2069,7 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         {graded.state === 'idle' && graded.message !== undefined && <Text color={AMBER}>{graded.message}</Text>}
+        {graderFailed !== null && <Text color={RED}>{graderFailed}</Text>}
         <Box flexDirection="column" flexGrow={1} marginTop={1}>
           {entries.length === 0 && (
             <Text color={MUTED}>No tests yet. New tests show up here as they are written; Grade all tests grades the ones already there.</Text>

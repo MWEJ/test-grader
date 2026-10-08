@@ -2,6 +2,8 @@
 
 // the oldest Haiku that grades: a setting naming an older one grades with this one instead
 export const MIN_HAIKU = 'claude-haiku-5-5'
+// the model that grades when the person sets none
+export const DEFAULT_MODEL = MIN_HAIKU
 
 // A model setting as the grader uses it: an alias (haiku, sonnet, opus) or a model id as
 // given, but a Haiku older than MIN_HAIKU (claude-haiku-4-5, claude-3-5-haiku-20241022) is

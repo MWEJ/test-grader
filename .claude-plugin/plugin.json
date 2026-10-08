@@ -11,7 +11,7 @@
       "type": "string",
       "title": "Grader model",
       "description": "The model that grades tests: an alias (haiku, sonnet, opus) or a model id. A Haiku older than 5.5 grades as claude-haiku-5-5.",
-      "default": "haiku"
+      "default": "claude-haiku-5-5"
     },
     "graderEscalate": {
       "type": "string",

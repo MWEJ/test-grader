@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING } from './helpers'
+import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING, ASKED } from './helpers'
 
 test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -193,8 +193,8 @@ test('a file short enough goes to the grader whole, with no word of an excerpt',
 })
 
 
-test('with no grader model set, tests are graded by haiku', async ($, on) => {
-  expect(await gradeOnce($, on)).toEqual(['haiku'])
+test('with no grader model set, tests are graded by claude-haiku-5-5', async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['claude-haiku-5-5'])
 })
 
 
@@ -212,7 +212,8 @@ for (const [set, used] of [
   ['claude-haiku-5-5', 'claude-haiku-5-5'],
   ['claude-haiku-6', 'claude-haiku-6'],
   ['claude-sonnet-4-5', 'claude-sonnet-4-5'],
-  ['  ', 'haiku'],
+  ['  ', 'claude-haiku-5-5'],
+  ['haiku', 'haiku'],
 ] as const) {
   test(`a grader model set to ${JSON.stringify(set)} grades with ${used}`, { options: { graderModel: set } }, async ($, on) => {
     expect(await gradeOnce($, on)).toEqual([used])
@@ -220,19 +221,39 @@ for (const [set, used] of [
 }
 
 
-test('a second-look model, when set, grades again what the first grade left shallow; the first grade stays with the grader model', { options: { graderEscalate: 'claude-haiku-4-5' } }, async ($, on) => {
+test('a second-look model, when set, grades again only what the first grade flagged; a strong test edited stays with the grader model', { options: { graderModel: 'sonnet', graderEscalate: 'claude-haiku-4-5' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
-  const { models } = project(on, files)
+  // the files Claude writes, not there before
+  const written: Record<string, string> = {
+    'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n",
+    'src/b.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n",
+  }
+  const files: Record<string, string> = {}
+  const { models, prompts } = project(on, files)
   on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
-  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
-  await clock.advance(10)
-  files['src/a.test.ts'] = "it('a shallow check', () => { expect(f).toBeTruthy() })\n"
-  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'toBeDefined', new_string: 'toBeTruthy' } as never)
-  await clock.advance(10)
-  // the second look is a Haiku too old to grade: raised to 5.5 as the grader model is
-  expect(models).toEqual(['haiku', 'claude-haiku-5-5'])
+  // the model of the grader call that judged this test
+  const gradedBy = (name: string): string[] => prompts.flatMap((p, i) => (ASKED([p]).includes(name) ? [models[i]!] : []))
+  const edit = async (file: string, from: string, to: string) => {
+    files[file] = files[file]!.replace(from, to)
+    await $.tool.call({ tool: 'Edit', file_path: `/proj/${file}`, old_string: from, new_string: to } as never)
+    await clock.advance(10)
+  }
+  for (const [file, content] of Object.entries(written)) {
+    files[file] = content
+    await $.tool.call({ tool: 'Write', file_path: `/proj/${file}`, content } as never)
+    await clock.advance(10)
+  }
+
+  // graded shallow at first by the grader model; its edit is the second look's
+  await edit('src/a.test.ts', 'toBeDefined', 'toBeTruthy')
+  // graded strong at first; its edit stays with the grader model
+  await edit('src/b.test.ts', 'toBe(3)', 'toEqual(3)')
+
+  // the second look is set to a Haiku older than 5.5, so it grades as claude-haiku-5-5, as the
+  // grader model setting would
+  expect(gradedBy('a shallow check')).toEqual(['sonnet', 'claude-haiku-5-5'])
+  expect(gradedBy('adds')).toEqual(['sonnet', 'sonnet'])
 })
 
 
@@ -293,3 +314,28 @@ test('the grader reads the code under test the test file imports, and the projec
   expect(systems[0]!.indexOf('Snapshots are fine here.')).toBeGreaterThan(systems[0]!.indexOf('Answer with JSON only.'))
 })
 
+
+test('a grader call that gets no answer says why in the pane, on the row and above the list, until a call answers', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const missing = { isAnswered: false, reason: 'api-error', status: 404, error: 'not_found_error', usage: {} }
+  const answers: unknown[] = [missing, undefined]
+  const { prompts } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: n => answers[n - 1] })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  const why = 'The grader (claude-haiku-5-5) gave no answer: api-error 404 not_found_error.'
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+
+  // above the list, and on the unrated row once it is opened
+  expect(await texts()).toContain(why)
+  await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
+  expect(await texts()).toContain(`The grader gave no verdict for this test. ${why} Grade again to retry it.`)
+
+  // a call that answers clears it
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(2)
+  expect((await texts()).some(t => t.includes('gave no answer'))).toBe(false)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
+})
