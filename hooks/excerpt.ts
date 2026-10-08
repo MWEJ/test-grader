@@ -1,4 +1,5 @@
 import type { Verdict } from '../types'
+import { verdictOf } from './verdicts'
 import { DECLARATION, caseStarts, langOf } from './discovery'
 
 // what the grader reads, and what its reply holds: pure text work, no engine calls
@@ -85,7 +86,7 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
   }
   const verdicts = objects.flatMap((r): Graded[] => {
     const o = r as Record<string, unknown>
-    const verdict = o.verdict === 'good' || o.verdict === 'weak' || o.verdict === 'useless' ? o.verdict : undefined
+    const verdict = verdictOf(o.verdict)
     if (typeof o.name !== 'string' || !verdict) return []
     return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: String(o.reason ?? '') }]
   })

@@ -4,7 +4,7 @@
 // counters (the module's through a command it answers, the test file's own from its global).
 // Usage: node scripts/coverage.mjs   (writes coverage/lcov.info and prints a table)
 import { execFileSync, spawnSync } from 'node:child_process'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -63,16 +63,39 @@ const test = ((name: string, ...rest: any[]) => {
   writeFileSync(path, readFileSync(path, 'utf8').replace(/import \{ ([^}]*)\btest\b,? ?([^}]*)\} from 'claude-code\/testing'/, (_m, a, b) => `import { ${a}${b}} from 'claude-code/testing'${wrap}`))
 }
 
-// the kit writes its report to stderr: both streams are read
-const ran = spawnSync('claude', ['plugin', 'test', copy], { encoding: 'utf8', maxBuffer: 1 << 30 })
-const output = `${ran.stdout ?? ''}\n${ran.stderr ?? ''}`
+// one test file at a time: the kit runs each file in a child of its own, and run together their
+// long counter lines can arrive cut into pieces. The others are set aside for each run, and the
+// kit writes its report to stderr, so both streams are read
+const files = readdirSync(tests).filter(f => /\.test\.tsx?$/.test(f))
+const outputs = []
+let passed = 0
+let failedCount = 0
+for (const name of files) {
+  for (const other of files) if (other !== name) renameSync(join(tests, other), join(tests, `${other}.off`))
+  const ran = spawnSync('claude', ['plugin', 'test', copy], { encoding: 'utf8', maxBuffer: 1 << 30 })
+  for (const other of files) if (other !== name) renameSync(join(tests, `${other}.off`), join(tests, other))
+  const out = `${ran.stdout ?? ''}\n${ran.stderr ?? ''}`
+  outputs.push(out)
+  passed += Number(out.match(/^ *(\d+) pass$/m)?.[1] ?? 0)
+  failedCount += Number(out.match(/^ *(\d+) fail$/m)?.[1] ?? 0)
+}
+const output = outputs.join('\n')
 const failed = output.split('\n').filter(line => line.startsWith('(fail)'))
-if (ran.status !== 0) process.stderr.write(`${failed.join('\n')}\nthe tests failed under instrumentation: coverage is of the runs that finished\n`)
+if (failed.length > 0) process.stderr.write(`${failed.join('\n')}\nthe tests failed under instrumentation: coverage is of the runs that finished\n`)
 const map = libCoverage.createCoverageMap({})
-for (const line of output.split('\n')) if (line.startsWith('__COV__')) map.merge(JSON.parse(line.slice('__COV__'.length)))
-const summary = output.match(/^ *\d+ pass\n *\d+ fail\n.*Ran .*$/m)?.[0]
-if (summary) console.log(summary.trim())
-
+// a line the kit's output cut off or interleaved is passed over: the counters only grow, so a
+// later line from the same file holds what it did
+let cut = 0
+for (const line of output.split('\n')) {
+  if (!line.startsWith('__COV__')) continue
+  try {
+    map.merge(JSON.parse(line.slice('__COV__'.length)))
+  } catch {
+    cut += 1
+  }
+}
+if (cut > 0) process.stderr.write(`${cut} counter lines arrived cut off and were passed over\n`)
+console.log(`${passed} pass, ${failedCount} fail, over ${files.length} test files`)
 const dir = join(root, 'coverage')
 rmSync(dir, { recursive: true, force: true })
 const context = libReport.createContext({ dir, coverageMap: map, defaultSummarizer: 'nested' })

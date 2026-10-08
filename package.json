@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "scripts": {
+    "coverage": "node scripts/coverage.mjs"
+  }
+}

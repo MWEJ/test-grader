@@ -1,7 +1,7 @@
 {
   "name": "test-grader",
   "version": "0.1.0",
-  "description": "A side pane that grades every test in the project (good, weak, useless), tells Claude how to write tests that grade good, and shows coverage.",
+  "description": "A side pane that grades every test in the project (strong, shallow, brittle, hollow, duplicate), tells Claude how to write tests that grade strong, and shows coverage.",
   "author": {
     "name": "Martin Hygge"
   },
@@ -16,7 +16,7 @@
     "graderEscalate": {
       "type": "string",
       "title": "Second-look model",
-      "description": "A model that grades again what the first grade left weak: regrades after an edit, evidence and verified mutations. off: the grader model does it all.",
+      "description": "A model that grades again what the first grade flagged: regrades after an edit, evidence and verified mutations. off: the grader model does it all.",
       "default": "off"
     },
     "graderWorkers": {

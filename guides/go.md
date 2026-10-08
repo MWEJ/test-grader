@@ -1,4 +1,4 @@
-# Writing tests that grade good: Go
+# Writing tests that grade strong: Go
 
 - Table-driven tests: a slice of cases, each with a `name`, its input and an explicit `want`, run with `t.Run(tc.name, ...)`. Include edge rows (zero, empty, nil, max) and error rows.
 - Compare whole results with `cmp.Diff(want, got)` (or `reflect.DeepEqual`) and print the diff; checking one field of a struct misses the rest.

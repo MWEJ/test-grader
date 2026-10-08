@@ -1,6 +1,18 @@
 # test-grader
 
-A Claude Code mod that grades how good your tests are. It lists every test in the project in a side pane. A model reviews each test, says in a sentence what it checks, and rates it **good**, **weak** or **useless**. Claude is told up front how to write tests that grade good. Its tests are graded as it writes them, and it checks the grades and strengthens the weak ones before it finishes.
+A Claude Code mod that grades how good your tests are. It lists every test in the project in a side pane. A model reviews each test, says in a sentence what it checks, and gives it a grade that names what is wrong with it, and so how to fix it. Claude is told up front how to write tests that grade strong. Its tests are graded as it writes them, and it checks the grades and fixes the flagged ones before it finishes.
+
+## The grades
+
+| Grade | Meaning | The fix |
+| --- | --- | --- |
+| **strong** | A plausible bug in the code makes it fail, and a correct change to how the code works does not | Keep it |
+| **shallow** | It can fail, but misses the likely bugs: happy path only, defined or truthy checks, loose matchers | Add the case it misses: an edge, an error, a boundary |
+| **brittle** | It checks real behaviour but also fails on correct changes: large snapshots, exact mock calls, implementation details, timing | Assert on behaviour, not on how the code does it |
+| **hollow** | No real bug can make it fail: no assertion, a tautology, it tests the mock | Rewrite it to assert on what the code does |
+| **duplicate** | Another test in the file already catches the same bugs | Delete it, or merge it into the other |
+
+Shallow and brittle are opposite problems: a shallow test misses bugs, and a brittle one raises false alarms. Where more than one grade fits, the grader gives the first of hollow, duplicate, shallow, brittle, and lists and notes put them in that order, worst first. Shallow, brittle, hollow and duplicate tests are *flagged*. Grades kept from before (good, weak, useless) read as strong, shallow and hollow.
 
 ## What it does
 
@@ -14,7 +26,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Go testify suites as their own group.** A suite spread over several files is one group, listing its files. A `Test…` function that only runs the suite is not counted as a test.
 - **A verdict per test.** Each test gets a one-line summary and a one-line reason. Verdicts sit in one column on the first line of the title. Pressing a row shows its details.
 - **Badges.** *new* marks a test written this session, and *modified* a test that was there before and was edited this session. A file or folder row carries a badge when a test beneath it does.
-- **A summary line.** It shows the counts of tests, good, weak, useless, new and modified.
+- **A summary line.** It shows the counts of tests and strong ones, then each other grade, new and modified when there are any.
 - **The last run.** Below the summary: how many tests it graded and how many it remembered, and what its grader calls cost in tokens (in, of them from the prompt cache, and out).
 - **Open in editor.** This button opens the test at its line (see [Opening a test in your editor](#opening-a-test-in-your-editor)).
 - **Run test.** This button runs the one test with the project's runner. The row then says whether it passed, with the command, and, when it failed, the end of what it printed (see [Running one test](#running-one-test)).
@@ -22,7 +34,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 
 ### Grading
 
-- **Claude is told in advance.** A section of the system prompt tells Claude how to write a test that grades good:
+- **Claude is told in advance.** A section of the system prompt tells Claude how to write a test that grades strong:
   - assert on behaviour, not on mocks;
   - ask which bug would make the test fail;
   - one behaviour per test;
@@ -30,16 +42,16 @@ The pane opens at session start, or with `/test-grader`. It shows:
   - mock only I/O, time and randomness;
   - stay deterministic.
 
-  The section also points Claude to the guide for each language the project's tests are in (see [Language guides](#language-guides)). Once it is done writing tests, Claude calls `test_grades` with `written: true` and strengthens each weak or useless test, or proves it is better than rated.
+  The section also points Claude to the guide for each language the project's tests are in (see [Language guides](#language-guides)). Once it is done writing tests, Claude calls `test_grades` with `written: true` and fixes each flagged test as its grade asks, or proves it is better than rated.
 - **New tests are graded as they are written.** When Claude writes or edits a test file, each new test is sent to the grader and tracked in the pane as new.
-- **Edited tests are graded again.** test-grader compares the file before and after an edit, and each test whose text changed is graded again, good ones too. That includes an edit inside a test's body that never touches its name, and an edit that only removes lines. A test that is deleted leaves the pane.
-- **Grades arrive as notes, never as prompts.** A weak or useless grade on a test Claude wrote or edited is added to the conversation as a note. No new turn starts for it. Claude reads the note in the turn under way, or in the next one.
-- **One note per round.** Grades wait while grading is still under way, then go out together as one note. A test graded twice before then is listed once, with its latest grade. A weak test regraded good before its note goes out drops out of the note: it is not told as weak.
-- **Accepted tests are told too.** When a test that was weak is graded good, the note says so.
-- **Three rounds per test.** A test still weak or useless after three rounds is reported once more, telling Claude to tell you what is left. After that, test-grader stops on it. Evidence the grader rejects counts as a round too.
-- **A suggestion after the turn.** When a turn ends with weak tests Claude wrote, the prompt box offers "Strengthen the weak tests you wrote this session", once for each set of such tests.
-- **Changes made outside Claude are caught.** At the end of each turn, test files that changed since they were last seen are checked for new and removed tests. A file whose modification time has not changed is not read again.
-- **Grade all tests** grades the whole project. It grades only the files that changed since their last grading. Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, Claude is asked to report the result and offer to strengthen the weak and useless tests, worst first.
+- **Edited tests are graded again.** test-grader compares the file before and after an edit, and each test whose text changed is graded again, strong ones too. That includes an edit inside a test's body that never touches its name, and an edit that only removes lines. A test that is deleted leaves the pane.
+- **Grades arrive as notes, never as prompts.** A flagged grade on a test Claude wrote or edited is added to the conversation as a note, with the fix for each grade. So are the results of Grade all, Regrade all, `/test-grader diff` and a coverage run. No new turn starts for it. Claude reads the note in the turn under way, or in the next one.
+- **One note per round.** Grades wait while grading is still under way, then go out together as one note. A test graded twice before then is listed once, with its latest grade. A flagged test regraded strong before its note goes out drops out of the note: it is not told as flagged.
+- **Accepted tests are told too.** When a test that was flagged is graded strong, the note says so.
+- **Three rounds per test.** A test still flagged after three rounds is reported once more, telling Claude to tell you what is left. After that, test-grader stops on it. Evidence the grader rejects counts as a round too.
+- **A suggestion after the turn.** When a turn ends with flagged tests Claude wrote, the prompt box offers "Fix the 2 flagged tests you wrote this session", once for each set of such tests. It is only a suggestion: nothing is sent unless you send it.
+- **The pane follows the files as they change.** Every 2 seconds, the listed test files are checked for changes made outside Claude's Write and Edit: by the shell, an editor or a checkout. Their new and removed tests show at once, and changed tests are graded again. A file whose modification time has not changed is not read again. Right after each shell command, and every 10 seconds otherwise, the project's test files are listed again: a new one shows ungraded, with no grader call, and a removed one leaves the pane with its grades. The same check runs at the end of each turn.
+- **Grade all tests** grades the whole project. It grades only the files that changed since their last grading. Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, then the flagged tests, worst first. No turn starts for it.
 - **Stop** cuts a run short. No more grader calls start, the tests not yet graded keep what they had, and the pane says how far the run got. The next run grades the rest.
 - **Regrade all** grades every file again, unchanged ones included.
 - **`/test-grader diff`** grades only the test files changed on this branch: against where it left `main` (or `master`), with the changes not committed yet and new files. The rest of the project's grades stay as they are.
@@ -70,7 +82,7 @@ A grader call that the API answers with *overloaded*, *rate limited* or a server
 | Setting | Values | Default | What it does |
 | --- | --- | --- | --- |
 | **Grader model** (`graderModel`) | an alias (`haiku`, `sonnet`, `opus`) or a model id | `haiku` | the model that grades. A Haiku older than 5.5, such as `claude-haiku-4-5` or `claude-3-5-haiku-20241022`, grades as `claude-haiku-5-5`. Any other model grades as set. |
-| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade left weak: regrades after an edit, evidence and verified mutations. Older Haikus are raised to 5.5 here too. |
+| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: regrades after an edit, evidence and verified mutations. Older Haikus are raised to 5.5 here too. |
 | **Grader workers** (`graderWorkers`) | 1 to 20 | 10 | how many grader calls Grade all tests runs at once |
 
 Change them in the `/config` menu, or in `~/.claude/settings.json`:
@@ -99,7 +111,7 @@ Only code counts. A test written inside a string literal or a comment, such as a
 
 ### Language guides
 
-The `guides/` folder holds a short guide to writing tests that grade good for each language:
+The `guides/` folder holds a short guide to writing tests that grade strong for each language:
 
 | Language | Guide |
 | --- | --- |
@@ -119,13 +131,13 @@ The system prompt names only the guides for the languages your project's tests a
 
 #### Asking for the grades: `test_grades`
 
-Claude can look up weak tests itself instead of waiting to be told. The system prompt tells it to call `test_grades` once it is done writing tests.
+Claude can look up flagged tests itself instead of waiting to be told. The system prompt tells it to call `test_grades` once it is done writing tests.
 
-By default the tool lists the useless and weak tests, worst first, after a line of counts. Each test comes with its file and line, what it checks, and why it got its verdict. A test Claude is strengthening also shows its round, or that its rounds are spent.
+By default the tool lists the flagged tests, worst first, after a line of counts. Each test comes with its file and line, what it checks, and why it got its verdict. A test Claude is strengthening also shows its round, or that its rounds are spent.
 
 | Input | What it does |
 | --- | --- |
-| `verdicts` | which tests to list: `useless`, `weak`, `unrated`, `reviewing`, `ungraded`, `good`. The default is `useless` and `weak`. |
+| `verdicts` | which tests to list: `hollow`, `duplicate`, `shallow`, `brittle`, `unrated`, `reviewing`, `ungraded`, `strong`. The default is the four flagged grades. |
 | `path` | only the tests in this file or folder |
 | `written` | only the tests written or edited this session |
 | `limit` | how many tests to list at most, 50 by default. The answer says how many it left out. |
@@ -177,10 +189,11 @@ The runner is found at session start: `package.json` for Vitest, Jest and Playwr
 
 ### Coverage
 
-The pane offers **Run coverage** when it finds a runner it knows:
+The pane offers **Run coverage** when it finds a way to measure it, in this order:
 
 | Project | Command |
 | --- | --- |
+| `package.json` with a `coverage` script | `npm run coverage` |
 | `package.json` with vitest | `npx vitest run --coverage` |
 | `package.json` with jest | `npx jest --coverage` |
 | `pytest.ini`, `pyproject.toml` or `setup.cfg` | `pytest --cov` |
@@ -188,7 +201,9 @@ The pane offers **Run coverage** when it finds a runner it knows:
 
 It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or the Go output. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
 
-When a run finishes, Claude is told the figures, along with the least covered folders: up to five of them, each under 80% with at least 20 lines. When a run fails, Claude is told how it failed, with the last lines it printed.
+The pane follows the report: one written by a run outside the pane, from the shell or CI, shows within 2 seconds.
+
+When a run finishes, Claude is told the figures in a note, along with the least covered folders: up to five of them, each under 80% with at least 20 lines. When a run fails, Claude is told how it failed, with the last lines it printed.
 
 ### Opening a test in your editor
 
@@ -220,16 +235,16 @@ The mod is a Claude Code plugin made of one hooks module.
 ```
 claude plugin validate .
 claude plugin test .
-node scripts/coverage.mjs
+npm run coverage
 ```
 
-The tests live in `tests/pane.test.tsx`. They run in the engine's test kit, with the file system, processes and the model mocked. The state the mod keeps is declared in `types/index.d.ts`.
+The tests live in `tests/`, one file per area: the pane, Grade all, the grader, the notes, the tools, changes to test files, coverage, Open in editor, discovery and the runner commands. `tests/helpers.tsx` holds what they share: a project the mod runs in, its pane, and fixtures. They run in the engine's test kit, with the file system, processes and the model mocked. The state the mod keeps is declared in `types/index.d.ts`.
 
 `claude plugin test` has no coverage of its own, so `scripts/coverage.mjs` measures it:
 
 1. It copies the mod to a temporary folder.
 2. It instruments the hooks with Istanbul.
-3. It runs the tests there, with each test handing back the counters.
+3. It runs the tests there one file at a time, with each test handing back the counters. Run together, the kit's children cut each other's long output lines.
 4. It prints a table, and writes `coverage/lcov.info` and `coverage/coverage-summary.json`.
 
 It needs Node and npm, and installs the Istanbul libraries into the temporary folder.
@@ -243,8 +258,10 @@ The engine keeps every function that is handed the engine interface `$` in `hook
 | `hooks/excerpt.ts` | what the grader reads of a long file, and what its reply holds |
 | `hooks/runner.ts` | the command that runs one test |
 | `hooks/settings.ts` | what a setting comes to: the grader model, the worker count |
+| `hooks/verdicts.ts` | the grades, their order and fixes, and the old grades' new names |
 | `hooks/hooks.json` | names the module |
 | `guides/` | the guide for each language that Claude reads before writing tests |
 | `types/index.d.ts` | the state contract |
-| `tests/pane.test.tsx` | the test suite |
+| `tests/*.test.tsx` | the test suite, by area |
+| `tests/helpers.tsx` | what the test files share |
 | `scripts/coverage.mjs` | the test suite's coverage |

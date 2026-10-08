@@ -1,4 +1,4 @@
-export type Verdict = 'good' | 'weak' | 'useless'
+export type Verdict = 'strong' | 'shallow' | 'brittle' | 'hollow' | 'duplicate'
 
 export type TrackedTest = {
   id: string

@@ -1,0 +1,295 @@
+import { expect, mock, test } from 'claude-code/testing'
+import { FILE, mount, project, verdictsDrawn, ok, gradeOnce, inFlight, ADDING } from './helpers'
+
+test('a new test deep in a long file reaches the grader with its body, however far down it sits', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const helper = "const helper = (n: number) => n * 2\n"
+  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => { expect(add(${i}, 1)).toBe(${i + 1}) })\n`).join('')
+  const added = "it('subtracts numbers', () => {\n  expect(sub(5, 3)).toBe(2)\n})\n"
+  const content = helper + old + added
+  expect(content.length).toBeGreaterThan(20_000)
+  const prompts: string[] = []
+  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  on('fs.stat', async () => {
+    throw new Error('missing')
+  })
+  on('fs.read', async () => ({ value: content }) as never)
+  on('model.complete', async (_$, e) => {
+    prompts.push(String((e as { prompt?: unknown }).prompt))
+    return { value: { isAnswered: true, usage: {}, text: '[]' } } as never
+  })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  // the new case whole, and the file's head where its helpers live
+  expect(prompts[0]).toContain('expect(sub(5, 3)).toBe(2)')
+  expect(prompts[0]).toContain('const helper = (n: number) => n * 2')
+})
+
+
+test('a test generated in a loop is graded case by case: the loop and its data reach the grader, and each case counts', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const looped = [
+    "it('first', () => { expect(1).toBe(1) })",
+    '',
+    '// each size, rounded',
+    "const CASES = [['tiny', 1], ['huge shallow', 9], ['middle', 5]]",
+    'for (const [name, n] of CASES) {',
+    '  it(`rounds ${name}`, () => { expect(round(n)).toBe(n) })',
+    '}',
+    '',
+  ].join('\n')
+  const { prompts, systems } = project(
+    on,
+    { 'src/round.test.ts': looped },
+    // the grader names the loop's cases as it expands them, and one name that is not one of them
+    { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge shallow', 'rounds middle', 'something else'] } },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  expect(systems[0]).toContain('generated in a loop')
+  const tree = JSON.stringify(await ui.drawn())
+  // first, and the loop's three cases; the stray name is dropped
+  expect(tree).toContain('4 tests · 3 strong · 1 shallow')
+  expect(tree).toContain('rounds huge shallow')
+  expect(tree).not.toContain('unrated')
+  expect(tree).not.toContain('something else')
+})
+
+
+test('in a long file, a looped test reaches the grader with the data above it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const old = Array.from({ length: 400 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const added = "\nconst SIZES = [['tiny', 1], ['huge', 9]]\nfor (const [name, n] of SIZES) {\n  it(`rounds ${name}`, () => { expect(round(n)).toBe(n) })\n}\n"
+  const prompts: string[] = []
+  on('session.cwd', async () => ({ value: '/proj' }) as never)
+  on('fs.stat', async () => {
+    throw new Error('missing')
+  })
+  on('fs.read', async () => ({ value: old + added }) as never)
+  on('model.complete', async (_$, e) => {
+    prompts.push(String((e as { prompt?: unknown }).prompt))
+    return { value: { isAnswered: true, usage: {}, text: '[]' } } as never
+  })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts[0]).toContain("const SIZES = [['tiny', 1], ['huge', 9]]")
+  expect(prompts[0]).toContain('for (const [name, n] of SIZES) {')
+  expect(prompts[0]).not.toContain('old case 399')
+})
+
+
+test('a new looped test becomes one entry per case it generates', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "const SIZES = ['tiny', 'huge']\nfor (const name of SIZES) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBeDefined() })\n}\n"
+  project(on, { 'src/round.test.ts': content }, { expand: { 'rounds ${name}': ['rounds tiny', 'rounds huge'] } })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/round.test.ts', content } as never)
+  await clock.advance(10)
+
+  const ui = await mount($)
+  const tree = JSON.stringify(await ui.drawn())
+  expect(tree).toContain('· 2 new')
+  expect(tree).toContain('rounds tiny')
+  expect(tree).toContain('rounds huge')
+  expect(tree).not.toContain('unrated')
+})
+
+
+test('a grader reply cut off before its end keeps every verdict that arrived whole, and the log says it was cut', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { logs } = project(
+    on,
+    { 'src/k.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\nit('a shallow check', () => { expect(f).toBeDefined() })\nit('subtracts', () => { expect(sub(3, 2)).toBe(1) })\n" },
+    // the reply stops partway through its third verdict
+    { cut: reply => reply.slice(0, reply.lastIndexOf('{"name"') + 30) },
+  )
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  expect(JSON.stringify(await ui.drawn())).toContain('3 tests · 1 strong · 1 shallow · 1 unrated')
+  expect(logs.some(line => line.startsWith('test-grader: a grader reply was cut off') && line.includes('src/k.test.ts'))).toBe(true)
+})
+
+
+test('a grader call has room in its reply for a looped test\'s every case', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const loop = "for (const name of NAMES) {\n  it(`the lifetime: ${name}`, () => { expect(ttl(name)).toBeDefined() })\n}\n"
+  // a grader whose reply stops where its token budget ends, at about 4 characters a token
+  const calls: { budgets: number[] } = { budgets: [] }
+  const cut = (reply: string): string => reply.slice(0, calls.budgets.at(-1)! * 4)
+  const { budgets, logs } = project(on, { 'src/l.test.ts': loop }, { cut, expand: { 'the lifetime: ${name}': Array.from({ length: 20 }, (_, i) => `the lifetime: case ${i}`) } })
+  calls.budgets = budgets
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  // every one of the loop's twenty cases came back with its verdict, and no reply was cut off
+  const verdicts = await verdictsDrawn(ui)
+  expect(Object.keys(verdicts)).toHaveLength(20)
+  expect(Object.values(verdicts).every(v => v === 'strong')).toBe(true)
+  expect(logs.some(line => line.startsWith('test-grader: a grader reply was cut off'))).toBe(false)
+})
+
+
+// A long file reaches the grader as an excerpt that leaves nothing of the cases under review
+// out, and brings the helpers they use from wherever in the file they are declared
+test('in a long file, a long case reaches the grader whole, with the helpers it uses from between other tests', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const old = (from: number) => Array.from({ length: 200 }, (_, i) => `it('old case ${from + i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
+  const helper = "\nconst MOCK_HOME = '/home/someone'\nfunction mockProject(dir: string) {\n  const off = listen(() => {\n    return dir\n  })\n  return { dir, home: MOCK_HOME, off }\n}\n"
+  const unused = "\nconst NEVER_USED = 'left out'\n"
+  const steps = Array.from({ length: 80 }, (_, i) => `  expect(step(p, ${i})).toBe(${i * 2})\n`).join('')
+  const added = `it('a long case', () => {\n  const p = mockProject('/proj')\n${steps}  expect(p.home).toBe('/home/someone') // the last line\n})\n`
+  const content = old(0) + helper + old(200) + unused + old(400) + added
+  expect(added.length).toBeGreaterThan(2_000)
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'x', new_string: added } as never)
+  await clock.advance(10)
+
+  expect(prompts).toHaveLength(1)
+  const prompt = prompts[0]!
+  expect(prompt).toContain("expect(p.home).toBe('/home/someone') // the last line")
+  // the helper the case calls, and the constant the helper uses in turn
+  expect(prompt).toContain('function mockProject(dir: string) {')
+  expect(prompt).toContain("const MOCK_HOME = '/home/someone'")
+  expect(prompt).not.toContain('NEVER_USED')
+  expect(prompt).not.toContain('old case 450')
+  expect(prompt).toContain('above is an excerpt')
+})
+
+
+test('a file short enough goes to the grader whole, with no word of an excerpt', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  const { prompts } = project(on, { 'src/a.test.ts': content })
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content } as never)
+  await clock.advance(10)
+
+  expect(prompts[0]).toContain(content.trimEnd())
+  expect(prompts[0]).not.toContain('excerpt')
+})
+
+
+test('with no grader model set, tests are graded by haiku', async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['haiku'])
+})
+
+
+test('the grader model setting picks the model that grades', { options: { graderModel: 'opus' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['opus'])
+})
+
+
+// a Haiku older than 5.5, however it is named, grades as Haiku 5.5; any other model as set
+for (const [set, used] of [
+  ['claude-haiku-4-5', 'claude-haiku-5-5'],
+  ['claude-haiku-4-5-20251001', 'claude-haiku-5-5'],
+  ['claude-3-5-haiku-20241022', 'claude-haiku-5-5'],
+  ['us.anthropic.claude-3-haiku-20240307-v1:0', 'claude-haiku-5-5'],
+  ['claude-haiku-5-5', 'claude-haiku-5-5'],
+  ['claude-haiku-6', 'claude-haiku-6'],
+  ['claude-sonnet-4-5', 'claude-sonnet-4-5'],
+  ['  ', 'haiku'],
+] as const) {
+  test(`a grader model set to ${JSON.stringify(set)} grades with ${used}`, { options: { graderModel: set } }, async ($, on) => {
+    expect(await gradeOnce($, on)).toEqual([used])
+  })
+}
+
+
+test('a second-look model, when set, grades again what the first grade left shallow; the first grade stays with the grader model', { options: { graderEscalate: 'claude-haiku-4-5' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/a.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  const { models } = project(on, files)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  files['src/a.test.ts'] = "it('a shallow check', () => { expect(f).toBeTruthy() })\n"
+  await $.tool.call({ tool: 'Edit', file_path: '/proj/src/a.test.ts', old_string: 'toBeDefined', new_string: 'toBeTruthy' } as never)
+  await clock.advance(10)
+  // the second look is a Haiku too old to grade: raised to 5.5 as the grader model is
+  expect(models).toEqual(['haiku', 'claude-haiku-5-5'])
+})
+
+
+test('the grader workers setting sets how many grader calls run at once', { options: { graderWorkers: 3 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(3)
+})
+
+
+test('a grader workers setting below 1 runs one call at a time', { options: { graderWorkers: 0 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(1)
+})
+
+
+test('a grader workers setting above 20 runs 20 at a time', { options: { graderWorkers: 50 } }, async ($, on) => {
+  expect(await inFlight($, on)).toBe(20)
+})
+
+
+test('a grader call the API answers overloaded is tried again after a wait, and one it refuses is not', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const failing = { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: {} }
+  const refused = { isAnswered: false, reason: 'api-error', status: 400, error: 'invalid_request', usage: {} }
+  const files: Record<string, string> = { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  const answers: unknown[] = [failing, undefined, refused]
+  const { prompts, logs } = project(on, files, { reply: n => answers[n - 1] })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  // the first call failed; the retry waits two to three seconds
+  expect(prompts).toHaveLength(1)
+  await clock.advance(3_000)
+  expect(prompts).toHaveLength(2)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
+
+  await ui.press({ key: 'regradeAll' })
+  await clock.advance(10_000)
+  expect(prompts).toHaveLength(3)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 unrated')
+  expect(logs).toContain('test-grader: the grader gave no answer for /proj/src/a.test.ts (api-error 400 invalid_request)')
+})
+
+
+test('the grader reads the code under test the test file imports, and the project rules in .test-grader.md', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...ADDING, 'src/unrelated.ts': 'export const UNRELATED_MARK = 1\n', '.test-grader.md': 'Snapshots are fine here.' }
+  const { prompts, systems } = project(on, files)
+  on('tool.call', async () => ({ result: {}, text: 'ok', isError: false, isReadOnly: false }) as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  // the module the test imports, whole, under its path; a file it does not import, not at all
+  expect(prompts[0]).toContain('src/add.ts')
+  expect(prompts[0]).toContain(ADDING['src/add.ts']!)
+  expect(prompts[0]).not.toContain('UNRELATED_MARK')
+  // the project's rules, after the grader's own rubric so they can override it
+  expect(systems[0]).toContain('Snapshots are fine here.')
+  expect(systems[0]!.indexOf('Snapshots are fine here.')).toBeGreaterThan(systems[0]!.indexOf('Answer with JSON only.'))
+})
+
