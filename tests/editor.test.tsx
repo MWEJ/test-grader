@@ -227,8 +227,8 @@ test('when no command can be started, the pane says which file it could not open
       throw new Error('spawn ENOENT')
     },
   })
-  // the reason is the host's own, its words not the mod's: the pane names the file and gives one
+  // the reason is the host's error, however the host wraps it: the pane names the file and passes the error on
   const said = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.startsWith("Couldn't open src/e.test.ts in an editor: "))
   expect(said).toHaveLength(1)
-  expect(said[0]!.length).toBeGreaterThan("Couldn't open src/e.test.ts in an editor: ".length)
+  expect(said[0]).toContain('spawn ENOENT')
 })

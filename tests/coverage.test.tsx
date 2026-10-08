@@ -321,7 +321,7 @@ test('Run coverage in a project that has since lost its way to measure it runs n
 test('a coverage command that cannot be started shows why in the pane, and can be run again', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   // a command the host will not start: the run rejects
-  project(on, JEST_PROJECT, {
+  const { runs } = project(on, JEST_PROJECT, {
     editor: () => {
       throw new Error('spawn npx ENOENT')
     },
@@ -330,12 +330,19 @@ test('a coverage command that cannot be started shows why in the pane, and can b
   const ui = await mount($)
   await ui.press({ key: 'run' })
   await clock.advance(10)
+  const tried = runs.length
+  expect(tried).toBeGreaterThan(0)
 
-  // the reason is the host's own, whole: here the test kit's, which has no command to run
+  // the reason is the host's own, whole: the error the command could not start with
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(texts).toContain('no implementation for process.run')
+  expect(texts.filter(t => t.includes('spawn npx ENOENT'))).toHaveLength(1)
   expect(texts).not.toContain('Coverage run failed.')
   expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+
+  // pressed again, the command is tried again
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(runs.length).toBe(tried * 2)
 })
 
 

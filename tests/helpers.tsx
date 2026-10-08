@@ -88,7 +88,13 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     if (argv[0] !== 'git') {
       if (!editor) throw new Error(`unexpected ${argv.join(' ')}`)
       runs.push(argv)
-      const said = editor(argv)
+      // a command that cannot start (editor throws) is refused with its error, as the host refuses one
+      let said: ReturnType<Shell>
+      try {
+        said = editor(argv)
+      } catch (err) {
+        return { deny: err instanceof Error ? err.message : String(err) } as never
+      }
       return { value: typeof said === 'number' ? { stdout: '', stderr: 'no such command', exitCode: said } : { stdout: '', stderr: '', exitCode: 0, ...said } } as never
     }
     return { value: isGit ? { stdout: ['README.md', 'src/math.ts', ...Object.keys(files)].join('\n'), stderr: '', exitCode: 0 } : { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 } } as never

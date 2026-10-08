@@ -380,7 +380,7 @@ test('test_verify whose run with the mutation fails to start puts the file back 
 
   const answer = await verifyWith($, { file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b' })
 
-  expect(answer).toBe('The run with the mutation failed to start: no implementation for process.run. The file is back as it was; nothing was regraded.')
+  expect(answer).toMatch(/^The run with the mutation failed to start: .*spawn npx ENOENT\. The file is back as it was; nothing was regraded\.$/)
   expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
   expect(prompts).toHaveLength(0)
 })
@@ -562,7 +562,7 @@ test('Run test whose runner cannot be started fails in its row with the error', 
   await ui.press({ key: 'x:/proj/src/a.test.ts:a shallow check' })
   await clock.advance(10)
 
-  expect(await runLine(ui)).toBe('Failed\nno implementation for process.run')
+  expect(await runLine(ui)).toMatch(/^Failed\n.*spawn npx ENOENT$/)
   // the row offers to run it again
   expect(buttonsOf(await ui.drawn()).get('x:/proj/src/a.test.ts:a shallow check')).toBe('Run test')
 })
