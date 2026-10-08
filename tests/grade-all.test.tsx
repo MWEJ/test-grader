@@ -1,4 +1,5 @@
-import { fingerprint, unkeep } from '../hooks/register'
+import { fingerprint } from '../hooks/register'
+import { unkeep } from '../hooks/kept'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Verdict } from '../types'
 import type { Engine, On } from './helpers'

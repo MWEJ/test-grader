@@ -263,12 +263,16 @@ The engine keeps every function that is handed the engine interface `$` in `hook
 | Path | What it holds |
 | --- | --- |
 | `hooks/register.tsx` | the hooks: grading, the notes, the pane, coverage, running tests, the tools, the commands |
+| `hooks/prompts.ts` | what the models read: the grader's rubric, the system prompt's section, the notes' follow-ups, and the tools' descriptions and schemas |
 | `hooks/discovery.ts` | which files hold tests, and which cases each declares, by language |
 | `hooks/excerpt.ts` | what the grader reads of a long file, and what its reply holds |
+| `hooks/kept.ts` | the grades as the store keeps them |
+| `hooks/coverage.ts` | coverage figures by folder, the least covered, and the note a run sends |
+| `hooks/gocover.ts` | Go's coverage profile, by file and package |
 | `hooks/prices.ts` | what a grader call costs, at the Claude API's list prices |
 | `hooks/runner.ts` | the command that runs one test |
 | `hooks/settings.ts` | what a setting comes to: the grader model, the worker count |
-| `hooks/verdicts.ts` | the grades, their order and fixes, and the old grades' new names |
+| `hooks/verdicts.ts` | the grades, their order and fixes, the states a list shows, and the old grades' new names |
 | `hooks/hooks.json` | names the module |
 | `guides/` | the guide for each language that Claude reads before writing tests |
 | `types/index.d.ts` | the state contract |

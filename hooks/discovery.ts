@@ -359,3 +359,6 @@ export const changedCases = (before: string, after: string, file: string): strin
   const was = textsOf(before)
   return [...textsOf(after)].filter(([name, text]) => was.get(name) !== text).map(([name]) => name)
 }
+
+// a file by its path in the project, or as it is when it lies outside
+export const shortPath = (file: string, cwd: string): string => (cwd && file.startsWith(`${cwd}/`) ? file.slice(cwd.length + 1) : file)

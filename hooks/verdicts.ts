@@ -7,6 +7,11 @@ import type { Verdict } from '../types'
 export const FLAGGED = ['hollow', 'duplicate', 'shallow', 'brittle'] as const satisfies readonly Verdict[]
 export const VERDICTS: readonly Verdict[] = [...FLAGGED, 'strong']
 
+// a test as a list shows it: its grade, or where its grading stands
+export type State = Verdict | 'unrated' | 'reviewing' | 'ungraded'
+// the states Claude's test_grades tool can ask for
+export const LISTED: readonly State[] = [...FLAGGED, 'unrated', 'reviewing', 'ungraded', 'strong']
+
 export const isFlagged = (v: Verdict | undefined): boolean => v !== undefined && v !== 'strong'
 
 // what each grade asks of whoever fixes the test
