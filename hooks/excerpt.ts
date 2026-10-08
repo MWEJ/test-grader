@@ -1,6 +1,6 @@
 import type { Verdict } from '../types'
 import { verdictOf } from './verdicts'
-import { DECLARATION, caseStarts, langOf } from './discovery'
+import { DECLARATION, caseNames, caseStarts, fits, isTemplate, langOf } from './discovery'
 
 // what the grader reads, and what its reply holds: pure text work, no engine calls
 
@@ -19,7 +19,8 @@ export const excerptOf = (source: string, names: string[], file: string): string
   const starts = caseStarts(source, file)
   const head = clamp(source.slice(0, starts[0]?.at ?? source.length), MAX_HEAD)
   const pieces = starts.map((start, i) => ({
-    isChosen: names.includes(start.name),
+    // a looped case is asked about by its expanded name: the loop that generates it is shown
+    isChosen: names.some(name => fits(start.name, name)),
     whole: source.slice(start.at, starts[i + 1]?.at ?? source.length).trimEnd(),
     // what sits above the case's own line: comments, data, helpers
     declares: [...source.slice(start.at, start.opens).matchAll(DECLARATION)].map(m => (m[1] ?? m[2])!),
@@ -52,6 +53,26 @@ export const excerptOf = (source: string, names: string[], file: string): string
     else if (out[out.length - 1] !== LEFT_OUT) out.push(LEFT_OUT)
   })
   return out.join('\n\n')
+}
+
+// a case's own text, from its start to the next case's (a looped case's: its loop's); null
+// when the file no longer has it
+export const caseTextOf = (source: string, name: string, file: string): string | null => {
+  const starts = caseStarts(source, file)
+  const i = starts.findIndex(s => fits(s.name, name))
+  return i < 0 ? null : source.slice(starts[i]!.at, starts[i + 1]?.at ?? source.length).trimEnd()
+}
+
+// The asked names that are cases a loop generates, each set under the loop's own name in the
+// file: the grader is told so, to judge each by that loop's body with its variable bound
+export const loopsOf = (source: string, names: string[], file: string): string[] => {
+  const templates = [...new Set(caseNames(source, file))].filter(isTemplate)
+  const byLoop = new Map<string, string[]>()
+  for (const name of names) {
+    const loop = isTemplate(name) ? undefined : templates.find(t => fits(t, name))
+    if (loop) byLoop.set(loop, [...(byLoop.get(loop) ?? []), name])
+  }
+  return [...byLoop].map(([loop, cases]) => `${cases.map(c => JSON.stringify(c)).join(', ')} ${cases.length === 1 ? 'is a case' : 'are cases'} of the loop that declares the test ${JSON.stringify(loop)}: judge ${cases.length === 1 ? 'it' : 'each'} by that loop's body, its variable bound to the case's value.`)
 }
 
 // the verdicts in a grader reply; of one cut off before its closing ], each object that
@@ -88,7 +109,11 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
     const o = r as Record<string, unknown>
     const verdict = verdictOf(o.verdict)
     if (typeof o.name !== 'string' || !verdict) return []
-    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: String(o.reason ?? '') }]
+    const reason = String(o.reason ?? '')
+    const missed = typeof o.missed === 'string' ? o.missed.trim() : ''
+    // shallow only with a bug the grader can name; told whoever fixes it, as the case to add
+    if (verdict === 'shallow' && missed === '') return [{ name: o.name, summary: String(o.summary ?? ''), verdict: 'strong', reason: `${reason} (Graded strong: no bug it would miss was named.)`.trim() }]
+    return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: verdict === 'shallow' ? `${reason} It would miss: ${missed}` : reason }]
   })
   return { verdicts, isCut: !isClosed }
 }

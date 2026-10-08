@@ -79,17 +79,17 @@ test('each test is one line until pressed open, and a second press closes it', a
 
   const closed = JSON.stringify(await ui.drawn())
   expect(closed).toContain('a shallow check')
-  expect(closed).not.toContain('shallow because.')
+  expect(closed).not.toContain('shallow because. It would miss: a wrong edge.')
   expect(closed).not.toContain('Checks a shallow check.')
 
   await ui.press({ key: 'r:/proj/src/more.test.ts:a shallow check' })
   const open = JSON.stringify(await ui.drawn())
   expect(open).toContain('src/more.test.ts')
   expect(open).toContain('Checks a shallow check.')
-  expect(open).toContain('shallow because.')
+  expect(open).toContain('shallow because. It would miss: a wrong edge.')
 
   await ui.press({ key: 'r:/proj/src/more.test.ts:a shallow check' })
-  expect(JSON.stringify(await ui.drawn())).not.toContain('shallow because.')
+  expect(JSON.stringify(await ui.drawn())).not.toContain('shallow because. It would miss: a wrong edge.')
 })
 
 

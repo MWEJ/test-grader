@@ -27,7 +27,7 @@ test('a new test graded flagged as it is written is told to Claude in a note of 
   expect(notes).toEqual([
     'Tests that need work (test-grader):\n' +
       '- hollow · src/a.test.ts · does nothing — hollow because.\n' +
-      '- shallow · src/a.test.ts · a shallow check — shallow because.\n' +
+      '- shallow · src/a.test.ts · a shallow check — shallow because. It would miss: a wrong edge.\n' +
       FOLLOW,
   ])
   expect(appended(logs)).toEqual(notes)
@@ -128,7 +128,7 @@ test('the results of Grade all tests, Regrade all and a coverage run are notes t
   const graded = [
     'Test grading (test-grader) finished: 2 graded · 1 strong · 1 shallow.',
     'Need work, worst first:',
-    '- shallow · src/b.test.ts · a shallow check — shallow because.',
+    '- shallow · src/b.test.ts · a shallow check — shallow because. It would miss: a wrong edge.',
     'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   ].join('\n')
   expect(added()).toEqual([graded, graded, 'Coverage run (test-grader) finished: lines 82.5% · statements 80% · branches 61.2% · functions 75% (coverage-summary.json).'])
@@ -157,8 +157,8 @@ test('shallow tests graded together, over several files, reach Claude as one not
   const lines = appended(logs)[0]!.split('\n')
   expect(lines.filter(l => l.startsWith('- '))).toEqual([
     '- hollow · src/a.test.ts · does nothing — hollow because.',
-    '- shallow · src/a.test.ts · a shallow check — shallow because.',
-    '- shallow · src/b.test.ts · another shallow one — shallow because.',
+    '- shallow · src/a.test.ts · a shallow check — shallow because. It would miss: a wrong edge.',
+    '- shallow · src/b.test.ts · another shallow one — shallow because. It would miss: a wrong edge.',
   ])
   expect(lines.at(-1)).toBe(FOLLOW)
   await turnEnd($, 't1')
@@ -238,7 +238,7 @@ test('a test Grade all listed shallow, edited by Claude, has its new grade told 
   expect(asked).toEqual([])
   expect(appended(logs)).toHaveLength(2)
   // the whole note: round one of a test Claude did not write, the fix for its grade with it
-  expect(appended(logs)[1]).toBe(['Tests that need work (test-grader):', '- shallow · src/a.test.ts · a shallow check — shallow because.', FOLLOW].join('\n'))
+  expect(appended(logs)[1]).toBe(['Tests that need work (test-grader):', '- shallow · src/a.test.ts · a shallow check — shallow because. It would miss: a wrong edge.', FOLLOW].join('\n'))
 
   // that round was counted: graded strong after the next edit, it is told as accepted
   const second = files['src/a.test.ts']!

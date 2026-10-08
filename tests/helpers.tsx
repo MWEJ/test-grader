@@ -28,13 +28,13 @@ export const mount = ($: Engine, rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean }
+export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict }
 
 // a command's answer: its exit code, or what it printed too
 export type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
-export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older }: Project = {}) {
+export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -49,6 +49,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   // each grader call's room for its reply
   const budgets: number[] = []
   const refused: Record<string, unknown>[] = []
+  const confirms: { prompt: string; model: string }[] = []
   // each grader call's model, and its system prompt
   const models: string[] = []
   const systems: string[] = []
@@ -108,6 +109,16 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
       return next({ ...e, maxTokens: 0 } as never)
     }
     const prompt = String((e as { prompt?: unknown }).prompt)
+    // a confirm pass over a first pass's flags: kept apart, and by default it agrees
+    if (prompt.includes('A first, quick pass flagged these')) {
+      const first = JSON.parse(prompt.match(/A first, quick pass flagged these: (\[.*\])/)![1]!) as { name: string; verdict: Verdict; reason: string }[]
+      confirms.push({ prompt, model: String((e as { model?: unknown }).model) })
+      const answer = first.map(v => {
+        const verdict = confirm ? confirm(v.name, v.verdict) : v.verdict
+        return { name: v.name, summary: `Checks ${v.name}.`, verdict, reason: verdict === v.verdict ? `${verdict} because.` : `${verdict} on a closer look.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '' }
+      })
+      return { value: { isAnswered: true, usage: {}, text: JSON.stringify(answer) } } as never
+    }
     budgets.push(Number((e as { maxTokens?: unknown }).maxTokens))
     models.push(String((e as { model?: unknown }).model))
     systems.push(String((e as { system?: unknown }).system))
@@ -136,7 +147,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
           JSON.stringify(
             names.flatMap(name => expand[name] ?? [name]).map(name => {
               const verdict = rule ? rule(name, prompt) : name.includes('shallow') ? 'shallow' : name.includes('nothing') ? 'hollow' : 'strong'
-              return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.` }
+              return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '' }
             }),
           ),
         ),
@@ -177,7 +188,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused }
+  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused, confirms }
 }
 
 

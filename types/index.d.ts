@@ -13,6 +13,8 @@ export type TrackedTest = {
   suite?: string
   /** what the session sent to have it regraded, when its verdict was given on evidence */
   evidence?: string
+  /** the test's own text, fingerprinted, when the evidence was accepted: the verdict holds while it is unchanged */
+  evidenceOf?: string
 }
 
 export type Coverage = {
@@ -27,7 +29,7 @@ export type Coverage = {
 }
 
 /** a test already in the project, as Grade all tests judged it (no verdict: the grader gave none; isUngraded: listed, never graded) */
-export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string }
+export type ExistingTest = { file: string; name: string; verdict?: Verdict; summary?: string; reason?: string; isPending?: boolean; isUngraded?: boolean; suite?: string; evidence?: string; evidenceOf?: string }
 
 /** Grade all tests: how far a run has got, and what the last one found */
 // hashes: each graded file's contents, as fingerprinted when its results were made
@@ -47,7 +49,7 @@ export type ExistingRun = {
   /** while running: a run of these files alone (their paths in the project), the rest left be */
   only?: string[]
   /** what the last run's grader calls cost, in tokens: in (of them from the prompt cache) and out */
-  spent?: { input: number; cached: number; output: number }
+  spent?: { input: number; cached: number; output: number; cost?: number; unpriced?: number }
 }
 
 /** a test's grade as Claude is told it */

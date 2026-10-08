@@ -5,9 +5,10 @@ import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '
 
 import { TEST_FILE, among, caseLine, caseNames, casesAround, changedCases, casesIn, fits, isTemplate, kindOf, suitesOf } from './discovery'
 import type { Kind } from './discovery'
-import { clamp, excerptOf, parseVerdicts } from './excerpt'
+import { caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts } from './excerpt'
 import type { Graded } from './excerpt'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
+import { costOf } from './prices'
 import { FIX, FLAGGED, isFlagged, verdictOf } from './verdicts'
 import { runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
@@ -110,17 +111,30 @@ const flaggedLines = (list: { file: string; name: string; verdict?: Verdict; rea
   )
 
 // What grader calls cost, summed: tokens in (of them read from the prompt cache) and out
-export type Spent = { input: number; cached: number; output: number }
-const addUsage = (spent: Spent | undefined, usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined): void => {
+export type Spent = { input: number; cached: number; output: number; cost: number; unpriced: number }
+const addUsage = (spent: Spent | undefined, model: string, usage: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } | undefined): void => {
   if (!spent || !usage) return
   spent.input += (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
   spent.cached += usage.cache_read_input_tokens ?? 0
   spent.output += usage.output_tokens ?? 0
+  // priced call by call: Haiku 5.5's price depends on each prompt's length
+  const cost = costOf(model, usage)
+  if (cost === null) spent.unpriced += 1
+  else spent.cost += cost
+}
+
+// a run's cost as the pane shows it: dollars to the cent, or finer below one; a call whose
+// model has no known price says so
+const dollars = (spent: { cost?: number; unpriced?: number }): string => {
+  const cost = spent.cost ?? 0
+  const shown = cost === 0 ? '' : cost >= 1 ? `$${cost.toFixed(2)}` : `$${cost.toPrecision(2)}`
+  const unpriced = spent.unpriced ? `${spent.unpriced} call${spent.unpriced === 1 ? '' : 's'} unpriced` : ''
+  return [shown && `about ${shown}`, unpriced].filter(Boolean).join(', ')
 }
 
 // the rubric every grader call opens with, fixed so the prompt cache keeps it
 const RUBRIC = [
-  'You are a strict, concise reviewer of automated tests. Answer with JSON only.',
+  'You are a careful, concise reviewer of automated tests. Answer with JSON only.',
   'For each test case you are asked about, say in one plain sentence what it verifies (summary) and judge whether it is a decent test.',
   'verdict, one of five, each naming what is wrong:',
   '"strong" = a plausible bug in the code under test would make it fail, and a correct change to how the code works would not;',
@@ -129,12 +143,20 @@ const RUBRIC = [
   '"hollow" = no real bug could make it fail: no assertion, a tautology, asserts only on its own mock, a snapshot of nothing, would pass with the code under test deleted;',
   '"duplicate" = another test in the file already catches the same bugs; name that test in the reason.',
   'Where more than one fits, give the first of: hollow, duplicate, shallow, brittle.',
+  'Default to "strong". Flag a test only when you can point at what in it a reviewer would change; where you are unsure between "strong" and a flagged grade, answer "strong".',
+  'Judge "shallow" against the whole file: a test that checks one case is strong when other tests in the file cover the edges and errors, or when that one case is all its name promises. Matching a prefix, a subset or one key field is not shallow when that is the contract under test.',
+  'Give "shallow" only with a concrete bug it would let through: in missed, an input and the wrong result the code could give that the test would still pass. A "shallow" with no missed counts as "strong".',
+  'Never mark a test down for code you cannot see, or for not covering what another test covers.',
   'reason: one short sentence justifying the verdict.',
   'A name with ${...} in it is a template for cases generated in a loop: grade each case the loop generates separately, named as the loop expands it.',
   "A loop's variables belong only to the tests inside that loop: do not fault a test outside it for not using them.",
   'A name with › in it is the groups the test sits in (describe blocks, classes), then its own name; a name ending in (2) is the second test of that name. Answer with each name exactly as given.',
   'When the code under test is shown, judge each assertion against what that code really does.',
-  'Return a JSON array: [{"name": string, "summary": string, "verdict": "strong"|"shallow"|"brittle"|"hollow"|"duplicate", "reason": string}]',
+  'Examples. it("parses a date", () => expect(parse("2024-01-02")).toEqual(new Date(2024, 0, 2))) beside tests of invalid and empty input: strong, its siblings cover the edges.',
+  'expect(error.message.startsWith("Invalid amount")) where the message prefix is what callers rely on: strong.',
+  'expect(total(items)).toBeDefined(): shallow, missed: "total([{price: 2}, {price: 3}]) returning 4 would pass".',
+  'expect(fn).toHaveBeenCalledTimes(3) on an internal helper: brittle. expect(true).toBe(true): hollow.',
+  'Return a JSON array: [{"name": string, "summary": string, "verdict": "strong"|"shallow"|"brittle"|"hollow"|"duplicate", "reason": string, "missed": string}], missed empty unless the verdict is "shallow"',
 ].join('\n')
 
 // the project's own rules for its tests, from .test-grader.md at its root: read at a session's
@@ -155,7 +177,7 @@ const sleep = ($: EngineInterface, ms: number): Promise<void> => new Promise(don
 // how long one grader call may take
 const CALL_TIMEOUT = 120_000
 
-type GradeOptions = { evidence?: string; model?: string; signal?: AbortSignal; spent?: Spent }
+type GradeOptions = { evidence?: string; isMeasured?: boolean; model?: string; signal?: AbortSignal; spent?: Spent; confirming?: Graded[] }
 
 // The code a test file tests, as the grader reads it beside the test: the project files it
 // imports by a relative path (JS and TS, Python, Ruby), its package's other files (Go), or the
@@ -226,9 +248,25 @@ const candidatesFor = async ($: EngineInterface, file: string, text: string, cwd
   return []
 }
 
+// These cases of this file, judged; null when the grader gave no answer. A plain grade that
+// flags a test is checked by a second, more careful call before the flag stands: where it
+// disagrees, its grade is the one given. A test a measured mutation made fail is not hollow
+const grade = async ($: EngineInterface, file: string, text: string, names: string[], options: GradeOptions = {}): Promise<Graded[] | null> => {
+  const first = await gradeCall($, file, text, names, options)
+  if (first === null) return null
+  const measured = options.isMeasured ? first.map(v => (v.verdict === 'hollow' ? { ...v, verdict: 'strong' as const, reason: `${v.reason} (A measured mutation made it fail, so it is not hollow.)` } : v)) : first
+  // evidence and a second look are already the careful call
+  if (options.evidence || options.model !== undefined) return measured
+  const flagged = measured.filter(v => isFlagged(v.verdict))
+  if (flagged.length === 0) return measured
+  const second = await gradeCall($, file, text, flagged.map(v => v.name), { ...options, model: escalateModel ?? graderModel, confirming: flagged })
+  if (second === null) return measured
+  return measured.map(v => (isFlagged(v.verdict) ? (second.find(s => s.name === v.name) ?? v) : v))
+}
+
 // One grader call: these cases of this file, judged; null when the grader gave no answer. An
 // API error that may pass is tried again, waiting longer each time; a stopped run is not
-const grade = async ($: EngineInterface, file: string, text: string, names: string[], { evidence, model, signal, spent }: GradeOptions = {}): Promise<Graded[] | null> => {
+const gradeCall = async ($: EngineInterface, file: string, text: string, names: string[], { evidence, isMeasured, model, signal, spent, confirming }: GradeOptions = {}): Promise<Graded[] | null> => {
   const source = excerptOf(text, names, file)
   const underTest = await codeUnderTest($, file, text).catch(() => '')
   const ask = [
@@ -244,9 +282,17 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
           'Weigh it, but check each claim against the source above: you cannot run code. Evidence cannot add an assertion the source does not contain.',
           'Evidence should name a concrete mutation (where, before, after), the command run, and the test\'s output before and after; evidence "measured by test-grader" was run by the tool itself, not claimed. Accept it only when the mutation changes behaviour the test\'s assertions in the source would detect; reject evidence that only reports the test passing, coverage, or claims about code not shown.',
           'In reason, say which part of the evidence changed your verdict, or why it did not.',
+          ...(isMeasured ? ['The mutation was measured: the test failed with it, so it is not "hollow".'] : []),
+        ]
+      : []),
+    ...(confirming
+      ? [
+          `A first, quick pass flagged these: ${JSON.stringify(confirming.map(v => ({ name: v.name, verdict: v.verdict, reason: v.reason })))}`,
+          'Check each yourself against the source. Keep a flag only where you agree; for "shallow", name the bug in missed. Where the first pass was wrong, or you are unsure, answer "strong".',
         ]
       : []),
     `Review ONLY these test cases: ${JSON.stringify(names)}`,
+    ...loopsOf(text, names, file),
   ].join('\n')
   const request = {
     model: model ?? graderModel,
@@ -285,7 +331,7 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
       await update($, graderError, () => `The grader (${request.model}) call failed: ${refused}`)
       return null
     }
-    addUsage(spent, reply.usage)
+    addUsage(spent, request.model, reply.usage)
     if (reply.isAnswered) {
       const { verdicts, isCut } = parseVerdicts(reply.text)
       if (isCut) {
@@ -444,15 +490,27 @@ const soon = ($: EngineInterface, work: () => Promise<void>): void => {
   void $.clock.after(1, () => void work().catch(() => undefined).finally(() => finishWork($)))
 }
 
+// A grade is for the text it read: the file as it is now when any of these cases' own text has
+// changed since (an outside edit while the grader ran), else null. Graded again at most so often
+const MAX_STALE = 2
+const staleOf = async ($: EngineInterface, file: string, graded: string, names: string[]): Promise<string | null> => {
+  const now = await $.fs.read(file).catch(() => null)
+  if (now === null || now === graded) return null
+  return names.some(name => caseTextOf(graded, name, file) !== caseTextOf(now, name, file)) ? now : null
+}
+
 // model: a second look, for a test graded again after a flagged grade
 const evaluate = ($: EngineInterface, file: string, ids: Map<string, string>, model?: string): Promise<void> => busy($, () => evaluateNow($, file, ids, model))
-const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>, model?: string): Promise<void> => {
+const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, string>, model?: string, tries = 0): Promise<void> => {
   const fail = async (): Promise<void> => {
     await update($, tests, list => list.map(t => (ids.has(t.id) && t.status === 'pending' ? { ...t, status: 'failed' as const } : t)))
   }
   try {
-    const verdicts = await grade($, file, await $.fs.read(file), [...ids.values()], { model })
+    const text = await $.fs.read(file)
+    const verdicts = await grade($, file, text, [...ids.values()], { model })
     if (verdicts === null) return fail()
+    // the file changed under the grade: graded again on its new text, not kept for the old
+    if (tries < MAX_STALE && (await staleOf($, file, text, [...ids.values()])) !== null) return evaluateNow($, file, ids, model, tries + 1)
     await update($, tests, list =>
       // a looped test becomes one entry per case it generates
       list.flatMap((t): TrackedTest[] => {
@@ -695,15 +753,21 @@ export const fingerprint = (text: string): string => {
   return `${(hash >>> 0).toString(16)}-${text.length}`
 }
 
+// a test's own text, fingerprinted: what a verdict given on evidence was given for
+const ownText = (text: string, name: string, file: string): string => fingerprint(caseTextOf(text, name, file) ?? '')
+// a verdict given on evidence holds, and is not graded again, while the test's own text is as it was
+const isHeld = (t: { name: string; evidence?: string; evidenceOf?: string }, text: string, file: string): boolean =>
+  Boolean(t.evidence && t.evidenceOf && t.evidenceOf === ownText(text, t.name, file))
+
 // The project's grades outlive the session: kept in the store under the project's folder,
 // with each graded file's fingerprint, so a later session lists them and Grade all tests
 // grades again only the files changed since. Listed-but-ungraded rows are not kept
 type SavedGrades = { results: ExistingTest[]; hashes: Record<string, string>; finishedAt?: number }
 // as kept: by file, each file's fingerprint and its tests as [name, verdict, summary, reason,
-// suite, evidence], verdicts as g (strong), w (shallow), b (brittle), u (hollow), d (duplicate)
+// suite, evidence, evidenceOf], verdicts as g (strong), w (shallow), b (brittle), u (hollow), d (duplicate)
 // (none: unrated), the first three as the grades before these were kept; a file's path is
 // written once
-type KeptTest = [string, string, string?, string?, string?, string?]
+type KeptTest = [string, string, string?, string?, string?, string?, string?]
 type KeptGrades = { v: 2; files: Record<string, { hash?: string; tests: KeptTest[] }>; finishedAt?: number }
 const gradesKey = (cwd: string): string => `grades:${cwd}`
 const VERDICT_CODE: Record<Verdict, string> = { strong: 'g', shallow: 'w', brittle: 'b', hollow: 'u', duplicate: 'd' }
@@ -714,7 +778,7 @@ const keep = (saved: SavedGrades, isLean: boolean): KeptGrades => {
   const files: KeptGrades['files'] = {}
   for (const [file, hash] of Object.entries(saved.hashes)) files[file] = { hash, tests: [] }
   for (const t of saved.results) {
-    const row: KeptTest = [t.name, t.verdict ? VERDICT_CODE[t.verdict] : '', isLean ? '' : (t.summary ?? ''), t.reason ?? '', t.suite ?? '', t.evidence ?? '']
+    const row: KeptTest = [t.name, t.verdict ? VERDICT_CODE[t.verdict] : '', isLean ? '' : (t.summary ?? ''), t.reason ?? '', t.suite ?? '', t.evidence ?? '', t.evidence ? (t.evidenceOf ?? '') : '']
     while (row.length > 2 && !row[row.length - 1]) row.pop()
     ;(files[t.file] ??= { tests: [] }).tests.push(row)
   }
@@ -727,8 +791,8 @@ export const unkeep = (kept: KeptGrades | SavedGrades): SavedGrades => {
   const hashes: Record<string, string> = {}
   for (const [file, { hash, tests }] of Object.entries(kept.files)) {
     if (hash) hashes[file] = hash
-    for (const [name, code, summary, reason, suite, evidence] of tests) {
-      results.push({ file, name, ...(CODE_VERDICT[code] ? { verdict: CODE_VERDICT[code] } : {}), ...(summary ? { summary } : {}), ...(reason ? { reason } : {}), ...(suite ? { suite } : {}), ...(evidence ? { evidence } : {}) })
+    for (const [name, code, summary, reason, suite, evidence, evidenceOf] of tests) {
+      results.push({ file, name, ...(CODE_VERDICT[code] ? { verdict: CODE_VERDICT[code] } : {}), ...(summary ? { summary } : {}), ...(reason ? { reason } : {}), ...(suite ? { suite } : {}), ...(evidence ? { evidence } : {}), ...(evidence && evidenceOf ? { evidenceOf } : {}) })
     }
   }
   return { results, hashes, ...(kept.finishedAt === undefined ? {} : { finishedAt: kept.finishedAt }) }
@@ -806,7 +870,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
     const others = only ? before.results.filter(t => !inRun.has(t.file)) : []
     await update($, existing, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}) }))
     const hashes: Record<string, string> = {}
-    const spent: Spent = { input: 0, cached: 0, output: 0 }
+    const spent: Spent = { input: 0, cached: 0, output: 0, cost: 0, unpriced: 0 }
     // tests whose results stand from before
     let remembered = 0
     // every file's batches, in file order; a file is done when its last batch is. Until the
@@ -853,8 +917,15 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
           done += 1
           continue
         }
-        for (let at = 0; at < names.length; at += BATCH) {
-          const batch = names.slice(at, at + BATCH)
+        // a test graded on evidence, its own text unchanged since, keeps that grade
+        const held = kept.filter(t => isHeld(t, text, file))
+        const toGrade = names.filter(name => !held.some(t => fits(name, t.name)))
+        if (held.length > 0) {
+          entry.slots.push({ items: held, waiting: held, was: held, isDone: true })
+          remembered += held.length
+        }
+        for (let at = 0; at < toGrade.length; at += BATCH) {
+          const batch = toGrade.slice(at, at + BATCH)
           const was = batch.flatMap(name => {
             const had = kept.filter(t => fits(name, t.name))
             return had.length > 0 ? had : [{ file, name, isUngraded: true }]
@@ -968,7 +1039,8 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   }
   const present = caseNames(text, file)
   // every test the change touched is graded again: a strong grade may not hold for its new text
-  const isRedo = (t: { file: string; name: string; verdict?: Verdict }): boolean => t.file === file && among(touched, t.name)
+  // but one graded on evidence whose own text is as it was keeps that grade
+  const isRedo = (t: { file: string; name: string; verdict?: Verdict; evidence?: string; evidenceOf?: string }): boolean => t.file === file && among(touched, t.name) && !isHeld(t, text, file)
   const known = new Set([...(await read($, existing)).results, ...(await read($, tests))].filter(t => t.file === file && among(touched, t.name) && among(present, t.name)).map(t => `${t.file}:${t.name}`))
   if (known.size > 0) await update($, modified, all => [...new Set([...all, ...known])].slice(-MAX_TESTS))
 
@@ -1010,7 +1082,14 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
 const regradeRows = ($: EngineInterface, file: string, text: string, names: string[], model?: string): Promise<void> =>
   busy($, async () => {
     const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
-    const verdicts = await grade($, file, text, names, { model }).catch(() => null)
+    let verdicts: Graded[] | null = null
+    // the file changed under the grade: graded again on its new text, not kept for the old
+    for (let tries = 0, at = text; tries <= MAX_STALE; tries++) {
+      verdicts = await grade($, file, at, names, { model }).catch(() => null)
+      const now = verdicts === null || tries === MAX_STALE ? null : await staleOf($, file, at, names)
+      if (now === null) break
+      at = now
+    }
     await reportGrades($, names.flatMap(name => {
       const v = verdicts?.find(x => x.name === name)
       return v ? [{ file, name, verdict: v.verdict, reason: v.reason }] : []
@@ -1392,12 +1471,12 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
 // a path the session gave: absolute, or in the project
 const inProject = (cwd: string, given: string): string => (given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`)
 
-const regradeOnEvidence = async ($: EngineInterface, file: string, text: string, name: string, caseName: string, evidence: string): Promise<string> => {
+const regradeOnEvidence = async ($: EngineInterface, file: string, text: string, name: string, caseName: string, evidence: string, isMeasured = false): Promise<string> => {
   const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
-  const verdicts = await grade($, file, text, [caseName], { evidence, model: escalateModel ?? undefined }).catch(() => null)
+  const verdicts = await grade($, file, text, [caseName], { evidence, isMeasured, model: escalateModel ?? undefined }).catch(() => null)
   const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
   if (!v) return 'The grader gave no verdict. Nothing was regraded; send it again.'
-  const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence }
+  const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, evidence, evidenceOf: ownText(text, caseName, file) }
   const suite = suitesOf(text, file).get(caseName)
   await update($, existing, r => ({
     ...r,
@@ -1524,7 +1603,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
     ].join('\n'),
     EVIDENCE_MAX,
   )
-  return `Measured: the test passes unchanged and fails with the mutation. ${await regradeOnEvidence($, file, text, name, caseName, evidence)}`
+  return `Measured: the test passes unchanged and fails with the mutation. ${await regradeOnEvidence($, file, text, name, caseName, evidence, true)}`
 }
 
 // the session's tool for the grades as they stand: the flagged tests by default,
@@ -2109,7 +2188,7 @@ export const register: Register = (on, options) => {
         {graded.state === 'idle' && graded.graded !== undefined && (
           <Text color={MUTED}>
             {`Last run: ${graded.graded} graded · ${graded.remembered ?? 0} remembered` +
-              (graded.spent && graded.spent.input + graded.spent.output > 0 ? ` · ${tokens(graded.spent.input)} in (${tokens(graded.spent.cached)} cached) / ${tokens(graded.spent.output)} out` : '')}
+              (graded.spent && graded.spent.input + graded.spent.output > 0 ? ` · ${tokens(graded.spent.input)} in (${tokens(graded.spent.cached)} cached) / ${tokens(graded.spent.output)} out` + (dollars(graded.spent) ? ` · ${dollars(graded.spent)}` : '') : '')}
           </Text>
         )}
         {graded.state === 'idle' && graded.message !== undefined && <Text color={AMBER}>{graded.message}</Text>}

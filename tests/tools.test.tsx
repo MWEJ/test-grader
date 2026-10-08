@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { mount, project, ok, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, askGrades, GRADED, turns, ADDING, jest } from './helpers'
+import { mount, project, ok, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, askGrades, GRADED, turns, ADDING, jest, ASKED } from './helpers'
 
 test('evidence the grader accepts turns a shallow test strong, and the row says it was graded on evidence', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -38,7 +38,7 @@ test('evidence the grader rejects leaves the verdict, and the tool says why', as
   const answer = await sendEvidence($, { file: '/proj/src/e.test.ts', test: 'a shallow check', evidence: 'It is fine.' })
   await clock.advance(10)
 
-  expect(answer).toBe('Still shallow: shallow because. Strengthen it, or send other evidence (round 1 of 3).')
+  expect(answer).toBe('Still shallow: shallow because. It would miss: a wrong edge. Strengthen it, or send other evidence (round 1 of 3).')
   expect(JSON.stringify(await ui.drawn())).toContain('2 tests · 1 strong · 1 shallow')
 })
 
@@ -56,23 +56,29 @@ test('evidence for a test that is not in the file is refused, with no grader cal
 })
 
 
-test('a verdict on evidence holds while the file is unchanged, and goes once it changes', async ($, on) => {
+test('a verdict on evidence holds while the test\'s own text is unchanged, other tests in the file changing or not, and goes once it changes', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { 'src/e.test.ts': E_TEST }
-  project(on, files, { rule: swayed })
+  const { prompts } = project(on, files, { rule: swayed })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
+  const asked = (name: string): number => ASKED(prompts).filter(n => n === name).length
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
   await clock.advance(10)
+  const before = asked('a shallow check')
 
-  // remembered: Grade all again keeps it
-  await ui.press({ key: 'gradeAll' })
+  // another test added: the file is graded again, but not the test held on evidence
+  files['src/e.test.ts'] = E_TEST + "\nit('second', () => { expect(f(2)).toBe(2) })\n"
+  await ui.press({ key: 'regradeAll' })
   await clock.advance(10)
   expect(JSON.stringify(await ui.drawn())).toContain('"on evidence"')
+  expect(JSON.stringify(await ui.drawn())).toContain('3 tests · 3 strong')
+  expect(asked('a shallow check')).toBe(before)
 
-  files['src/e.test.ts'] = E_TEST + "\nit('second', () => { expect(f(2)).toBe(2) })\n"
+  // its own text changed: graded again, without the evidence
+  files['src/e.test.ts'] = files['src/e.test.ts']!.replace('expect(f).toBeDefined()', 'expect(f).toBeTruthy()')
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   const tree = JSON.stringify(await ui.drawn())
@@ -93,8 +99,8 @@ test('test_grades lists the flagged tests, worst first, each at its line with wh
     '4 tests: 1 strong, 1 hollow, 2 shallow.\n' +
       'Flagged, worst first:\n' +
       '- src/math.test.ts:2 "does nothing": hollow\n  Checks: Checks does nothing.\n  Why: hollow because.\n' +
-      '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because.\n' +
-      '- src/deep/more.test.ts:4 "another shallow one": shallow\n  Checks: Checks another shallow one.\n  Why: shallow because.\n' +
+      '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
+      '- src/deep/more.test.ts:4 "another shallow one": shallow\n  Checks: Checks another shallow one.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   )
 })
@@ -112,7 +118,7 @@ test('test_grades narrows to a folder, to the verdicts asked, and to a limit, sa
   expect(deep).toBe(
     '2 tests in src/deep: 0 strong, 2 shallow.\n' +
       'Flagged, worst first:\n' +
-      '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because.\n' +
+      '- src/deep/more.test.ts:3 "a shallow check": shallow\n  Checks: Checks a shallow check.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       '1 more not listed; raise limit or narrow path to see them.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   )
@@ -186,7 +192,7 @@ test('test_grades with written lists only the tests written or edited this sessi
   expect(await askGrades($, { written: true })).toBe(
     '2 tests written or edited this session: 1 strong, 1 shallow.\n' +
       'Flagged, worst first:\n' +
-      '- src/new.test.ts:1 "a new shallow test": shallow (round 1 of 3)\n  Checks: Checks a new shallow test.\n  Why: shallow because.\n' +
+      '- src/new.test.ts:1 "a new shallow test": shallow (round 1 of 3)\n  Checks: Checks a new shallow test.\n  Why: shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.',
   )
 })
@@ -221,7 +227,7 @@ test('/test-grader report writes the grades as Markdown, worst first with each t
   expect((ran as { text: string }).text).toBe('Wrote test-grader-report.md and test-grader-report.json: 4 tests, 1 strong, 1 hollow, 2 shallow.')
   const md = files['test-grader-report.md']!
   expect(md.split('\n').slice(0, 3)).toEqual(['# Test grades', '', `4 tests: 1 hollow, 2 shallow, 1 strong. Graded by test-grader, ${new Date(1_000_010).toISOString()}.`])
-  expect(md).toContain('## Hollow (1)\n\n- `src/math.test.ts:2` does nothing: hollow because.\n\n## Shallow (2)\n\n- `src/deep/more.test.ts:3` a shallow check: shallow because.\n- `src/deep/more.test.ts:4` another shallow one: shallow because.')
+  expect(md).toContain('## Hollow (1)\n\n- `src/math.test.ts:2` does nothing: hollow because.\n\n## Shallow (2)\n\n- `src/deep/more.test.ts:3` a shallow check: shallow because. It would miss: a wrong edge.\n- `src/deep/more.test.ts:4` another shallow one: shallow because. It would miss: a wrong edge.')
   const json = JSON.parse(files['test-grader-report.json']!) as { counts: Record<string, number>; tests: { file: string; line: number; name: string; state: string }[] }
   expect(json.counts).toEqual({ hollow: 1, duplicate: 0, shallow: 2, brittle: 0, unrated: 0, reviewing: 0, ungraded: 0, strong: 1 })
   expect(json.tests[0]).toEqual({ file: 'src/math.test.ts', line: 2, name: 'does nothing', state: 'hollow', summary: 'Checks does nothing.', reason: 'hollow because.', onEvidence: false })
@@ -242,6 +248,24 @@ test('Run test runs the one test with the project runner, and its row says how i
   expect(runs.filter(r => r[1] === 'jest')).toEqual([['npx', 'jest', 'src/a.test.ts', '-t', '^a shallow check$']])
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain("Failed: npx jest src/a.test.ts -t '^a shallow check$'\\nFAIL src/a.test.ts\\n  ● a shallow check\\n    expected 3")
+})
+
+
+test('a test a measured mutation made fail is never graded hollow, while evidence only claimed can still be', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...ADDING }
+  // a grader that will not be moved off hollow
+  project(on, files, { editor: jest(files), rule: () => 'hollow' })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+
+  const claimed = await sendEvidence($, { file: 'src/a.test.ts', test: 'a shallow check', evidence: 'Measured by test-grader, not claimed: it failed.' })
+  expect(claimed).toMatch(/^Still hollow: /)
+  const measured = await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: 'a + b', replace: 'a - b' } as never).then(r => String((r as { result: unknown }).result))
+  expect(measured).toContain('Now strong: ')
+  expect(measured).toContain('so it is not hollow')
 })
 
 

@@ -1,6 +1,7 @@
 import { fingerprint, unkeep } from '../hooks/register'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Verdict } from '../types'
+import type { Engine, On } from './helpers'
 import { askGrades, buttonsOf, mount, project, verdictsDrawn, nodesOf, holdsKey, appended, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, ASKED, seedState, BRANCH, branchGit } from './helpers'
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the flagged worst first', async ($, on) => {
@@ -29,7 +30,7 @@ test('Grade all tests grades every case of every test file git tracks, in batche
   expect(tree).toContain('26 tests · 24 strong · 1 hollow · 1 shallow"')
   // listed: the hollow before the shallow; the strong are counted, not listed
   expect(tree).toContain('hollow because.')
-  expect(tree).toContain('shallow because.')
+  expect(tree).toContain('shallow because. It would miss: a wrong edge.')
   expect(tree.indexOf('does nothing')).toBeLessThan(tree.indexOf('a shallow check'))
   // the strong are listed too, after the shallow in their file
   expect(tree.indexOf('a shallow check')).toBeLessThan(tree.indexOf('case 7'))
@@ -178,7 +179,7 @@ test('a finished run leaves Claude a note: the counts, then every shallow, hollo
     'Test grading (test-grader) finished: 4 graded · 1 strong · 1 hollow · 1 shallow · 1 unrated.\n' +
       'Need work, worst first:\n' +
       '- hollow · src/math.test.ts · does nothing — hollow because.\n' +
-      '- shallow · src/more.test.ts · a shallow check — shallow because.\n' +
+      '- shallow · src/more.test.ts · a shallow check — shallow because. It would miss: a wrong edge.\n' +
       'If one of these is better than rated, send your evidence (a mutation that makes it fail, what it alone catches) with the test_evidence tool to have it regraded.\n' +
       'Unrated (the grader gave no verdict):\n' +
       '- src/more.test.ts · lost ${x}',
@@ -286,7 +287,7 @@ test('a finished Grade all tests saves grades a later session reads back whole, 
   expect(unkeep(store['grades:/proj'] as never)).toEqual({
     results: [
       { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because.' },
-      { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'shallow because.' },
+      { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'shallow because. It would miss: a wrong edge.' },
     ],
     hashes: { '/proj/src/a.test.ts': fingerprint(files['src/a.test.ts']!), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) },
     finishedAt: 1_000_001,
@@ -530,15 +531,37 @@ test('Stop cuts a run short: no more grader calls, the tests keep what they had,
 })
 
 
-test('the pane shows what the last run cost, in tokens in, from the cache and out', async ($, on) => {
+// a run of one grader call with this usage, and the line the pane says it cost in
+const costLine = async ($: Engine, on: On, usage: Record<string, number>) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const answer = { isAnswered: true, usage: { input_tokens: 400, cache_read_input_tokens: 1_600, output_tokens: 300 }, text: JSON.stringify([{ name: 'adds', summary: 's', verdict: 'strong', reason: 'r' }]) }
+  const answer = { isAnswered: true, usage, text: JSON.stringify([{ name: 'adds', summary: 's', verdict: 'strong', reason: 'r' }]) }
   project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: () => answer })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(JSON.stringify(await ui.drawn())).toContain('Last run: 1 graded · 0 remembered · 2k in (2k cached) / 300 out')
+  return (await ui.findAll({ type: 'Text' })).map(t => t.text).find(t => t.startsWith('Last run:'))
+}
+
+test('the pane shows what the last run cost, in tokens in, from the cache and out, and in dollars at Haiku 5.5 prices', async ($, on) => {
+  // 400 × $0.10 + 1,600 × $0.01 + 300 × $0.50 a million
+  expect(await costLine($, on, { input_tokens: 400, cache_read_input_tokens: 1_600, output_tokens: 300 })).toBe('Last run: 1 graded · 0 remembered · 2k in (2k cached) / 300 out · about $0.00021')
+})
+
+test('a Haiku 5.5 prompt of exactly 100,000 tokens is priced short', async ($, on) => {
+  // 100,000 × $0.10 + 2,000 × $0.50 a million; priced long it would be $0.055
+  expect(await costLine($, on, { input_tokens: 100_000, output_tokens: 2_000 })).toContain('· about $0.011')
+})
+
+test('a Haiku 5.5 prompt over 100,000 tokens, cache writes and reads counted in, is priced long', async ($, on) => {
+  // 80,000 × $0.50 + 10,000 × $0.625 + 20,000 × $0.05 + 1,000 × $2.50 a million
+  expect(await costLine($, on, { input_tokens: 80_000, cache_creation_input_tokens: 10_000, cache_read_input_tokens: 20_000, output_tokens: 1_000 })).toContain('· about $0.050')
+})
+
+test('a grader model with no known price shows its calls as unpriced, not a cost', { options: { graderModel: 'my-gateway-model' } }, async ($, on) => {
+  const line = await costLine($, on, { input_tokens: 400, output_tokens: 300 })
+  expect(line).toContain('· 1 call unpriced')
+  expect(line).not.toContain('$')
 })
 
 

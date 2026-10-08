@@ -27,7 +27,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **A verdict per test.** Each test gets a one-line summary and a one-line reason. Verdicts sit in one column on the first line of the title. Pressing a row shows its details.
 - **Badges.** *new* marks a test written this session, and *modified* a test that was there before and was edited this session. A file or folder row carries a badge when a test beneath it does.
 - **A summary line.** It shows the counts of tests and strong ones, then each other grade, new and modified when there are any.
-- **The last run.** Below the summary: how many tests it graded and how many it remembered, and what its grader calls cost in tokens (in, of them from the prompt cache, and out).
+- **The last run.** Below the summary: how many tests it graded and how many it remembered, and what its grader calls cost: in tokens (in, of them from the prompt cache, and out), and in dollars at the Claude API's list prices for the model asked for. Haiku 5.5 is priced by each call's prompt length, higher over 100,000 tokens. An alias is priced as its family's latest model, and a call to a model with no listed price, such as a gateway's own, is counted as unpriced.
 - **Open in editor.** This button opens the test at its line (see [Opening a test in your editor](#opening-a-test-in-your-editor)).
 - **Run test.** This button runs the one test with the project's runner. The row then says whether it passed, with the command, and, when it failed, the end of what it printed (see [Running one test](#running-one-test)).
 - **Coverage figures.** These show when the project has a coverage report (see [Coverage](#coverage)).
@@ -55,10 +55,17 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Stop** cuts a run short. No more grader calls start, the tests not yet graded keep what they had, and the pane says how far the run got. The next run grades the rest.
 - **Regrade all** grades every file again, unchanged ones included.
 - **`/test-grader diff`** grades only the test files changed on this branch: against where it left `main` (or `master`), with the changes not committed yet and new files. The rest of the project's grades stay as they are.
-- **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates.
+- **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates. Graded again, each case is sent with its loop's code, and the grader is told which loop the case comes from.
 - **Tests of one name are told apart.** Two tests named alike in one file are named by the groups around them, as in `parser › empty input` and `lexer › empty input`. Failing that, they are named by their order: `works`, `works (2)`.
 
 The grader is `haiku` by default: the alias, which Claude Code resolves to the Haiku its account, provider or gateway is set up with. It reviews up to 10 tests per call, with up to 10 calls at once.
+
+#### Keeping false flags down
+
+- **Strong unless shown otherwise.** The grader defaults to strong, and where it is unsure it answers strong. It judges a test against the whole file: one case is enough when other tests cover the edges, or when that case is all the test's name promises. It never marks a test down for code it cannot see.
+- **Shallow needs a named bug.** A shallow grade must name a bug the test would let through: an input, and the wrong result it would still pass. That bug is added to the reason, as the case to add. A shallow grade with none counts as strong.
+- **A flag is confirmed before it is told.** When a first, quick pass flags a test, a second, more careful call checks it: the second-look model when one is set, else the grader model at its own effort. The flag stands only if that call agrees, and its grade and reason are the ones given. Tests graded strong cost no second call.
+- **A grade is for the text it read.** If a test's own code changes while it is being graded, by an outside edit, the grade is thrown away and the test is graded again on its new code. A change elsewhere in the file leaves the grade be.
 
 #### What the grader reads
 
@@ -82,7 +89,7 @@ A grader call that the API answers with *overloaded*, *rate limited* or a server
 | Setting | Values | Default | What it does |
 | --- | --- | --- | --- |
 | **Grader model** (`graderModel`) | an alias (`haiku`, `sonnet`, `opus`) or a model id | `haiku` | the model that grades; the alias follows the Haiku Claude Code is set up with. A model id is used exactly as set, so a gateway's own ids work. |
-| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: an edited test whose last grade was flagged, evidence and verified mutations. An edited test graded strong stays with the grader model. |
+| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: it confirms a first flag before Claude is told, and grades an edited test whose last grade was flagged, evidence and verified mutations. An edited test graded strong stays with the grader model. |
 | **Grader workers** (`graderWorkers`) | 1 to 20 | 10 | how many grader calls Grade all tests runs at once |
 
 Change them in the `/config` menu, where a change applies to the next grader call, or in `~/.claude/settings.json`, read when Claude Code starts:
@@ -91,7 +98,7 @@ Change them in the `/config` menu, where a change applies to the next grader cal
 { "pluginConfigs": { "test-grader": { "graderModel": "haiku", "graderEscalate": "sonnet", "graderWorkers": 4 } } }
 ```
 
-When the mod is loaded straight from its folder, the key is `test-grader@inline` instead. A change reloads the mod, and every grading after it uses the new settings.
+When the mod is loaded straight from its folder, the key is `test-grader@inline` instead. Every grading after a change uses the new settings.
 
 #### Which tests are found
 
@@ -146,7 +153,7 @@ The tool reads the grades the pane shows and starts no grading. Tests still bein
 
 #### Sending evidence: `test_evidence`
 
-When a test is better or worse than its rating, Claude can send evidence. The best evidence is a mutation of the code that makes this test fail, with the command run and the output before and after. The grader cannot run code. It checks each claim against the source and the code under test, and it rejects evidence that only says the test passes, or that it has coverage. A verdict given on evidence is marked as such in the pane, and it holds while the file is unchanged.
+When a test is better or worse than its rating, Claude can send evidence. The best evidence is a mutation of the code that makes this test fail, with the command run and the output before and after. The grader cannot run code. It checks each claim against the source and the code under test, and it rejects evidence that only says the test passes, or that it has coverage. A verdict given on evidence is marked as such in the pane, and it holds while the test's own code is unchanged: edits to other tests, Grade all and Regrade all leave it be. An edit to the test itself grades it again, without the evidence.
 
 #### Measured evidence: `test_verify`
 
@@ -157,7 +164,7 @@ When a test is better or worse than its rating, Claude can send evidence. The be
 3. It runs the test again.
 4. It puts the file back as it was, and checks that it is.
 
-If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
+If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. A test a measured mutation made fail is never graded hollow. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
 
 ### Running one test
 
@@ -256,6 +263,7 @@ The engine keeps every function that is handed the engine interface `$` in `hook
 | `hooks/register.tsx` | the hooks: grading, the notes, the pane, coverage, running tests, the tools, the commands |
 | `hooks/discovery.ts` | which files hold tests, and which cases each declares, by language |
 | `hooks/excerpt.ts` | what the grader reads of a long file, and what its reply holds |
+| `hooks/prices.ts` | what a grader call costs, at the Claude API's list prices |
 | `hooks/runner.ts` | the command that runs one test |
 | `hooks/settings.ts` | what a setting comes to: the grader model, the worker count |
 | `hooks/verdicts.ts` | the grades, their order and fixes, and the old grades' new names |
