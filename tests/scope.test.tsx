@@ -156,3 +156,19 @@ test('test files the project\'s .test-grader-ignore names are neither listed nor
   expect(await askGrade($, clock)).toContain('2 graded')
   expect(filesOf(prompts).sort()).toEqual(['/proj/src/a/x.test.ts', '/proj/src/b/y.test.ts'])
 })
+
+
+test('test files in git worktree copies of the project or in installed packages are never listed, with no ignore list', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const copy = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"
+  project(on, { ...TWO_FOLDERS, '.worktrees/fix/src/a/x.test.ts': copy, '.claude/worktrees/b/src/a/x.test.ts': copy, 'node_modules/lib/lib.test.ts': copy, 'src/worktrees/w.test.ts': copy })
+  await start($)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  const tree = JSON.stringify(await ui.drawn())
+  // the two folders' tests and src/worktrees/, which is the project's own
+  expect(tree).toContain('3 tests')
+  expect(tree).not.toContain('.worktrees')
+  expect(tree).not.toContain('node_modules')
+})

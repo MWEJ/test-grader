@@ -915,3 +915,72 @@ test('tools the session has lost are registered again at a turn\'s end, and only
   await clock.advance(10)
   expect(tools.slice(6).sort()).toEqual(['test_grades', 'test_verify'])
 })
+
+
+// a Go module below the project's root, as a repo with a backend/ and a mobile/ has it
+const BACKEND: Record<string, string> = {
+  'backend/go.mod': 'module example.com/shop\n\ngo 1.22\n',
+  'backend/tests/config/run_test.go': 'package config\n\nfunc TestPins(t *testing.T) {\n\tif port() != 1 {\n\t\tt.Fatal("port")\n\t}\n}\n',
+  'backend/tests/config/port.go': 'package config\n\nfunc port() int { return 1 }\n',
+}
+const goRun = (files: Record<string, string>) => (argv: string[]) =>
+  argv[0] === 'go' ? (files['backend/tests/config/port.go']!.includes('return 1') ? { stdout: 'ok  example.com/shop/tests/config', exitCode: 0 } : { stdout: '--- FAIL: TestPins\n    run_test.go:5: port', exitCode: 1 }) : 1
+
+test('test_verify on a Go test of a module below the root runs it from the module\'s folder', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND }
+  const { runs, runsIn, prompts } = project(on, files, { editor: goRun(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
+  await clock.advance(10)
+  await answer
+
+  expect(runs.slice(0, 2)).toEqual([['go', 'test', './tests/config', '-count=1', '-run', '^TestPins$'], ['go', 'test', './tests/config', '-count=1', '-run', '^TestPins$']])
+  expect(runsIn.slice(0, 2)).toEqual(['/proj/backend', '/proj/backend'])
+  // the measured evidence names the command as run
+  expect(prompts.at(-1)).toContain('cd backend && go test ./tests/config -count=1 -run')
+})
+
+test('test_verify on a test that could not run says so, not that it fails, and mutates nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND }
+  const { writes } = project(on, files, { editor: () => ({ stdout: 'go: cannot find main module, but found .git/config in /proj', exitCode: 1 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
+  expect(answer).toMatch(/^Could not run the test, so nothing was measured\. cd backend && go test .*\nprinted:|^Could not run the test, so nothing was measured\. cd backend && go test [^\n]* printed:\ngo: cannot find main module/)
+  expect(writes).toEqual([])
+})
+
+test('Run test on a jest app in a folder of its own runs it there, by the runner its package.json names', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'mobile/package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'mobile/src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  const { runs, runsIn } = project(on, files, { editor: () => ({ stdout: 'PASS', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'r:/proj/mobile/src/a.test.ts:adds' })
+  await ui.press({ key: 'x:/proj/mobile/src/a.test.ts:adds' })
+  await clock.advance(10)
+
+  expect(runs.filter(r => r[1] === 'jest')).toEqual([['npx', 'jest', 'src/a.test.ts', '-t', '^adds$']])
+  expect(runsIn.at(-1)).toBe('/proj/mobile')
+})
+
+test('a workspace package that names no runner of its own runs its test by the root\'s', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'packages/x/package.json': '{ "name": "x" }', 'packages/x/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  const { runs, runsIn } = project(on, files, { editor: () => ({ stdout: 'PASS', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'r:/proj/packages/x/a.test.ts:adds' })
+  await ui.press({ key: 'x:/proj/packages/x/a.test.ts:adds' })
+  await clock.advance(10)
+
+  expect(runs.filter(r => r[1] === 'jest')).toEqual([['npx', 'jest', 'packages/x/a.test.ts', '-t', '^adds$']])
+  expect(runsIn.at(-1)).toBe('/proj')
+})

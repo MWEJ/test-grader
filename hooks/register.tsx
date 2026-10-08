@@ -13,7 +13,7 @@ import { gradesKey, keep, unkeep } from './kept'
 import type { KeptGrades, SavedGrades } from './kept'
 import { costOf } from './prices'
 import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, CONTEXT_DESCRIPTION, COVERAGE_DESCRIPTION, COVERAGE_SCHEMA, COVERAGE_TOOL, CONTEXT_MAX, VERIFY_SIBLINGS, CONTEXT_SCHEMA, CONTEXT_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
-import { isBuildFailure, runArgv, shown, tailOf } from './runner'
+import { PROJECT_MARKS, isBuildFailure, isSetupFailure, runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
 import { FLAGGED, LISTED, isFlagged, verdictOf } from './verdicts'
@@ -568,6 +568,10 @@ const mtime = async ($: EngineInterface, path: string): Promise<number | null> =
 
 // the report a coverage run left in this folder (the project's, or a part's), its paths relative to it
 const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage | null> => {
+  // a file the project's ignore list names does not count (scratch code in backend/tmp/)
+  const root = await projectDir($)
+  const isIgnored = await ignoreOf($, root)
+  const isKept = (file: string): boolean => !isIgnored(shortPath(file, root))
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
   const lcovPath = `${cwd}/coverage/lcov.info`
   const xmlPath = `${cwd}/coverage.xml`
@@ -582,7 +586,7 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
         .filter(([file]) => file !== 'total')
         .map(([file, m]) => ({ file, total: Number(m.lines?.total ?? 0), covered: Number(m.lines?.covered ?? 0) }))
       return {
-        byDir: byDirOf(byFile, cwd),
+        byDir: byDirOf(byFile.filter(f => isKept(f.file.startsWith('/') ? f.file : `${cwd}/${f.file}`)), cwd),
         lines: pct(total.lines?.pct),
         statements: pct(total.statements?.pct),
         branches: pct(total.branches?.pct),
@@ -606,7 +610,7 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
       return file ? [{ file: file.startsWith('/') ? file : `${cwd}/${file}`, total: count('LF'), covered: count('LH') }] : []
     })
     return {
-      byDir: byDirOf(byFile, cwd),
+      byDir: byDirOf(byFile.filter(f => isKept(f.file)), cwd),
       lines: ratio('LH', 'LF'),
       statements: null,
       branches: ratio('BRH', 'BRF'),
@@ -623,7 +627,7 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
   const profileAt = await mtime($, `${cwd}/${GO_PROFILE}`)
   if (profileAt !== null) {
     const goMod = await $.fs.read(`${cwd}/go.mod`).catch(() => '')
-    const { statements, byFile, byPackage } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd)
+    const { statements, byFile, byPackage } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd, isKept)
     if (statements !== null) return { byDir: byDirOf(byFile, cwd), byPackage, lines: null, statements: pct(statements), branches: null, functions: null, source: 'go test -coverprofile', updatedAt: profileAt }
   }
   const goAt = await mtime($, goPath)
@@ -717,7 +721,7 @@ const measure = async ($: EngineInterface, rel = ''): Promise<{ command: CoverCo
     const runs = await Promise.all(chosen.map(p => measurePart($, cwd, p, rel === p.dir || p.dir.startsWith(`${rel}/`) || rel === '' ? '' : p.dir === '' ? rel : rel.slice(p.dir.length + 1))))
     await refreshCoverage($)
     const failed = runs.find(r => r.exitCode !== 0)
-    await setRun(failed ? 'failed' : 'idle', failed ? `Tests exited with ${failed.exitCode}.` : undefined)
+    await setRun(failed ? 'failed' : 'idle', failed ? `Tests exited with ${failed.exitCode}${(await read($, coverage)) ? ': the figures are from the tests that ran' : ''}.` : undefined)
     if (runs.length === 1) return runs[0]!
     return {
       command: { argv: [], label: runs.map(r => r.command.label).join(' · ') },
@@ -872,12 +876,15 @@ const loadGrades = async ($: EngineInterface): Promise<void> => {
 
 // The project's test files, by their path in it: every one git tracks, and every new one it
 // would (untracked, not ignored); null outside a git repository
-// the project's test files, as git lists them, less those its .test-grader-ignore names
+// the project's test files, as git lists them, less those its .test-grader-ignore names, and
+// the copies of the project git worktrees and installed packages hold
 const IGNORE = '.test-grader-ignore'
+const ALWAYS_IGNORED = '.worktrees/\n.claude/worktrees/\nnode_modules/\n'
+const ignoreOf = async ($: EngineInterface, cwd: string): Promise<(path: string) => boolean> => ignoredBy(ALWAYS_IGNORED + (await $.fs.read(`${cwd}/${IGNORE}`).catch(() => '')))
 const testFiles = async ($: EngineInterface, cwd: string): Promise<string[] | null> => {
   const listed = await $.process.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], { cwd, timeoutMs: 60_000 })
   if (listed.exitCode !== 0) return null
-  const isIgnored = ignoredBy(await $.fs.read(`${cwd}/${IGNORE}`).catch(() => ''))
+  const isIgnored = await ignoreOf($, cwd)
   return [...new Set(listed.stdout.split('\n').filter(f => f !== '' && TEST_FILE.test(f) && !isIgnored(f)))]
 }
 
@@ -1636,6 +1643,28 @@ const detectRunners = async ($: EngineInterface, cwd: string): Promise<Runners> 
   }
 }
 
+// Where a test runs from: the nearest folder above its file, inside the project, that holds its
+// language's mark (backend/go.mod, mobile/package.json), with the runners found there; else the
+// project's root. Kept by folder in this load of the module
+const basesAt = new Map<string, Promise<{ base: string; runners: Runners }>>()
+const baseOf = async ($: EngineInterface, cwd: string, file: string): Promise<{ base: string; runners: Runners }> => {
+  const marks = PROJECT_MARKS[kindOf(file)] ?? []
+  const key = `${kindOf(file)}:${file.slice(0, file.lastIndexOf('/'))}`
+  const known = basesAt.get(key)
+  if (known) return known
+  const found = (async () => {
+    for (let dir = file.slice(0, file.lastIndexOf('/')); dir.length > cwd.length && dir.startsWith(`${cwd}/`); dir = dir.slice(0, dir.lastIndexOf('/'))) {
+      if (!(await Promise.all(marks.map(mark => mtime($, `${dir}/${mark}`)))).some(at => at !== null)) continue
+      // a workspace's package that names no runner of its own runs by one further up
+      const found = await detectRunners($, dir)
+      if ((kindOf(file) !== 'js' || found.js) && (kindOf(file) !== 'jvm' || found.jvm)) return { base: dir, runners: found }
+    }
+    return { base: cwd, runners }
+  })()
+  basesAt.set(key, found)
+  return found
+}
+
 // a test as its runner names it, found in its file as it is now
 const targetOf = (cwd: string, file: string, text: string, name: string): RunTarget | null => {
   const found = casesIn(text, file).find(c => fits(c.name, name))
@@ -1652,12 +1681,14 @@ const runOne = async ($: EngineInterface, file: string, name: string): Promise<R
   const cwd = await projectDir($)
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}.`
-  const target = targetOf(cwd, file, text, name)
+  const { base, runners: found } = await baseOf($, cwd, file)
+  const target = targetOf(base, file, text, name)
   if (!target) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
-  const argv = runArgv(target, runners)
+  const argv = runArgv(target, found)
   if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
-  const result = await $.process.run(argv, { cwd, timeoutMs: RUN_TIMEOUT })
-  return { isPassed: result.exitCode === 0, command: shown(argv), tail: tailOf([result.stdout, result.stderr].join('\n'), RUN_TAIL) }
+  const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT })
+  const command = base === cwd ? shown(argv) : `cd ${shortPath(base, cwd)} && ${shown(argv)}`
+  return { isPassed: result.exitCode === 0, command, tail: tailOf([result.stdout, result.stderr].join('\n'), RUN_TAIL) }
 }
 
 // a test run from the pane: its row shows it running, then passed or failed with the end of
@@ -1692,6 +1723,8 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
 
   const clean = await runOne($, file, name)
   if (typeof clean === 'string') return `${clean} Nothing was run.`
+  // a test that never ran (no module, no runner, code that does not build) is not a failing one
+  if (!clean.isPassed && (isSetupFailure(clean.tail) || isBuildFailure(clean.tail))) return `Could not run the test, so nothing was measured. ${clean.command} printed:\n${clean.tail}`
   if (!clean.isPassed) return `The test fails unchanged, so a mutation shows nothing. ${clean.command} printed:\n${clean.tail}`
   let mutated: Ran | string
   // with siblings: the file's other tests under the same mutation, the failing ones run again
@@ -2190,6 +2223,10 @@ export const register: Register = (on, options) => {
     }
 
     const entries = entriesOf(graded, list, await read($, modified))
+    // whether each file's tests can be run one at a time, by the runners where they run from
+    const runnable = new Map(
+      await Promise.all([...new Set(entries.map(t => t.file))].map(async file => [file, runArgv({ rel: '', kind: kindOf(file), plain: '', groups: [], line: 1 }, (await baseOf($, cwd, file)).runners) !== null] as const)),
+    )
     const tally = (of: Entry[], s: State): number => of.filter(t => t.state === s).length
 
     // grouped: a Go suite over its files, else by file; the worst group first, and in a
@@ -2320,7 +2357,7 @@ export const register: Register = (on, options) => {
                 {/* actions drawn as buttons, [ Open in editor ], apart from the text above */}
                 <Box flexDirection="row" gap={2}>
                   <Button key={`o:${t.file}:${t.name}`} label="Open in editor" onPress={() => $.clock.after(1, () => void openInEditor($, t.file, t.name))} />
-                  {runArgv({ rel: '', kind: kindOf(t.file), plain: '', groups: [], line: 1 }, runners) !== null && ran?.state !== 'running' && (
+                  {runnable.get(t.file) === true && ran?.state !== 'running' && (
                     <Button key={`x:${t.file}:${t.name}`} label="Run test" onPress={() => $.clock.after(1, () => void runFromPane($, t.file, t.name))} />
                   )}
                 </Box>
@@ -2412,15 +2449,33 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-    // Go's packages under the total, least covered first: a few, then how many more and their best
-    const packages = (cov?.byPackage ?? []).length > 1
-      ? cov!.byPackage!.map(p => ({ name: p.name, pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name))
-      : []
-    // the rest behind a press, kept open as a group is
-    const isAllPackages = filesOpen[ALL_PACKAGES] === true
-    const packageBars = isAllPackages ? packages : packages.slice(0, PACKAGE_BARS)
-    const packagesLeft = isAllPackages ? [] : packages.slice(PACKAGE_BARS)
-    const packageWidth = Math.min(PACKAGE_LABEL, Math.max(9, ...packageBars.map(p => p.name.length)))
+    // Go's packages under the total (a part's under that part, named in it), least covered first:
+    // a few, then how many more and their best, the rest behind a press, kept open as a group is
+    const packagesDrawn = (of: { name: string; total: number; covered: number }[], prefix: string, key: string): unknown[] => {
+      const packages = of.length > 1 ? of.map(p => ({ name: p.name.slice(prefix.length) || './', pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name)) : []
+      const isAll = filesOpen[key] === true
+      const shown = isAll ? packages : packages.slice(0, PACKAGE_BARS)
+      const left = isAll ? [] : packages.slice(PACKAGE_BARS)
+      const width = Math.min(PACKAGE_LABEL, Math.max(9, ...shown.map(p => p.name.length)))
+      return [
+        ...shown.map(p => bar(`cov-pkg-${prefix}${p.name}`, p.name, p.pct, width, 2)),
+        ...(left.length > 0
+          ? [
+              <Box key={`${key}-more`} marginLeft={2}>
+                <Button key={key} plain label={`▸ ${plural(left.length, 'more package')}, up to ${Math.max(...left.map(p => p.pct))}%`} onPress={flip(key, false)} />
+              </Box>,
+            ]
+          : []),
+        ...(isAll && packages.length > PACKAGE_BARS
+          ? [
+              <Box key={`${key}-less`} marginLeft={2}>
+                <Button key={key} plain label={`▾ the ${PACKAGE_BARS} least covered only`} onPress={flip(key, true)} />
+              </Box>,
+            ]
+          : []),
+      ]
+    }
+    const parts = cov?.parts && cov.parts.length > 1 ? cov.parts : null
 
     return (
       <Box flexDirection="column" flexGrow={1}>
@@ -2451,28 +2506,19 @@ export const register: Register = (on, options) => {
                 <Text color={MUTED}>{cov ? `${cov.source}${age !== null ? ` – ${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago` : ''}` : 'no report found'}</Text>
               </Box>
               {metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, 11, 0)) as never}
-              {/* a project of parts: each part's figures under its folder */}
-              {(cov?.parts && cov.parts.length > 1
-                ? cov.parts.flatMap(part => [
+              {/* a project of parts: each part's figures, and its packages, under its folder */}
+              {(parts
+                ? parts.flatMap(part => [
                     <Text key={`cov-part-${part.dir}`} color={MUTED}>{`${part.dir}/ · ${part.source}`}</Text>,
                     ...([['Lines', part.lines], ['Statements', part.statements], ['Branches', part.branches], ['Functions', part.functions]] as const)
                       .filter(([, v]) => v !== null)
                       .map(([label, v]) => bar(`cov-${part.dir}-${label}`, label, v as number, 11, 2)),
+                    ...packagesDrawn((cov?.byPackage ?? []).filter(p => p.name.startsWith(`${part.dir}/`)), `${part.dir}/`, `${ALL_PACKAGES}:${part.dir}`),
                   ])
-                : []) as never}
-              {packageBars.map(p => bar(`cov-pkg-${p.name}`, p.name, p.pct, packageWidth, 2)) as never}
-              {packagesLeft.length > 0 && (
-                <Box marginLeft={2}>
-                  <Button key={ALL_PACKAGES} plain label={`▸ ${plural(packagesLeft.length, 'more package')}, up to ${Math.max(...packagesLeft.map(p => p.pct))}%`} onPress={flip(ALL_PACKAGES, false)} />
-                </Box>
-              )}
-              {isAllPackages && packages.length > PACKAGE_BARS && (
-                <Box marginLeft={2}>
-                  <Button key={ALL_PACKAGES} plain label={`▾ the ${PACKAGE_BARS} least covered only`} onPress={flip(ALL_PACKAGES, true)} />
-                </Box>
-              )}
+                : packagesDrawn(cov?.byPackage ?? [], '', ALL_PACKAGES)) as never}
               {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
-              {running.state === 'failed' && <Text color={RED}>{running.message ?? 'Coverage run failed.'}</Text>}
+              {/* tests failed but left figures: a warning, not a failure */}
+              {running.state === 'failed' && <Text color={cov && running.message?.startsWith('Tests exited') ? AMBER : RED}>{running.message ?? 'Coverage run failed.'}</Text>}
             </Box>
           )}
           <Box flexDirection="row" gap={2} marginTop={1}>

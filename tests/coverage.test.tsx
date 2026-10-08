@@ -537,7 +537,8 @@ test('test_coverage whose tests fail gives the figures of what ran and the end o
   project(on, files, {
     editor: () => {
       files['coverage/lcov.info'] = 'SF:src/a/x.ts\nLF:10\nLH:4\nend_of_record\n'
-      return { stdout: 'FAIL src/a.test.ts\n  ● adds › expected 3, got 4\n', exitCode: 1 }
+      // thirty lines of setup before the failure: only the last twenty are kept
+      return { stdout: [...Array.from({ length: 30 }, (_, i) => `setup ${i + 1}`), 'FAIL src/a.test.ts', '  ● adds › expected 3, got 4'].join('\n'), exitCode: 1 }
     },
   })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
@@ -547,8 +548,9 @@ test('test_coverage whose tests fail gives the figures of what ran and the end o
   const answer = await askCoverage($, clock)
   expect(answer).toContain('It exited with 1: the figures are from the tests that ran.')
   expect(answer).toContain('The project: 40% lines.')
-  expect(answer).toContain('● adds › expected 3, got 4')
-  expect(JSON.stringify(await ui.drawn())).toContain('Tests exited with 1.')
+  const printed = answer.slice(answer.indexOf('The last 20 lines it printed:\n') + 'The last 20 lines it printed:\n'.length).split('\n')
+  expect(printed).toEqual([...Array.from({ length: 18 }, (_, i) => `setup ${i + 13}`), 'FAIL src/a.test.ts', '  ● adds › expected 3, got 4'])
+  expect(JSON.stringify(await ui.drawn())).toContain('Tests exited with 1: the figures are from the tests that ran.')
 })
 
 
@@ -580,8 +582,15 @@ test('a project of parts with no way to measure at its root runs each part\'s co
 
   expect(runs.map(argv => argv.slice(0, 3).join(' ')).sort()).toEqual(['go test ./...', 'npx jest --coverage'])
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(texts).toContain('backend/ · go test -coverprofile')
-  expect(texts).toContain('mobile/ · lcov.info')
+  // each part's packages under its own figures, named within it
+  const backendAt = texts.indexOf('backend/ · go test -coverprofile')
+  const mobileAt = texts.indexOf('mobile/ · lcov.info')
+  expect(backendAt).toBeGreaterThanOrEqual(0)
+  expect(mobileAt).toBeGreaterThan(backendAt)
+  const packageAt = (name: string) => texts.indexOf(name)
+  expect(packageAt('pkg/b/')).toBeGreaterThan(backendAt)
+  expect(packageAt('pkg/b/')).toBeLessThan(mobileAt)
+  expect(texts).not.toContain('backend/pkg/b/')
   // each folder's figure in its part's kind
   expect(texts).toContain('25% statements')
   expect(texts).toContain('60% lines')
@@ -610,4 +619,46 @@ test('test_coverage on a folder no part measures runs nothing and names the part
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   expect(await askCoverage($, clock, 'docs')).toBe('Coverage could not be measured: No part of the project measures docs/: coverage is measured in backend/, mobile/.')
   expect(runs).toEqual([])
+})
+
+
+test('a Go coverage run whose tests fail still gives the figures it left, naming the failed packages, and the pane warns', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...GO_MODULE }
+  const { notes } = project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = GO_PROFILE
+      return { stdout: 'ok  \texample.com/shop/pkg/a\t0.1s\n--- FAIL: TestB (0.00s)\nFAIL\nFAIL\texample.com/shop/pkg/b\t0.2s\nFAIL\n', exitCode: 1 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(notes).toEqual(['Coverage run (test-grader) finished with failing tests (go test ./... -coverprofile exited with 1): statements 25% (go test -coverprofile). The figures are from the tests that ran.\nFailed: example.com/shop/pkg/b.'])
+  const warning = (await ui.findAll({ type: 'Text' })).find(t => t.text === 'Tests exited with 1: the figures are from the tests that ran.')
+  expect(warning?.props?.color).toBe('#fbbf24')
+})
+
+test('coverage leaves out the files the project\'s ignore list names, in the totals and the packages', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // pkg/a 10 of 10 covered; tmp/scratch 0 of 30, ignored
+  const profile = ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/tmp/scratch/s.go:1.1,2.2 30 0', 'example.com/shop/pkg/b/b.go:1.1,2.2 10 0', ''].join('\n')
+  const files: Record<string, string> = { ...GO_MODULE, '.test-grader-ignore': 'tmp/\n' }
+  const { notes } = project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = profile
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(notes[0]).toContain('statements 50% (go test -coverprofile)')
+  const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain('pkg/b/')
+  expect(texts).not.toContain('tmp/scratch/')
 })

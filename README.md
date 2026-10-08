@@ -20,7 +20,7 @@ Shallow and brittle are opposite problems: a shallow test misses bugs, and a bri
 
 The pane opens at session start, or with `/test-grader`. It shows:
 
-- **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded. A `.test-grader-ignore` file at the project's root leaves test files out of the list and of grading, one pattern per line as `.gitignore` reads them: `.agents/` (a folder at any depth), `/legacy/old/` (from the root), `**/*.snap.test.ts`, and `#` for a comment.
+- **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded. A `.test-grader-ignore` file at the project's root leaves test files out of the list and of grading, one pattern per line as `.gitignore` reads them: `.agents/` (a folder at any depth), `/legacy/old/` (from the root), `**/*.snap.test.ts`, and `#` for a comment. Copies of the project in git worktrees (`.worktrees/`, `.claude/worktrees/`) and `node_modules/` are always left out. Coverage leaves out the files the list names too, in its totals, folders and packages.
 - **Tests grouped by folder and file, worst first.** The pane draws the project's folders as a tree. Each folder's row shows the counts for every test beneath it, and its line coverage when a coverage report has it. A folder holding only one subfolder shares its row, as in `gateways/api/`. When tests sit in a single folder, no folder row is drawn, and the list reads flat.
 - **Folders and files start closed among siblings.** One alone at its level starts open. Each opens with a press. What you open stays open across a reload of the mod or a compaction. A new session starts everything closed again.
 - **Go testify suites as their own group.** A suite spread over several files is one group, listing its files. A `Test…` function that only runs the suite is not counted as a test.
@@ -245,6 +245,8 @@ If the mutated code did not build (Go's `[build failed]` or a compiler error, Ty
 | PHPUnit, Pest | `vendor/bin/phpunit --filter …`, `vendor/bin/pest <file> --filter <name>` |
 | Swift | `swift test --filter <Class>/<name>` |
 
+A test runs from the nearest folder above its file that holds its language's project file (`go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, `build.gradle`, `Gemfile`, `composer.json`, `Package.swift`), with the runner that folder names: a Go test in `backend/` runs as `cd backend && go test ./tests/config …`. A workspace package whose `package.json` names no runner runs by the root's. When the test could not run at all (no module, no runner, code that does not build), `test_verify` says so instead of reporting a failing test.
+
 The runner is found at session start: `package.json` for Vitest, Jest and Playwright, `build.gradle` or `pom.xml`, a `Gemfile`, and `composer.json` for Pest. Where test-grader knows no runner for a test, the pane shows no **Run test** button for it.
 
 ### Writing the grades out: `/test-grader report`
@@ -266,7 +268,9 @@ The pane offers **Run coverage** when it finds a way to measure it, in this orde
 | `pytest.ini`, `pyproject.toml` or `setup.cfg` | `pytest --cov` |
 | `go.mod` | `go test ./... -cover -coverprofile=.test-grader-go-cover.out` |
 
-**A project of parts.** When the root has none of these, each top-level folder that holds tests and has one of its own is a part: a Go `backend/` and a jest `mobile/`, say. Run coverage runs every part's in its own folder, at once. The pane shows each part's figures under its folder (Go's statements and jest's lines don't add up to one figure), each folder's row shows its part's kind of figure, and Go's packages are named by their path in the project. `test_coverage` on a folder runs only the part it's in, a Go folder by its packages.
+**A project of parts.** When the root has none of these, each top-level folder that holds tests and has one of its own is a part: a Go `backend/` and a jest `mobile/`, say. Run coverage runs every part's in its own folder, at once. The pane shows each part's figures under its folder (Go's statements and jest's lines don't add up to one figure), each folder's row shows its part's kind of figure, and Go's packages are named by their path in the project. `test_coverage` on a folder runs only the part it's in, a Go folder by its packages. Each part's Go packages are drawn under that part.
+
+When a run's tests fail but it still wrote its report (an end-to-end test that needs a service, say), the figures are shown and told with a warning that they come from the tests that ran, naming Go's failed packages.
 
 It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or Go's coverage profile. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
 

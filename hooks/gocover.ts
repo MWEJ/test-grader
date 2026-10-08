@@ -9,7 +9,8 @@ export const moduleOf = (goMod: string): string | null => goMod.match(/^module\s
 
 type Tally = { total: number; covered: number }
 
-export const goProfileOf = (profile: string, module: string | null, cwd: string): { statements: number | null; byFile: ({ file: string } & Tally)[]; byPackage: ({ name: string } & Tally)[] } => {
+// isKept: whether a file counts (not one the project's ignore list names)
+export const goProfileOf = (profile: string, module: string | null, cwd: string, isKept: (file: string) => boolean = () => true): { statements: number | null; byFile: ({ file: string } & Tally)[]; byPackage: ({ name: string } & Tally)[] } => {
   const blocks = new Map<string, { file: string; statements: number; isCovered: boolean }>()
   for (const line of profile.split('\n')) {
     const m = line.trim().match(/^(.+\.go):(\d+\.\d+,\d+\.\d+) (\d+) (\d+)$/)
@@ -28,7 +29,7 @@ export const goProfileOf = (profile: string, module: string | null, cwd: string)
     if (b.isCovered) f.covered += b.statements
     files.set(b.file, f)
   }
-  const byFile = [...files].map(([path, f]) => ({ file: local(path), ...f }))
+  const byFile = [...files].map(([path, f]) => ({ file: local(path), ...f })).filter(f => isKept(f.file))
   const total = byFile.reduce((s, f) => s + f.total, 0)
   const covered = byFile.reduce((s, f) => s + f.covered, 0)
   // a package is its files' folder: by its path in the project ('./' the module's root), one

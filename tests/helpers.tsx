@@ -38,6 +38,8 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
+  // the folder each of those commands ran in
+  const runsIn: string[] = []
   // every git command, as run
   const gits: string[][] = []
   mock.env(on, env)
@@ -88,6 +90,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     if (argv[0] !== 'git') {
       if (!editor) throw new Error(`unexpected ${argv.join(' ')}`)
       runs.push(argv)
+      runsIn.push(String((e as { init?: { cwd?: string } }).init?.cwd ?? ''))
       // a command that cannot start (editor throws) is refused with its error, as the host refuses one
       let said: ReturnType<Shell>
       try {
@@ -195,7 +198,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
-  return { prompts, notes, runs, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused, confirms }
+  return { prompts, notes, runs, runsIn, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused, confirms }
 }
 
 

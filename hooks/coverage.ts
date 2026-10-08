@@ -99,6 +99,14 @@ export const coverageNote = (command: CoverCommand, exitCode: number, output: st
       : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
+  // tests failed, but the run left figures: they are given, with what failed (Go's FAIL lines)
+  if (figures) {
+    const failed = [...new Set(output.split('\n').flatMap(l => l.match(/^FAIL\s+(\S+)/)?.[1] ?? []).filter(p => p !== 'FAIL'))]
+    return [
+      `Coverage run (test-grader) finished with failing tests (${command.label} exited with ${exitCode}): ${figures}. The figures are from the tests that ran.`,
+      ...(failed.length > 0 ? [`Failed: ${failed.slice(0, 10).join(', ')}${failed.length > 10 ? ` and ${failed.length - 10} more` : ''}.`] : [`The last ${lines.length} lines it printed:`, ...lines]),
+    ].join('\n')
+  }
   return [`Coverage run (test-grader) failed: ${command.label} exited with ${exitCode}. The last ${lines.length} lines it printed:`, ...lines].join('\n')
 }
 

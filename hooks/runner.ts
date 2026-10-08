@@ -60,5 +60,22 @@ export const tailOf = (output: string, lines: number): string => output.split('\
 // a run's output that says the code did not build or load, not that a test failed: Go's
 // [build failed] and compiler lines, TypeScript's error TS, a SyntaxError, Rust's error[E…],
 // javac's and Kotlin's compilation errors, Swift's and C#'s compiler errors
+// the files that mark where a language's project starts, its tests run from there: a Go module
+// in backend/, a jest app in mobile/
+export const PROJECT_MARKS: Partial<Record<Kind, string[]>> = {
+  go: ['go.mod'],
+  js: ['package.json'],
+  py: ['pyproject.toml', 'pytest.ini', 'setup.cfg', 'setup.py'],
+  rs: ['Cargo.toml'],
+  jvm: ['build.gradle', 'build.gradle.kts', 'pom.xml'],
+  rb: ['Gemfile'],
+  php: ['composer.json'],
+  swift: ['Package.swift'],
+}
+
+// a run's output that says the test could not be run at all: no module, no runner, no test found
+export const isSetupFailure = (tail: string): boolean =>
+  /cannot find main module|go\.mod file not found|no Go files in|command not found|No tests found|no tests ran|ENOENT|Cannot find module|could not be found|not recognized as an internal or external command/i.test(tail)
+
 export const isBuildFailure = (tail: string): boolean =>
   /\[build failed\]|\[setup failed\]|^# \S+\n\S+\.go:\d+:\d+: |\berror TS\d+:|\bSyntaxError\b|\bIndentationError\b|\berror\[E\d+\]|COMPILATION ERROR|Compilation failed|\berror CS\d+:|\berror: cannot find symbol|^e: .*\.kt:/m.test(tail)
