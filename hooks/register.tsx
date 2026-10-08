@@ -13,8 +13,9 @@ import { gradesKey, keep, unkeep } from './kept'
 import type { KeptGrades, SavedGrades } from './kept'
 import { costOf } from './prices'
 import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, CONTEXT_DESCRIPTION, COVERAGE_DESCRIPTION, COVERAGE_SCHEMA, COVERAGE_TOOL, CONTEXT_MAX, VERIFY_SIBLINGS, CONTEXT_SCHEMA, CONTEXT_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
-import { PROJECT_MARKS, isBuildFailure, isSetupFailure, runArgv, shown, tailOf } from './runner'
+import { PROJECT_MARKS, goTagsOf, isBuildFailure, isSetupFailure, isNoneRun, runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
+import { CHAR_BUDGET, NODE_BUDGET, charCount, drawable, nodeCount } from './tree'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
 import { FLAGGED, LISTED, isFlagged, verdictOf } from './verdicts'
 import type { State } from './verdicts'
@@ -961,6 +962,9 @@ const saveGrades = async ($: EngineInterface): Promise<void> => {
       for (const [i, part] of parts.entries()) await $.fs.write(`${dir}/${i}.part`, part)
       const pointer: GradesOnDisk = { v: 2, onDisk: dir, parts: parts.length }
       await $.store.set(gradesKey(cwd), pointer)
+      // the parts of a larger save before, past the new end: emptied, as the engine deletes no file
+      const stale = (await $.fs.list(dir).catch(() => [])).filter(e => e.kind === 'file' && /^\d+\.part$/.test(e.name) && Number.parseInt(e.name, 10) >= parts.length && (e.size ?? 1) > 0)
+      for (const e of stale) await $.fs.write(`${dir}/${e.name}`, '').catch(() => undefined)
       await update($, saveError, () => null)
       return
     } catch (error) {
@@ -1826,7 +1830,7 @@ const targetOf = (cwd: string, file: string, text: string, name: string): RunTar
   const found = cases.find(c => c.name === name) ?? cases.find(c => fits(c.name, name))
   if (!found) return null
   const suite = suitesOf(text, file).get(found.plain)
-  return { rel: shortPath(file, cwd), kind: kindOf(file), plain: found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}) }
+  return { rel: shortPath(file, cwd), kind: kindOf(file), plain: found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}), ...(kindOf(file) === 'go' && goTagsOf(text).length > 0 ? { tags: goTagsOf(text) } : {}) }
 }
 
 // One test run by the project's runner: whether it passed, and the end of what it printed
@@ -1844,7 +1848,9 @@ const runOne = async ($: EngineInterface, file: string, name: string): Promise<R
   if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
   const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT })
   const command = base === cwd ? shown(argv) : `cd ${shortPath(base, cwd)} && ${shown(argv)}`
-  return { isPassed: result.exitCode === 0, command, tail: tailOf([result.stdout, result.stderr].join('\n'), RUN_TAIL) }
+  const output = [result.stdout, result.stderr].join('\n')
+  // a run that ran no test passed nothing: a Go file behind a build tag the run left out, a name not found
+  return { isPassed: result.exitCode === 0 && !isNoneRun(output), command, tail: tailOf(output, RUN_TAIL) }
 }
 
 // a test run from the pane: its row shows it running, then passed or failed with the end of
@@ -2603,6 +2609,12 @@ export const register: Register = (on, options) => {
       }
     }
     drawLevel(root, '', 0)
+    // the engine draws none of a tree past its node limit, and blanks text past its character
+    // limit: the rows past the budget are left out
+    let [nodes, chars] = [0, 0]
+    const fits = drawn.findIndex(row => (nodes += nodeCount(row)) > NODE_BUDGET || (chars += charCount(row)) > CHAR_BUDGET)
+    const cut = fits === -1 ? 0 : drawn.length - fits
+    if (cut > 0) drawn.splice(fits, cut, <Text key="cut" color={AMBER}>{`${plural(cut, 'more row')} not drawn: too many folders and files are open at once. Close one to see the rest.`}</Text>)
 
     const metrics: [string, number | null][] = cov
       ? [['Lines', cov.lines], ['Statements', cov.statements], ['Branches', cov.branches], ['Functions', cov.functions]]
@@ -2658,7 +2670,7 @@ export const register: Register = (on, options) => {
     }
     const parts = cov?.parts && cov.parts.length > 1 ? cov.parts : null
 
-    return (
+    return drawable(
       <Box flexDirection="column" flexGrow={1}>
         <Text bold color={VIOLET}>{counts}</Text>
         {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}

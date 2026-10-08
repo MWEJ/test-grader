@@ -2,7 +2,8 @@ import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
 import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
-import { isBuildFailure } from '../hooks/runner'
+import { goTagsOf, isBuildFailure, isNoneRun } from '../hooks/runner'
+import { charCount, nodeCount, printable } from '../hooks/tree'
 import { fits, ignoredBy, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
@@ -495,4 +496,35 @@ test('a medium or low confidence is kept with the grades, and a high one left ou
   }
   const back = unkeep(JSON.parse(JSON.stringify(keep(saved, false))))
   expect(back.results.map(t => [t.name, t.confidence])).toEqual([['low', 'low'], ['medium', 'medium'], ['high', undefined]])
+})
+
+
+// what the engine draws: it refuses a whole tree over an escape or half an emoji
+test('a text cut inside an emoji keeps no half of it, the whole emoji kept', async () => {
+  const cut = '🍅🍅'.slice(0, 3)
+  expect(printable(`a${cut}b`)).toBe('a🍅\uFFFDb')
+  expect(printable('\udc45 tail')).toBe('\uFFFD tail')
+})
+
+test('a run\'s colour codes and other control characters are dropped, its lines and tabs kept', async () => {
+  expect(printable('\u001b[31mFAIL\u001b[39m a\n\tb\u0007\u001b]8;;https://x\u0007link')).toBe('FAIL a\n\tblink')
+})
+
+test('a tree counts each element and each text as a node, and the characters of its texts and string props', async () => {
+  const tree = { type: 'Box', props: { key: 'k1', width: 3 }, children: [{ type: 'Text', props: {}, children: ['abc'] }, 'de'] }
+  expect(nodeCount(tree)).toBe(4)
+  expect(charCount(tree)).toBe(7)
+})
+
+test('a Go file\'s build tags are the ones its //go:build line asks for, not those it rules out', async () => {
+  expect(goTagsOf('//go:build integration && !short\n\npackage x\n')).toEqual(['integration'])
+  expect(goTagsOf('//go:build e2e || (integration && linux)\npackage x\n')).toEqual(['e2e', 'integration', 'linux'])
+  // only above the package clause: a comment in the body is no constraint
+  expect(goTagsOf('package x\n\n//go:build integration\n')).toEqual([])
+})
+
+test('a run that exited 0 having run no test is told apart from one that passed', async () => {
+  expect(isNoneRun('ok  \texample.com/shop/x\t0.01s [no tests to run]')).toBe(true)
+  expect(isNoneRun('testing: warning: no tests to run\nPASS\nok  \tx\t0.1s')).toBe(true)
+  expect(isNoneRun('ok  \texample.com/shop/x\t0.01s')).toBe(false)
 })

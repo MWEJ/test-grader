@@ -518,3 +518,43 @@ test('a pane whose drawing fails says why, in place of a blank pane', async ($, 
   expect(texts).toHaveLength(1)
   expect(texts[0]).toMatch(/^test-grader could not draw this pane: Type error\. Please report it; the tools still work\.$/)
 })
+
+
+// what the engine refuses in a drawn text: escapes, lone surrogate halves, its placeholder character
+const REFUSED = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u{10eeee}]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u
+const textsOf = (tree: unknown): string[] =>
+  typeof tree === 'string' ? [tree] : tree && typeof tree === 'object' ? [...Object.values((tree as Node).props ?? {}).filter((v): v is string => typeof v === 'string'), ...((tree as Node).children ?? []).flatMap(textsOf)] : []
+
+test('a failed run that printed colours is drawn without them, so the engine still draws the pane', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  project(on, files, { editor: () => ({ stdout: '\u001b[31mFAIL\u001b[39m src/a.test.ts\n  \u001b[1m● adds\u001b[22m', exitCode: 1 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'r:/proj/src/a.test.ts:adds' })
+  await ui.press({ key: 'x:/proj/src/a.test.ts:adds' })
+  await clock.advance(10)
+
+  const texts = textsOf(await ui.drawn())
+  expect(texts.filter(t => REFUSED.test(t))).toEqual([])
+  expect(texts.some(t => t.endsWith('FAIL src/a.test.ts\n  ● adds'))).toBe(true)
+})
+
+test('a pane with more rows open than the engine draws leaves the rest out and says so, its tree inside the limit', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  // one file, open as the only one, holding more tests than 20,000 nodes draw
+  const many = Array.from({ length: 3_000 }, (_, i) => `it('case ${i}', () => { expect(${i}).toBe(${i}) })`).join('\n')
+  project(on, { 'src/a.test.ts': `${many}\n` })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+
+  const tree = await ui.drawn()
+  const count = (n: unknown): number => (typeof n === 'string' ? 1 : n && typeof n === 'object' ? 1 + ((n as Node).children ?? []).reduce((a: number, c) => a + count(c), 0) : 0)
+  expect(count(tree)).toBeLessThanOrEqual(20_000)
+  const cut = textsOf(tree).find(t => t.includes('more rows not drawn'))
+  expect(cut).toMatch(/^\d+ more rows not drawn: too many folders and files are open at once\. Close one to see the rest\.$/)
+  const shown = rowsOf(JSON.stringify(tree), '/proj/src/a.test.ts').length
+  expect(shown + Number(cut!.split(' ')[0])).toBe(3_000)
+})

@@ -16,7 +16,14 @@ export type Runners = {
 
 // a test as its runner names it: its file (in the project), its own name, the groups around
 // it, its line, and a Go suite test's suite
-export type RunTarget = { rel: string; kind: Kind; plain: string; groups: string[]; line: number; suite?: string }
+export type RunTarget = { rel: string; kind: Kind; plain: string; groups: string[]; line: number; suite?: string; tags?: string[] }
+
+// a Go file's build tags its tests need: the names its //go:build line asks for, not those it
+// rules out (//go:build integration && !short needs integration)
+export const goTagsOf = (text: string): string[] => {
+  const line = /^\/\/go:build (.+)$/m.exec(text.slice(0, text.search(/^package /m) >>> 0))?.[1] ?? ''
+  return [...new Set([...line.matchAll(/(!?)\b([A-Za-z_][\w.]*)/g)].filter(m => m[1] === '').map(m => m[2]!))]
+}
 
 const SPEC = /\.spec\.[cm]?[jt]sx?$/
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -41,7 +48,7 @@ export const runArgv = (t: RunTarget, runners: Runners): string[] | null => {
     case 'py':
       return ['python3', '-m', 'pytest', '-q', [t.rel, ...t.groups, t.plain].join('::')]
     case 'go':
-      return ['go', 'test', `./${dir}`, '-count=1', '-run', t.suite ? `/^${t.plain}$` : `^${t.plain}$`]
+      return ['go', 'test', `./${dir}`, '-count=1', ...(t.tags?.length ? ['-tags', t.tags.join(',')] : []), '-run', t.suite ? `/^${t.plain}$` : `^${t.plain}$`]
     case 'rb':
       if (t.rel.endsWith('_spec.rb')) return [...(runners.isBundled ? ['bundle', 'exec'] : []), 'rspec', `${t.rel}:${t.line}`]
       return ['ruby', '-Itest', t.rel, '-n', `/^${escapeRegex(t.plain.replace(/ /g, '_'))}$|^test_${escapeRegex(t.plain.replace(/ /g, '_'))}$/`]
@@ -84,7 +91,10 @@ export const PROJECT_MARKS: Partial<Record<Kind, string[]>> = {
 
 // a run's output that says the test could not be run at all: no module, no runner, no test found
 export const isSetupFailure = (tail: string): boolean =>
-  /cannot find main module|go\.mod file not found|no Go files in|command not found|No tests found|no tests ran|ENOENT|Cannot find module|could not be found|not recognized as an internal or external command/i.test(tail)
+  /cannot find main module|go\.mod file not found|no Go files in|command not found|No tests found|no tests ran|no tests to run|no test files|ENOENT|Cannot find module|could not be found|not recognized as an internal or external command/i.test(tail)
+
+// a run's output that says it ran no test at all, though it exited 0: Go's [no tests to run]
+export const isNoneRun = (output: string): boolean => /\[no tests to run\]|testing: warning: no tests to run|^ok\s.*\[no test files\]/m.test(output)
 
 export const isBuildFailure = (tail: string): boolean =>
   /\[build failed\]|\[setup failed\]|^# \S+\n\S+\.go:\d+:\d+: |\berror TS\d+:|\bSyntaxError\b|\bIndentationError\b|\berror\[E\d+\]|COMPILATION ERROR|Compilation failed|\berror CS\d+:|\berror: cannot find symbol|^e: .*\.kt:/m.test(tail)

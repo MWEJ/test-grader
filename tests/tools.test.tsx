@@ -1003,6 +1003,57 @@ test('test_verify on a test that could not run says so, not that it fails, and m
   expect(writes).toEqual([])
 })
 
+// a Go integration test, behind a build tag: go test leaves its file out unless the tag is given
+const TAGGED: Record<string, string> = {
+  ...BACKEND,
+  'backend/tests/config/run_test.go': `//go:build integration && !short\n\n${BACKEND['backend/tests/config/run_test.go']}`,
+}
+const taggedRun = (files: Record<string, string>) => (argv: string[]) =>
+  argv[0] !== 'go' ? 1 : argv.join(' ').includes('-tags integration') ? goRun(files)(argv) : { stdout: 'ok  \texample.com/shop/tests/config\t0.01s [no tests to run]', exitCode: 0 }
+
+test('test_verify on a Go test behind a build tag runs it with the tags its file asks for', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...TAGGED }
+  const { runs } = project(on, files, { editor: taggedRun(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
+  await clock.advance(10)
+
+  expect(await answer).toMatch(/^Measured: the test passes unchanged and fails with the mutation\./)
+  expect(runs[0]).toEqual(['go', 'test', './tests/config', '-count=1', '-tags', 'integration', '-run', '^TestPins$'])
+})
+
+test('test_verify on a test whose run ran no test says it could not run it, not that a mutation got through', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND }
+  // go test exits 0 when -run matches nothing
+  const { writes } = project(on, files, { editor: () => ({ stdout: 'ok  \texample.com/shop/tests/config\t0.01s [no tests to run]', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const answer = await verifyWith($, { file: 'backend/tests/config/run_test.go', test: 'TestPins', mutate: 'backend/tests/config/port.go', find: 'return 1', replace: 'return 2' })
+
+  expect(answer).toMatch(/^Could not run the test, so nothing was measured\. .*\[no tests to run\]$/s)
+  expect(writes).toEqual([])
+})
+
+test('Run test whose run ran no test fails in its row, not passes', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...BACKEND }
+  project(on, files, { editor: () => ({ stdout: 'ok  \texample.com/shop/tests/config\t0.01s [no tests to run]', exitCode: 0 }) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'r:/proj/backend/tests/config/run_test.go:TestPins' })
+  await ui.press({ key: 'x:/proj/backend/tests/config/run_test.go:TestPins' })
+  await clock.advance(10)
+
+  expect(await runLine(ui)).toMatch(/^Failed: cd backend && go test /)
+})
+
+
 test('Run test on a jest app in a folder of its own runs it there, by the runner its package.json names', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files = { 'mobile/package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'mobile/src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }

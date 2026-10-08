@@ -475,6 +475,28 @@ test("a project whose grades are more than the session's state holds in one valu
   expect(back.every(t => t.reason === BIG_REASON)).toBe(true)
 })
 
+test('a save in fewer parts than the one before empties the parts past its end, so none is left over', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { files, saved } = bigProject()
+  const dir = '/home/u/.claude/test-grader/grades/-proj'
+  // a part from a larger save before, past the end of any save of these grades
+  files[`${dir}/9.part`] = 'x'.repeat(1_000)
+  on('fs.list', async (_$, e) => {
+    if ((e as { path: string }).path !== dir) throw new Error('missing')
+    return { value: Object.keys(files).filter(f => f.startsWith(`${dir}/`)).map(f => ({ name: f.slice(dir.length + 1), kind: 'file', size: files[f]!.length })) } as never
+  })
+  const { store } = project(on, files, { env: { HOME: '/home/u' } })
+  store['grades:/proj'] = saved
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+
+  const { parts } = store['grades:/proj'] as { parts: number }
+  expect(parts).toBeLessThan(9)
+  expect(files[`${dir}/9.part`]).toBe('')
+  // the parts of this save are kept whole
+  expect(unkeep(JSON.parse(Array.from({ length: parts }, (_, i) => files[`${dir}/${i}.part`]).join(''))).results).toHaveLength(9000)
+})
+
 test('a new session takes the grades from the files the store names', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { 'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
