@@ -1,6 +1,6 @@
 {
   "name": "test-grader",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A side pane that grades every test in the project (strong, shallow, brittle, hollow, duplicate), tells Claude how to write tests that grade strong, and shows coverage.",
   "author": {
     "name": "Martin Hygge"
@@ -10,8 +10,8 @@
     "graderModel": {
       "type": "string",
       "title": "Grader model",
-      "description": "The model that grades tests: an alias (haiku, sonnet, opus) or a model id. A Haiku older than 5.5 grades as claude-haiku-5-5.",
-      "default": "claude-haiku-5-5"
+      "description": "The model that grades tests: an alias (haiku, sonnet, opus) or a model id. haiku by default, which Claude Code resolves to the Haiku it is set up with. A model id is used exactly as set, so a gateway's own ids work.",
+      "default": "haiku"
     },
     "graderEscalate": {
       "type": "string",

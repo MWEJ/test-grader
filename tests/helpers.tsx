@@ -372,7 +372,7 @@ export const turnStart = ($: Engine, turnId: string) => $.turn.start({ text: '',
 export const turnEnd = ($: Engine, turnId: string) => $.turn.complete({ turnId, reason: 'answer', text: 'done' } as never)
 
 
-// The grader model is a setting: claude-haiku-5-5 unless the person picks another
+// The grader model is a setting: the haiku alias unless the person picks another
 export const gradeOnce = async ($: Engine, on: On) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const { models } = project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })

@@ -58,7 +58,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates.
 - **Tests of one name are told apart.** Two tests named alike in one file are named by the groups around them, as in `parser › empty input` and `lexer › empty input`. Failing that, they are named by their order: `works`, `works (2)`.
 
-The grader is `claude-haiku-5-5` by default. It reviews up to 10 tests per call, with up to 10 calls at once.
+The grader is `haiku` by default: the alias, which Claude Code resolves to the Haiku its account, provider or gateway is set up with. It reviews up to 10 tests per call, with up to 10 calls at once.
 
 #### What the grader reads
 
@@ -75,14 +75,14 @@ The rubric and the file go first in each call, marked for the prompt cache, so t
 
 #### When the API fails
 
-A grader call that the API answers with *overloaded*, *rate limited* or a server error is tried again up to three times. The waits are 2, 4 and then 8 seconds, each with up to a second more, so parallel calls do not retry together. Any other error leaves the tests unrated, and the pane says why in red above the list and on each unrated row: the model it asked and the API's answer, such as `The grader (claude-haiku-5-5) gave no answer: api-error 404 not_found_error.` It stays until a grader call answers. A model the account or its provider does not offer is the usual cause: set `graderModel` to one it does. A call the engine refuses to send, as it does a model blocked by the account's settings or a gateway's, fails at once and says so the same way. An older Claude Code that takes less of a request (`model.complete: takes { model, prompt }`) is asked again plainly: the texts unmarked and no effort, then the model and one prompt alone, the rubric leading it; the first form it takes is kept for the session. An answer holding no verdict for the tests asked about leaves them unrated too, and the pane quotes the start of what came back; the debug log has more of it. Each call may take two minutes at most.
+A grader call that the API answers with *overloaded*, *rate limited* or a server error is tried again up to three times. The waits are 2, 4 and then 8 seconds, each with up to a second more, so parallel calls do not retry together. Any other error leaves the tests unrated, and the pane says why in red above the list and on each unrated row: the model it asked and the API's answer, such as `The grader (haiku) gave no answer: api-error 404 not_found_error.` It stays until a grader call answers. A model the account or its provider does not offer is the usual cause: set `graderModel` to one it does. A call the engine refuses to send, as it does a model blocked by the account's settings or a gateway's, fails at once and says so the same way. An older Claude Code that takes less of a request (`model.complete: takes { model, prompt }`) is asked again plainly: the texts unmarked and no effort, then the model and one prompt alone, the rubric leading it; the first form it takes is kept for the session. An answer holding no verdict for the tests asked about leaves them unrated too, and the pane quotes the start of what came back; the debug log has more of it. Each call may take two minutes at most.
 
 #### Grader settings
 
 | Setting | Values | Default | What it does |
 | --- | --- | --- | --- |
-| **Grader model** (`graderModel`) | an alias (`haiku`, `sonnet`, `opus`) or a model id | `claude-haiku-5-5` | the model that grades. A Haiku older than 5.5, such as `claude-haiku-4-5` or `claude-3-5-haiku-20241022`, grades as `claude-haiku-5-5`. Any other model grades as set. |
-| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: an edited test whose last grade was flagged, evidence and verified mutations. An edited test graded strong stays with the grader model. Older Haikus are raised to 5.5 here too. |
+| **Grader model** (`graderModel`) | an alias (`haiku`, `sonnet`, `opus`) or a model id | `haiku` | the model that grades; the alias follows the Haiku Claude Code is set up with. A model id is used exactly as set, so a gateway's own ids work. |
+| **Second-look model** (`graderEscalate`) | `off`, an alias or a model id | `off` | a model that grades again what the first grade flagged: an edited test whose last grade was flagged, evidence and verified mutations. An edited test graded strong stays with the grader model. |
 | **Grader workers** (`graderWorkers`) | 1 to 20 | 10 | how many grader calls Grade all tests runs at once |
 
 Change them in the `/config` menu, or in `~/.claude/settings.json`:

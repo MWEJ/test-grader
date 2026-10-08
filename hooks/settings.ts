@@ -1,24 +1,14 @@
 // The settings: what a value the person set comes to
 
-// the oldest Haiku that grades: a setting naming an older one grades with this one instead
-export const MIN_HAIKU = 'claude-haiku-5-5'
-// the model that grades when the person sets none
-export const DEFAULT_MODEL = MIN_HAIKU
+// the model that grades when the person sets none: the alias, which Claude Code resolves to
+// the Haiku its account or gateway is set up with
+export const DEFAULT_MODEL = 'haiku'
 
-// A model setting as the grader uses it: an alias (haiku, sonnet, opus) or a model id as
-// given, but a Haiku older than MIN_HAIKU (claude-haiku-4-5, claude-3-5-haiku-20241022) is
-// MIN_HAIKU; blank or not text, the fallback
+// A model setting as the grader uses it: an alias (haiku, sonnet, opus) or a model id, as
+// given, so a gateway's own ids reach it unchanged; blank or not text, the fallback
 export const modelOf = (chosen: unknown, fallback: string): string => {
   const model = typeof chosen === 'string' ? chosen.trim() : ''
-  if (model === '') return fallback
-  const id = model.toLowerCase()
-  // a provider's prefix (us.anthropic.) and suffixes (a date, a version) aside
-  const version =
-    id.match(/(?:^|[./])claude-haiku-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:-v\d+(?::\d+)?|@\d+)?$/) ??
-    id.match(/(?:^|[./])claude-(\d+)(?:-(\d{1,2}))?-haiku(?:-\d{8})?(?:-v\d+(?::\d+)?|@\d+)?$/)
-  if (!version) return model
-  const [major, minor] = [Number(version[1]), Number(version[2] ?? 0)]
-  return major < 5 || (major === 5 && minor < 5) ? MIN_HAIKU : model
+  return model === '' ? fallback : model
 }
 
 // how many grader calls Grade all runs at once: 1 to MAX_WORKERS, 10 when unset

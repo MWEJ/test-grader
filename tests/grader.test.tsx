@@ -193,8 +193,8 @@ test('a file short enough goes to the grader whole, with no word of an excerpt',
 })
 
 
-test('with no grader model set, tests are graded by claude-haiku-5-5', async ($, on) => {
-  expect(await gradeOnce($, on)).toEqual(['claude-haiku-5-5'])
+test('with no grader model set, tests are graded by the haiku alias', async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['haiku'])
 })
 
 
@@ -203,22 +203,19 @@ test('the grader model setting picks the model that grades', { options: { grader
 })
 
 
-// a Haiku older than 5.5, however it is named, grades as Haiku 5.5; any other model as set
-for (const [set, used] of [
-  ['claude-haiku-4-5', 'claude-haiku-5-5'],
-  ['claude-haiku-4-5-20251001', 'claude-haiku-5-5'],
-  ['claude-3-5-haiku-20241022', 'claude-haiku-5-5'],
-  ['us.anthropic.claude-3-haiku-20240307-v1:0', 'claude-haiku-5-5'],
-  ['claude-haiku-5-5', 'claude-haiku-5-5'],
-  ['claude-haiku-6', 'claude-haiku-6'],
-  ['claude-sonnet-4-5', 'claude-sonnet-4-5'],
-  ['  ', 'claude-haiku-5-5'],
-  ['haiku', 'haiku'],
-] as const) {
-  test(`a grader model set to ${JSON.stringify(set)} grades with ${used}`, { options: { graderModel: set } }, async ($, on) => {
-    expect(await gradeOnce($, on)).toEqual([used])
-  })
-}
+test('a gateway\'s own id for an older Haiku grades exactly as set', { options: { graderModel: 'us.anthropic.claude-3-haiku-20240307-v1:0' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['us.anthropic.claude-3-haiku-20240307-v1:0'])
+})
+
+
+test('a grader model set with spaces around it grades with them trimmed', { options: { graderModel: '  claude-haiku-4-5  ' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['claude-haiku-4-5'])
+})
+
+
+test('a blank grader model setting grades with the haiku alias', { options: { graderModel: '   ' } }, async ($, on) => {
+  expect(await gradeOnce($, on)).toEqual(['haiku'])
+})
 
 
 test('a second-look model, when set, grades again only what the first grade flagged; a strong test edited stays with the grader model', { options: { graderModel: 'sonnet', graderEscalate: 'claude-haiku-4-5' } }, async ($, on) => {
@@ -250,9 +247,7 @@ test('a second-look model, when set, grades again only what the first grade flag
   // graded strong at first; its edit stays with the grader model
   await edit('src/b.test.ts', 'toBe(3)', 'toEqual(3)')
 
-  // the second look is set to a Haiku older than 5.5, so it grades as claude-haiku-5-5, as the
-  // grader model setting would
-  expect(gradedBy('a shallow check')).toEqual(['sonnet', 'claude-haiku-5-5'])
+  expect(gradedBy('a shallow check')).toEqual(['sonnet', 'claude-haiku-4-5'])
   expect(gradedBy('adds')).toEqual(['sonnet', 'sonnet'])
 })
 
@@ -324,7 +319,7 @@ test('a grader call that gets no answer says why in the pane, on the row and abo
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  const why = 'The grader (claude-haiku-5-5) gave no answer: api-error 404 not_found_error.'
+  const why = 'The grader (haiku) gave no answer: api-error 404 not_found_error.'
   const texts = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
 
   // above the list, and on the unrated row once it is opened
@@ -348,7 +343,9 @@ test('a grader call the engine refuses to send, as it does a blocked model, says
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text)
-  expect(texts.some(t => t.startsWith('The grader (claude-haiku-5-5) call failed: '))).toBe(true)
+  // the reason is the host's own, whole: here the test kit's, which has no model to send to
+  expect(texts).toContain('The grader (haiku) call failed: no implementation for model.complete')
+  expect(texts.filter(t => t.includes('call failed'))).toHaveLength(1)
   expect(JSON.stringify(await ui.drawn())).toContain('1 unrated')
 })
 
@@ -411,7 +408,7 @@ test('a grader answer holding no verdict for the tests asked about says what cam
 
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect(await texts()).toContain('The grader (claude-haiku-5-5) answered with no verdict it could read: "I cannot help with that.".')
+  expect(await texts()).toContain('The grader (haiku) answered with no verdict it could read: "I cannot help with that.".')
 
   // a verdict, but for a test it was not asked about, counts as none
   await ui.press({ key: 'gradeAll' })
