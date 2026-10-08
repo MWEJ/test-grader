@@ -339,3 +339,28 @@ test('a grader call that gets no answer says why in the pane, on the row and abo
   expect((await texts()).some(t => t.includes('gave no answer'))).toBe(false)
   expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
 })
+
+test('a grader answer holding no verdict for the tests asked about says what came back, until one does', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const prose = { isAnswered: true, text: 'I cannot help with that.', usage: {} }
+  const otherName = { isAnswered: true, text: '[{"name":"subtracts","summary":"s","verdict":"strong","reason":"r"}]', usage: {} }
+  const answers: unknown[] = [prose, otherName, undefined]
+  project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { reply: n => answers[n - 1] })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  const texts = async () => (await ui.findAll({ type: 'Text' })).map(t => t.text)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(await texts()).toContain('The grader (claude-haiku-5-5) answered with no verdict it could read: "I cannot help with that.".')
+
+  // a verdict, but for a test it was not asked about, counts as none
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect((await texts()).some(t => t.includes('answered with no verdict') && t.includes('subtracts'))).toBe(true)
+
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect((await texts()).some(t => t.includes('answered with no verdict'))).toBe(false)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
+})

@@ -261,11 +261,17 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
     const reply = await $.model.complete(request, signal ? { signal } : undefined)
     addUsage(spent, reply.usage)
     if (reply.isAnswered) {
-      await update($, graderError, () => null)
       const { verdicts, isCut } = parseVerdicts(reply.text)
       if (isCut) {
         $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
       }
+      // an answer with no verdict for any case asked about leaves them unrated: the pane says
+      // what came back, so a model that will not answer in the format can be told apart
+      if (names.length > 0 && !verdicts.some(v => names.includes(v.name))) {
+        const said = reply.text.replace(/\s+/g, ' ').trim()
+        $.ui.log(`test-grader: the grader answered with no verdict for ${file}: ${said.slice(0, 2_000)}`, { to: 'debug' })
+        await update($, graderError, () => `The grader (${request.model}) answered with no verdict it could read: "${said.length > 160 ? `${said.slice(0, 160)}…` : said}".`)
+      } else await update($, graderError, () => null)
       return verdicts
     }
     if (attempt >= RETRIES || !isPassing(reply as never)) {
