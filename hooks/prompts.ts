@@ -23,6 +23,8 @@ export const RUBRIC = [
   "A loop's variables belong only to the tests inside that loop: do not fault a test outside it for not using them.",
   'A name with › in it is the groups the test sits in (describe blocks, classes), then its own name; a name ending in (2) is the second test of that name. Answer with each name exactly as given.',
   'When the code under test is shown, judge each assertion against what that code really does.',
+  'Ask only for behaviour the code under test has: a missed case must be one the code shown could get wrong. Where a test\'s name promises behaviour the code does not have (an allowlist the code never checks, a cache it never keeps), the fault is the name: say so in reason and suggest a name for what it checks, and judge the test by what it checks.',
+  'Do not rest a verdict on how the language, runtime or build treats the code (strict mode, a transform, module loading) unless the source shows it: take the test to run as written, and judge what its assertions would catch.',
   'Examples. it("parses a date", () => expect(parse("2024-01-02")).toEqual(new Date(2024, 0, 2))) beside tests of invalid and empty input: strong, its siblings cover the edges.',
   'expect(error.message.startsWith("Invalid amount")) where the message prefix is what callers rely on: strong.',
   'expect(total(items)).toBeDefined(): shallow, missed: "total([{price: 2}, {price: 3}]) returning 4 would pass".',

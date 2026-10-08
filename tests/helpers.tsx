@@ -28,13 +28,13 @@ export const mount = ($: Engine, rows = 60) =>
 
 // gate: the first grader call waits on it; held: every call waits until it is released
 // rule: a verdict from the name and the prompt, in place of the name-only default
-export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict; cwd?: () => string }
+export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict; cwd?: () => string; slow?: { paths: Set<string>; until: Promise<void> } }
 
 // a command's answer: its exit code, or what it printed too
 export type Shell = (argv: string[]) => number | { stdout?: string; stderr?: string; exitCode?: number }
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
-export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm, cwd }: Project = {}) {
+export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm, cwd, slow }: Project = {}) {
   const prompts: string[] = []
   // every command but git, as run; editor answers it
   const runs: string[][] = []
@@ -77,6 +77,8 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
   on('session.id', async () => ({ value: session.id }) as never)
   // a file the project holds is there, written at the kit's start; any other is missing
   on('fs.stat', async (_$, e) => {
+    // slow: a look at one of these paths waits, as a slow disk does, until the test lets it go
+    if (slow?.paths.has((e as { path: string }).path)) await slow.until
     const path = (e as { path: string }).path.replace(/^\/proj\//, '')
     if (!(path in files)) throw new Error('missing')
     // modified when its text changes, as a file on disk is
@@ -502,6 +504,9 @@ export const RUNS: [string, RunTarget, Runners, string[] | null][] = [
   ['vitest', { rel: 'src/a.test.ts', kind: 'js', plain: 'adds (1+1)', groups: ['math'], line: 3 }, { js: 'vitest' }, ['npx', 'vitest', 'run', 'src/a.test.ts', '-t', '^math adds \\(1\\+1\\)$']],
   ['playwright', { rel: 'e2e/a.spec.ts', kind: 'js', plain: 'logs in', groups: [], line: 7 }, { js: 'playwright' }, ['npx', 'playwright', 'test', 'e2e/a.spec.ts:7']],
   ['no JS runner', { rel: 'src/a.test.ts', kind: 'js', plain: 'x', groups: [], line: 1 }, {}, null],
+  ['node --test with tsx', { rel: 'src/a.test.ts', kind: 'js', plain: 'adds (1+1)', groups: ['math'], line: 3 }, { js: 'node', isTsx: true }, ['node', '--import', 'tsx', '--test', '--test-name-pattern', 'adds \\(1\\+1\\)$', 'src/a.test.ts']],
+  ['node --test', { rel: 'src/a.test.js', kind: 'js', plain: 'adds', groups: [], line: 3 }, { js: 'node' }, ['node', '--test', '--test-name-pattern', 'adds$', 'src/a.test.js']],
+  ['a .spec file beside node --test, by Playwright', { rel: 'tests/a.spec.ts', kind: 'js', plain: 'logs in', groups: [], line: 7 }, { js: 'node', hasPlaywright: true }, ['npx', 'playwright', 'test', 'tests/a.spec.ts:7']],
   ['pytest in a class', { rel: 'tests/test_a.py', kind: 'py', plain: 'test_a', groups: ['TestA'], line: 2 }, {}, ['python3', '-m', 'pytest', '-q', 'tests/test_a.py::TestA::test_a']],
   ['go', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestA', groups: [], line: 1 }, {}, ['go', 'test', './pkg', '-count=1', '-run', '^TestA$']],
   ['go suite', { rel: 'pkg/a_test.go', kind: 'go', plain: 'TestB', groups: [], line: 1, suite: 'Suite' }, {}, ['go', 'test', './pkg', '-count=1', '-run', '/^TestB$']],

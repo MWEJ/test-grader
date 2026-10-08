@@ -354,6 +354,56 @@ test('a test graded before own texts were kept gains its own on a run that finds
 })
 
 
+// a project of 9,000 graded tests, 30 files of 300, each grade with a long reason: more than
+// one value of the session's state holds, and more than the store has room for
+const BIG_REASON = 'r'.repeat(450)
+const bigProject = () => {
+  const files: Record<string, string> = {}
+  const results: Record<string, unknown>[] = []
+  const hashes: Record<string, string> = {}
+  for (let f = 0; f < 30; f += 1) {
+    const rel = `src/f${f}.test.ts`
+    files[rel] = Array.from({ length: 300 }, (_, i) => `it('case ${i}', () => { expect(g(${i})).toBe(${i}) })\n`).join('')
+    hashes[`/proj/${rel}`] = fingerprint(files[rel]!)
+    for (let i = 0; i < 300; i += 1) results.push({ file: `/proj/${rel}`, name: `case ${i}`, verdict: 'strong', summary: `Checks case ${i}.`, reason: BIG_REASON })
+  }
+  return { files, saved: { results, hashes, finishedAt: 500_000 } }
+}
+
+test("a project whose grades are more than the session's state holds in one value still lists them all, and saves them to files of their own", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { files, saved } = bigProject()
+  const { store } = project(on, files, { env: { HOME: '/home/u' } })
+  store['grades:/proj'] = saved
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  expect(await askGrades($, { path: 'src' })).toMatch(/^9000 tests in src: 9000 strong\b/)
+  // the store names the files; they read back whole, every grade with its reason
+  const pointer = store['grades:/proj'] as { onDisk: string; parts: number }
+  expect(pointer.onDisk).toBe('/home/u/.claude/test-grader/grades/-proj')
+  const text = Array.from({ length: pointer.parts }, (_, i) => files[`/home/u/.claude/test-grader/grades/-proj/${i}.part`]).join('')
+  const back = unkeep(JSON.parse(text)).results
+  expect(back).toHaveLength(9000)
+  expect(back.every(t => t.reason === BIG_REASON)).toBe(true)
+})
+
+test('a new session takes the grades from the files the store names', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/b.test.ts': "it('a shallow check', () => { expect(f).toBeDefined() })\n" }
+  const kept = JSON.stringify({ v: 2, files: { '/proj/src/b.test.ts': { hash: fingerprint(files['src/b.test.ts']!), tests: [['a shallow check', 'w', 'Checks it.', 'saved on disk.']] } } })
+  // cut in two, as a large project's are
+  files['/home/u/.claude/test-grader/grades/-proj/0.part'] = kept.slice(0, 40)
+  files['/home/u/.claude/test-grader/grades/-proj/1.part'] = kept.slice(40)
+  const { store } = project(on, files, { env: { HOME: '/home/u' } })
+  store['grades:/proj'] = { v: 2, onDisk: '/home/u/.claude/test-grader/grades/-proj', parts: 2 }
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const answer = await askGrades($, { path: 'src' })
+  expect(answer).toMatch(/^1 tests in src: 0 strong, 1 shallow/)
+  expect(answer).toContain('saved on disk.')
+})
+
+
 test('a new session lists the grades saved for its project, and Grade all tests grades again only the files changed since', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const before = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"

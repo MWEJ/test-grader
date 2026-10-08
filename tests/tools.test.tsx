@@ -275,6 +275,47 @@ test('a test a measured mutation made fail is never graded hollow, while evidenc
 })
 
 
+test('a mutation test_verify measured a test let through reaches the grader at that test\'s next grading, marked when the test has changed since', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...ADDING }
+  const { prompts } = project(on, files, { editor: jest(files) })
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: '(a: number', replace: '(a: any' } as never)
+  const told = 'test_verify ran these tests against a mutated copy of the code, and they let the change through: "a shallow check" still passed with "(a: number" replaced by "(a: any" in src/add.ts'
+
+  // graded again on the same text: told, as measured on it
+  await $.tool.call({ tool: 'mcp__test-grader__test_grade', path: 'src/a.test.ts', again: true } as never)
+  await clock.advance(10)
+  expect(prompts.at(-1)).toContain(`${told}.`)
+
+  // edited since: told, marked as measured before the change
+  files['src/a.test.ts'] = "import { add } from './add'\n\nit('a shallow check', () => {\n  expect(add(1, 2)).toBe(3)\n})\n"
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/a.test.ts', content: files['src/a.test.ts'] } as never)
+  await clock.advance(10)
+  expect(prompts.at(-1)).toContain(`${told} (measured before its text last changed).`)
+})
+
+test('a test of the same name in another file is graded with no word of the mutation the first let through', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { ...ADDING, 'src/b.test.ts': "import { add } from './add'\n\nit('a shallow check', () => {\n  expect(add(1, 2)).toBe(3)\n})\n" }
+  const { prompts } = project(on, files, { editor: jest(files) })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  // a.test.ts lets one through; b.test.ts, graded again, is not told of it
+  await $.tool.call({ tool: 'mcp__test-grader__test_verify', file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: '(a: number', replace: '(a: any' } as never)
+  await $.tool.call({ tool: 'mcp__test-grader__test_grade', path: 'src/b.test.ts', again: true } as never)
+  await clock.advance(10)
+  expect(prompts.at(-1)).toContain('Test file: /proj/src/b.test.ts')
+  expect(prompts.at(-1)).not.toContain('test_verify ran these tests')
+})
+
+
 test('test_verify measures a mutation the test catches, puts the file back, and the grade takes what it measured', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files = { ...ADDING }
@@ -293,7 +334,7 @@ test('test_verify measures a mutation the test catches, puts the file back, and 
 
   // a mutation it does not catch: nothing is regraded
   const missed = await verify({ file: 'src/a.test.ts', test: 'a shallow check', mutate: 'src/add.ts', find: '(a: number', replace: '(a: any' })
-  expect(missed).toBe('The test still passes with "(a: number" replaced by "(a: any" in src/add.ts: it does not catch that change. The file is back as it was; nothing was regraded.')
+  expect(missed).toBe('The test still passes with "(a: number" replaced by "(a: any" in src/add.ts: it does not catch that change. The file is back as it was; nothing was regraded, and the grader is told of it when the test is next graded.')
   expect(files['src/add.ts']).toBe(ADDING['src/add.ts'])
   // nor is a test file mutated, nor text that is not found exactly once: neither writes a file
   const written = writes.length
@@ -637,6 +678,13 @@ const FOUND: [string, Record<string, string>, string, string[], string][] = [
     'Passed: bundle exec rspec spec/foo_spec.rb:2',
   ],
   [
+    'a script running node --test, ahead of the Playwright the package also has',
+    { 'package.json': '{ "scripts": { "test:unit": "node --import tsx --test src/lib/*.test.ts", "e2e": "playwright test" }, "devDependencies": { "@playwright/test": "^1.40.0", "tsx": "^4.0.0" } }', 'src/lib/url.test.ts': "import { test } from 'node:test'\n\ntest('joins the base', () => {\n  assert.equal(join('a'), 'a')\n})\n" },
+    'src/lib/url.test.ts:joins the base',
+    ['node', '--import', 'tsx', '--test', '--test-name-pattern', 'joins the base$', 'src/lib/url.test.ts'],
+    "Passed: node --import tsx --test --test-name-pattern 'joins the base$' src/lib/url.test.ts",
+  ],
+  [
     'package.json with @playwright/test: Playwright',
     { 'package.json': '{ "devDependencies": { "@playwright/test": "^1.40.0" } }', 'e2e/login.spec.ts': "import { test, expect } from '@playwright/test'\n\ntest('logs in', async ({ page }) => {\n  await expect(page).toHaveTitle('Home')\n})\n" },
     'e2e/login.spec.ts:logs in',
@@ -968,6 +1016,26 @@ test('Run test on a jest app in a folder of its own runs it there, by the runner
 
   expect(runs.filter(r => r[1] === 'jest')).toEqual([['npx', 'jest', 'src/a.test.ts', '-t', '^adds$']])
   expect(runsIn.at(-1)).toBe('/proj/mobile')
+})
+
+test("the pane draws while the test files' project folders are still being looked up, and offers Run test once they are found", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'mobile/package.json': '{ "devDependencies": { "jest": "^29.0.0" } }', 'mobile/src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
+  // after the start, the look for mobile/'s package.json waits, as a slow disk or many folders do
+  let release = (): void => undefined
+  const slow = { paths: new Set<string>(), until: new Promise<void>(r => (release = r)) }
+  project(on, files, { slow })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  slow.paths.add('/proj/mobile/package.json')
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'r:/proj/mobile/src/a.test.ts:adds' })
+  expect(JSON.stringify(await ui.drawn())).toContain('adds')
+  expect(buttonsOf(await ui.drawn()).get('x:/proj/mobile/src/a.test.ts:adds')).toBeUndefined()
+
+  release()
+  await clock.advance(10)
+  expect(buttonsOf(await ui.drawn()).get('x:/proj/mobile/src/a.test.ts:adds')).toBe('Run test')
 })
 
 test('a workspace package that names no runner of its own runs its test by the root\'s', async ($, on) => {

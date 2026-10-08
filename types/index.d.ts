@@ -67,6 +67,8 @@ export type ExistingRun = {
   /** the files the last run graded again for a change since their last grading, and graded for the first time, by their paths in the project */
   changed?: string[]
   added?: string[]
+  /** in the session's state: how many of the results' chunks hold the results, their own field left empty */
+  chunks?: number
   /** what the last run's grader calls cost, in tokens: in (of them from the prompt cache) and out */
   spent?: { input: number; cached: number; output: number; cost?: number; unpriced?: number }
 }
@@ -83,6 +85,8 @@ declare module 'claude-code' {
       coverage: Coverage | null
       run: CoverageRun
       existing: ExistingRun
+      /** the results of `existing`, in order, a chunk each: one value is held to 4 MiB, and a project of thousands of tests is more */
+      results: StateFamily<ExistingTest[]>
       /** why the last note to Claude was not added, until one is */
       noteError: string | null
       /** the rows pressed open in the pane, by their key */
@@ -105,6 +109,10 @@ declare module 'claude-code' {
       modified: string[]
       /** each test run from the pane, by file:name: running, or how it ended and what it printed last */
       testRuns: Record<string, { state: 'running' | 'passed' | 'failed'; command?: string; tail?: string }>
+      /** how many times the project folders of the listed test files were looked up: a lookup done draws the pane again */
+      basesFound: number
+      /** the mutations test_verify measured a test let through, by file::name: the change, and the test's own text then */
+      survived: Record<string, { change: string; textOf: string }[]>
       /** why each test its last grader call gave no verdict got none, by file::name; a verdict clears it */
       unrated: Record<string, string>
       /** why the last grader call gave no answer, with its model, until one answers */

@@ -224,7 +224,7 @@ When a test is better or worse than its rating, Claude can send evidence. The be
 3. It runs the test again.
 4. It puts the file back as it was, and checks that it is.
 
-If the mutated code did not build (Go's `[build failed]` or a compiler error, TypeScript's `error TS…`, a `SyntaxError`, Rust's `error[E…]`, a Java, Kotlin or C# compilation error), the test never ran, so the tool refuses it as measuring nothing and asks for a change that compiles. If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. A test a measured mutation made fail is never graded hollow. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. With `siblings: true`, the file's other tests (up to 20) are run too while the mutation is in place, and the answer and the evidence say which of them also fail: "this test alone catches the change", or which others do. A test that also fails on the unchanged code is run again to check, and is not counted. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
+If the mutated code did not build (Go's `[build failed]` or a compiler error, TypeScript's `error TS…`, a `SyntaxError`, Rust's `error[E…]`, a Java, Kotlin or C# compilation error), the test never ran, so the tool refuses it as measuring nothing and asks for a change that compiles. If the test failed with the mutation, the commands and their output go to the grader as evidence, and the test is regraded. A test a measured mutation made fail is never graded hollow. If the test still passed, nothing is regraded, and the tool says the test does not catch that change. The grader is told of it when that test is next graded, and whether the test has changed since: a test that lets a measured change through is not strong unless the change alters nothing it should catch, or the test now catches it. With `siblings: true`, the file's other tests (up to 20) are run too while the mutation is in place, and the answer and the evidence say which of them also fail: "this test alone catches the change", or which others do. A test that also fails on the unchanged code is run again to check, and is not counted. This tool runs commands and changes a file for a moment, so Claude Code asks you before it runs.
 
 ### Running one test
 
@@ -234,6 +234,7 @@ If the mutated code did not build (Go's `[build failed]` or a compiler error, Ty
 | --- | --- |
 | Vitest | `npx vitest run <file> -t '^<groups> <name>$'` |
 | Jest | `npx jest <file> -t '^<groups> <name>$'` |
+| Node's test runner | `node --test --test-name-pattern '<name>$' <file>`, with `--import tsx` where the script loads tsx |
 | Playwright | `npx playwright test <file>:<line>` |
 | pytest | `python3 -m pytest -q <file>::<Class>::<name>` |
 | Go | `go test ./<dir> -count=1 -run '^<name>$'` (a suite test: `-run '/^<name>$'`) |
@@ -247,7 +248,7 @@ If the mutated code did not build (Go's `[build failed]` or a compiler error, Ty
 
 A test runs from the nearest folder above its file that holds its language's project file (`go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, `build.gradle`, `Gemfile`, `composer.json`, `Package.swift`), with the runner that folder names: a Go test in `backend/` runs as `cd backend && go test ./tests/config …`. A workspace package whose `package.json` names no runner runs by the root's. When the test could not run at all (no module, no runner, code that does not build), `test_verify` says so instead of reporting a failing test.
 
-The runner is found at session start: `package.json` for Vitest, Jest and Playwright, `build.gradle` or `pom.xml`, a `Gemfile`, and `composer.json` for Pest. Where test-grader knows no runner for a test, the pane shows no **Run test** button for it.
+The runner is found at session start: `package.json` for Vitest, Jest, Node's test runner (a script running `node --test` or `tsx --test`) and Playwright, `build.gradle` or `pom.xml`, a `Gemfile`, and `composer.json` for Pest. A package whose scripts run `node --test` runs its tests that way, and its Playwright, if it has one, runs only its `.spec` files. Where test-grader knows no runner for a test, the pane shows no **Run test** button for it. The pane draws straight away while each test file's folder is looked up, and adds the buttons as the lookups finish.
 
 ### Writing the grades out: `/test-grader report`
 
@@ -298,7 +299,7 @@ Editors that open at a line include VS Code and its forks (Cursor, Windsurf, VSC
 
 Grades are saved per project, with a fingerprint of each file. Each file's path is written once in the saved form. A new session lists the grades straight away, and **Grade all tests** then grades only the files that changed. Tests removed while no session was watching are pruned at session start.
 
-If a project's grades are too many to save whole, they are saved without their one-line summaries. If even that fails, the pane says the grades will not outlive the session.
+Claude Code keeps 4 MiB of saved values for all of a plugin's projects together, so a project whose grades come to more than 1 MB saves them in files of their own, under `~/.claude/test-grader/grades/` (or `$CLAUDE_CONFIG_DIR`), and the store only names them. If they can't be written there and are too many to save whole, they are saved without their one-line summaries. If even that fails, the pane says the grades will not outlive the session. In the session itself, the grades are held in chunks, so a project of many thousands of tests is not held to the 4 MiB one value can hold.
 
 A reload of the mod does not lose grading in progress. If a run, a regrade or a new test's grading was cut off, it starts again at the next session start. A Regrade all that was cut off resumes as a Regrade all, and a `diff` run as a `diff` run.
 

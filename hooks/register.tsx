@@ -23,7 +23,54 @@ const PANE = 'test-grader'
 const tests = atom({ plugin: 'test-grader', key: 'tests' } as const, [])
 const coverage = atom({ plugin: 'test-grader', key: 'coverage' } as const, null)
 const run = atom({ plugin: 'test-grader', key: 'run' } as const, { state: 'idle' })
-const existing = atom({ plugin: 'test-grader', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
+const existingMeta = atom({ plugin: 'test-grader', key: 'existing' } as const, { state: 'idle', done: 0, total: 0, results: [] })
+// The grades of the project's tests: one value of the session's state is held to 4 MiB, and a
+// project of thousands of tests, each with its reasons, is more. The results go in chunks of a
+// family, in order; the run's own value counts them and keeps its results field empty
+const CHUNK = 1_000_000
+const readChunk = async ($: EngineInterface, id: number): Promise<ExistingTest[]> => (await $.state.get({ plugin: 'test-grader', key: 'results', id: String(id) })).value ?? []
+const writeChunk = async ($: EngineInterface, id: number, chunk: ExistingTest[]): Promise<void> => void (await $.state.set({ plugin: 'test-grader', key: 'results', id: String(id) }, chunk))
+const readRun = async ($: EngineInterface): Promise<ExistingRun> => {
+  const meta = await read($, existingMeta)
+  if (!meta.chunks) return meta
+  const parts = await Promise.all(Array.from({ length: meta.chunks }, (_, i) => readChunk($, i)))
+  return { ...meta, results: parts.flat() }
+}
+// each write of the run waits for the one before: a write reads the whole and puts it back
+let runWrites: Promise<unknown> = Promise.resolve()
+const chunksWritten = new Map<number, string>()
+const updateRun = ($: EngineInterface, fn: (r: ExistingRun) => ExistingRun): Promise<void> => {
+  const done = runWrites.then(async () => {
+    const before = await readRun($)
+    const { results, ...meta } = fn(before)
+    const chunks: ExistingTest[][] = []
+    let size = CHUNK
+    for (const t of results) {
+      const length = JSON.stringify(t).length + 1
+      if (size + length > CHUNK) {
+        chunks.push([])
+        size = 0
+      }
+      chunks.at(-1)!.push(t)
+      size += length
+    }
+    // a chunk as it was last written is not written again
+    for (const [i, chunk] of chunks.entries()) {
+      const text = JSON.stringify(chunk)
+      if (chunksWritten.get(i) === text) continue
+      await writeChunk($, i, chunk)
+      chunksWritten.set(i, text)
+    }
+    // fewer than before: the chunks past the end are emptied
+    for (let i = chunks.length; i < (before.chunks ?? 0); i += 1) {
+      await writeChunk($, i, [])
+      chunksWritten.delete(i)
+    }
+    await update($, existingMeta, () => ({ ...meta, results: [], chunks: chunks.length }))
+  })
+  runWrites = done.catch(() => undefined)
+  return done
+}
 const noteError = atom({ plugin: 'test-grader', key: 'noteError' } as const, null)
 const opened = atom({ plugin: 'test-grader', key: 'open' } as const, [])
 const fileOpen = atom({ plugin: 'test-grader', key: 'fileOpen' } as const, {})
@@ -38,6 +85,8 @@ const saveError = atom({ plugin: 'test-grader', key: 'saveError' } as const, nul
 const graderError = atom({ plugin: 'test-grader', key: 'graderError' } as const, null)
 const unrated = atom({ plugin: 'test-grader', key: 'unrated' } as const, {})
 const testRuns = atom({ plugin: 'test-grader', key: 'testRuns' } as const, {})
+const basesFound = atom({ plugin: 'test-grader', key: 'basesFound' } as const, 0)
+const survived = atom({ plugin: 'test-grader', key: 'survived' } as const, {})
 const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
 
 const GREEN = '#4ade80'
@@ -256,6 +305,28 @@ const grade = async ($: EngineInterface, file: string, text: string, names: stri
   return measured.map(v => (isFlagged(v.verdict) ? (second.find(s => s.name === v.name) ?? v) : v))
 }
 
+// The mutations test_verify ran that a test under review let through: a test that misses a
+// measured change to the code is not strong, unless the change alters nothing it should catch
+// or the test has changed since to catch it
+const MAX_SURVIVED = 3
+const MAX_SURVIVED_TESTS = 500
+const survivedOf = (all: Record<string, { change: string; textOf: string }[]>, file: string, text: string, names: string[]): string[] => {
+  const own = ownTexts(text, file)
+  const lines = Object.entries(all).flatMap(([key, ms]) => {
+    const at = key.indexOf('::')
+    const [of, caseName] = [key.slice(0, at), key.slice(at + 2)]
+    if (of !== file) return []
+    const name = names.find(n => fits(caseName, n))
+    if (name === undefined) return []
+    return ms.map(m => `"${name}" still passed with ${m.change}${m.textOf === own(caseName) ? '' : ' (measured before its text last changed)'}`)
+  })
+  if (lines.length === 0) return []
+  return [
+    `test_verify ran these tests against a mutated copy of the code, and they let the change through: ${lines.join('; ')}.`,
+    'A test that lets a measured change through is not strong, unless the change alters nothing the test should catch, or the test changed since and its assertions now catch it. Say which in reason; where it is a gap, name it in missed.',
+  ]
+}
+
 // What a grader call reads besides the rubric and the project's rules: the test file (whole or
 // an excerpt), the code under test, and what it is asked, with any last grades, evidence or flags
 type AskOptions = Pick<GradeOptions, 'evidence' | 'isMeasured' | 'confirming' | 'prior' | 'edited'>
@@ -282,6 +353,7 @@ const askOf = async ($: EngineInterface, file: string, text: string, names: stri
           'Grade each as it is now. Where a change met the earlier concern, say so in reason. Flag one again only for a gap a plausible bug slips through, not for wording or style, and where it is a different concern from the earlier one, say that it is.',
         ]
       : []),
+    ...survivedOf(await read($, survived), file, text, names),
     ...(evidence
       ? [
           `The developer's session sent evidence about this test: ${JSON.stringify(evidence)}`,
@@ -835,16 +907,64 @@ const ownTexts = (text: string, file: string): ((name: string) => string) => {
 const isHeld = (t: { name: string; evidence?: string; evidenceOf?: string }, text: string, file: string): boolean =>
   Boolean(t.evidence && t.evidenceOf && t.evidenceOf === ownText(text, t.name, file))
 
+// The store holds 4 MiB for every project together: a project's grades past this go to files
+// of their own, under the Claude configuration folder, in parts a file holds (a file is read
+// and written to 4 MiB, and a character is up to 3 bytes)
+const STORE_ROOM = 1_000_000
+const PART = 1_000_000
+type GradesOnDisk = { v: 2; onDisk: string; parts: number }
+const gradesDir = async ($: EngineInterface, cwd: string): Promise<string | null> => {
+  const home = await $.env.get('HOME')
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || (home ? `${home}/.claude` : '')
+  return config ? `${config}/test-grader/grades/${cwd.replace(/[^A-Za-z0-9._-]+/g, '-')}` : null
+}
+// cut where no character's two halves are parted
+const partsOf = (text: string): string[] => {
+  const parts: string[] = []
+  for (let at = 0; at < text.length; ) {
+    let end = Math.min(at + PART, text.length)
+    const last = text.charCodeAt(end - 1)
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end -= 1
+    parts.push(text.slice(at, end))
+    at = end
+  }
+  return parts
+}
+// the grades a pointer names, or none where a part is missing or they do not read whole
+const readOnDisk = async ($: EngineInterface, pointer: GradesOnDisk): Promise<KeptGrades | undefined> => {
+  try {
+    const parts = await Promise.all(Array.from({ length: pointer.parts }, (_, i) => $.fs.read(`${pointer.onDisk}/${i}.part`)))
+    return JSON.parse(parts.join('')) as KeptGrades
+  } catch (error) {
+    $.ui.log(`test-grader: the grades in ${pointer.onDisk} could not be read: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
+    return undefined
+  }
+}
 const saveGrades = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
   if (!cwd) return
-  const run = await read($, existing)
+  const run = await readRun($)
   const saved: SavedGrades = {
     results: run.results.filter(t => !t.isUngraded).map(({ isPending: _, ...t }) => t),
     hashes: run.hashes ?? {},
     ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
   }
   const why = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+  // many: in files of their own, the store naming them
+  const text = JSON.stringify(keep(saved, false))
+  const dir = text.length > STORE_ROOM ? await gradesDir($, cwd) : null
+  if (dir !== null) {
+    try {
+      const parts = partsOf(text)
+      for (const [i, part] of parts.entries()) await $.fs.write(`${dir}/${i}.part`, part)
+      const pointer: GradesOnDisk = { v: 2, onDisk: dir, parts: parts.length }
+      await $.store.set(gradesKey(cwd), pointer)
+      await update($, saveError, () => null)
+      return
+    } catch (error) {
+      $.ui.log(`test-grader: the grades could not be written to ${dir}: ${why(error)}`, { to: 'debug' })
+    }
+  }
   try {
     await $.store.set(gradesKey(cwd), keep(saved, false))
     await update($, saveError, () => null)
@@ -864,14 +984,15 @@ const saveGrades = async ($: EngineInterface): Promise<void> => {
 
 // at a session's start, one that has graded nothing yet takes the project's saved grades
 const loadGrades = async ($: EngineInterface): Promise<void> => {
-  const run = await read($, existing)
+  const run = await readRun($)
   if (run.hashes || run.results.some(t => !t.isUngraded)) return
   const cwd = await projectDir($)
   if (!cwd) return
-  const kept = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as KeptGrades | SavedGrades | undefined
+  const stored = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as KeptGrades | SavedGrades | GradesOnDisk | undefined
+  const kept = stored && 'onDisk' in stored ? await readOnDisk($, stored) : stored
   if (!kept || !('v' in kept ? kept.files : Array.isArray(kept.results))) return
   const saved = unkeep(kept)
-  await update($, existing, r => ({ ...r, results: saved.results, hashes: saved.hashes ?? {}, ...(saved.finishedAt === undefined ? {} : { finishedAt: saved.finishedAt }) }))
+  await updateRun($, r => ({ ...r, results: saved.results, hashes: saved.hashes ?? {}, ...(saved.finishedAt === undefined ? {} : { finishedAt: saved.finishedAt }) }))
 }
 
 // The project's test files, by their path in it: every one git tracks, and every new one it
@@ -900,11 +1021,11 @@ const stopGrading = (): void => stopRun?.abort()
 type RunOptions = { isFresh?: boolean; only?: string[]; scope?: string; isQuiet?: boolean }
 const gradeAll = ($: EngineInterface, options: RunOptions = {}): Promise<string> => busy($, () => gradeAllNow($, options))
 const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, isQuiet = false }: RunOptions): Promise<string> => {
-  const before = await read($, existing)
+  const before = await readRun($)
   if (before.state === 'running') return 'Grading is already under way; wait for it to finish.'
   const cwd = await projectDir($)
   const fail = async (message: string): Promise<string> => {
-    await update($, existing, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
+    await updateRun($, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
     return message
   }
   const stop = new AbortController()
@@ -921,7 +1042,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
     const inRun = new Set(files.map(rel => `${cwd}/${rel}`))
     // a narrowed run leaves the other files' results be
     const others = only ? before.results.filter(t => !inRun.has(t.file)) : []
-    await update($, existing, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}), ...(scope ? { scope } : {}) }))
+    await updateRun($, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}), ...(scope ? { scope } : {}) }))
     const hashes: Record<string, string> = {}
     const spent: Spent = { input: 0, cached: 0, output: 0, cost: 0, unpriced: 0 }
     // tests whose results stand from before
@@ -1018,7 +1139,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
       }
       isRead = true
       ready()
-      await update($, existing, r => ({ ...r, done, results: shown() }))
+      await updateRun($, r => ({ ...r, done, results: shown() }))
     })()
     let next = 0
     const worker = async (): Promise<void> => {
@@ -1059,7 +1180,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
           hashes[entry.file] = entry.hash!
           done += 1
         }
-        await update($, existing, r => ({ ...r, done, results: shown() }))
+        await updateRun($, r => ({ ...r, done, results: shown() }))
       }
     }
     await Promise.all([reading, ...Array.from({ length: parallel }, worker)])
@@ -1072,7 +1193,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
     // a file not graded keeps its last fingerprint, so the next run grades it
     const kept = Object.fromEntries(Object.entries(before.hashes ?? {}).filter(([f]) => !inRun.has(f) || hashes[f] === undefined))
     const allHashes = only || isStopped ? { ...kept, ...hashes } : hashes
-    await update($, existing, (): ExistingRun => ({
+    await updateRun($, (): ExistingRun => ({
       state: 'idle' as const,
       done,
       total: files.length,
@@ -1126,7 +1247,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   // every test the change touched is graded again: a strong grade may not hold for its new text
   // but one graded on evidence whose own text is as it was keeps that grade
   const isRedo = (t: { file: string; name: string; verdict?: Verdict; evidence?: string; evidenceOf?: string }): boolean => t.file === file && among(touched, t.name) && !isHeld(t, text, file)
-  const known = new Set([...(await read($, existing)).results, ...(await read($, tests))].filter(t => t.file === file && among(touched, t.name) && among(present, t.name)).map(t => `${t.file}:${t.name}`))
+  const known = new Set([...(await readRun($)).results, ...(await read($, tests))].filter(t => t.file === file && among(touched, t.name) && among(present, t.name)).map(t => `${t.file}:${t.name}`))
   if (known.size > 0) await update($, modified, all => [...new Set([...all, ...known])].slice(-MAX_TESTS))
 
   const now = await read($, tests)
@@ -1145,7 +1266,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
     if (ids.size > 0) soon($, () => evaluate($, file, ids, isSecond ? (escalateModel ?? undefined) : undefined))
   }
 
-  const run = await read($, existing)
+  const run = await readRun($)
   const kept = run.results.filter(t => t.file !== file || among(present, t.name))
   // a test the session's own list grades again is not graded twice: its newer grade wins the row
   const redoing = new Set(redoNew.values())
@@ -1153,7 +1274,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
   const redo = redoRows.map(t => t.name)
   if (kept.length === run.results.length && redo.length === 0) return
   const pick = (t: ExistingTest): boolean => t.file === file && redo.includes(t.name)
-  await update($, existing, r => ({
+  await updateRun($, r => ({
     ...r,
     results: r.results.filter(t => t.file !== file || among(present, t.name)).map(t => (pick(t) ? { ...t, isPending: true } : t)),
   }))
@@ -1169,7 +1290,7 @@ const refresh = async ($: EngineInterface, file: string, touched: string[]): Pro
 const regradeRows = ($: EngineInterface, file: string, text: string, names: string[], model?: string): Promise<void> =>
   busy($, async () => {
     const pick = (t: ExistingTest): boolean => t.file === file && names.includes(t.name)
-    const had = (await read($, existing)).results.filter(t => pick(t) && t.verdict !== undefined)
+    const had = (await readRun($)).results.filter(t => pick(t) && t.verdict !== undefined)
     const edited = had.map(t => ({ name: t.name, verdict: t.verdict!, ...(t.reason ? { reason: t.reason } : {}) }))
     let verdicts: Graded[] | null = null
     let graded = text
@@ -1189,7 +1310,7 @@ const regradeRows = ($: EngineInterface, file: string, text: string, names: stri
       return v ? [{ file, name, verdict: v.verdict, reason: v.reason, ...beforeFor(name, v.verdict) }] : []
     }))
     const why = await unratedOf($, file)
-    await update($, existing, r => ({
+    await updateRun($, r => ({
       ...r,
       results: r.results.map(t => {
         if (!pick(t)) return t
@@ -1210,9 +1331,9 @@ const regradeRows = ($: EngineInterface, file: string, text: string, names: stri
 // pending. A start with grading under way here (a compaction) leaves it to finish
 const resume = async ($: EngineInterface): Promise<void> => {
   if (working > 0) return
-  const run = await read($, existing)
+  const run = await readRun($)
   if (run.state === 'running') {
-    await update($, existing, ({ isFresh: _, only: _o, scope: _s, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
+    await updateRun($, ({ isFresh: _, only: _o, scope: _s, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
     soon($, async () => void (await gradeAll($, { isFresh: run.isFresh === true, ...(run.only ? { only: run.only } : {}), ...(run.scope ? { scope: run.scope } : {}) })))
   } else {
     const byFile = new Map<string, string[]>()
@@ -1221,7 +1342,7 @@ const resume = async ($: EngineInterface): Promise<void> => {
       const text = await $.fs.read(file).catch(() => null)
       if (text !== null) soon($, () => regradeRows($, file, text, names))
       // the file is gone: its rows leave with it at the next listing; unmarked till then
-      else await update($, existing, r => ({ ...r, results: r.results.map(t => (t.file === file ? (({ isPending: _, ...rest }) => rest)(t) : t)) }))
+      else await updateRun($, r => ({ ...r, results: r.results.map(t => (t.file === file ? (({ isPending: _, ...rest }) => rest)(t) : t)) }))
     }
   }
   const pending = new Map<string, Map<string, string>>()
@@ -1242,7 +1363,7 @@ const readAt = new Map<string, number>()
 const lastText = new Map<string, string>()
 const catchUp = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
-  const run = await read($, existing)
+  const run = await readRun($)
   const files = [...new Set([...(await read($, tests)).map(t => t.file), ...run.results.map(t => t.file)])].filter(f => cwd !== '' && f.startsWith(`${cwd}/`))
   const last = await read($, seen)
   for (const file of files) {
@@ -1262,7 +1383,7 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
     const names = caseNames(text, file)
     // the tests whose text changed; every one, where the file's text before is not known
     await refresh($, file, prior !== undefined ? changedCases(prior, text, file) : names)
-    const known = [...(await read($, tests)).filter(t => t.file === file), ...(await read($, existing)).results.filter(t => t.file === file)].map(t => t.name)
+    const known = [...(await read($, tests)).filter(t => t.file === file), ...(await readRun($)).results.filter(t => t.file === file)].map(t => t.name)
     const fresh = [...new Set(names)].filter(n => !among(known, n) && !known.some(k => fits(n, k)))
     if (fresh.length > 0) await track($, file, fresh)
   }
@@ -1276,19 +1397,19 @@ const renamed = <T extends { verdict?: Verdict }>(t: T): T => {
 }
 const renameGrades = async ($: EngineInterface): Promise<void> => {
   await update($, tests, list => list.map(renamed))
-  await update($, existing, r => ({ ...r, results: r.results.map(renamed) }))
+  await updateRun($, r => ({ ...r, results: r.results.map(renamed) }))
   await update($, outbox, b => ({ accepted: b.accepted.map(renamed), going: b.going.map(renamed), spent: b.spent.map(renamed) }))
 }
 
 // At a session's start: an entry whose test is no longer among its file's cases, or whose
 // file is gone, was changed while no session watched it, and leaves both lists
 const prune = async ($: EngineInterface): Promise<void> => {
-  const files = [...new Set([...(await read($, tests)).map(t => t.file), ...(await read($, existing)).results.map(t => t.file)])]
+  const files = [...new Set([...(await read($, tests)).map(t => t.file), ...(await readRun($)).results.map(t => t.file)])]
   const present = new Map<string, string[]>()
   for (const file of files) present.set(file, await $.fs.read(file).then(text => caseNames(text, file), () => []))
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
   await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
-  await update($, existing, r => ({ ...r, results: withoutTemplates(r.results.filter(isThere)) }))
+  await updateRun($, r => ({ ...r, results: withoutTemplates(r.results.filter(isThere)) }))
   await saveGrades($)
 }
 
@@ -1305,7 +1426,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
   const listed = await testFiles($, cwd)
   if (listed === null) return
   const files = listed.map(rel => `${cwd}/${rel}`)
-  const run = await read($, existing)
+  const run = await readRun($)
   const cases: ExistingTest[] = []
   const hashes: Record<string, string> = {}
   for (const file of files) {
@@ -1320,7 +1441,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
     }
   }
   const isListed = new Set(Object.keys(hashes))
-  await update($, existing, r => (r.state === 'running' ? r : { ...r, results: [...withoutTemplates(cases), ...r.results.filter(t => !isListed.has(t.file))] }))
+  await updateRun($, r => (r.state === 'running' ? r : { ...r, results: [...withoutTemplates(cases), ...r.results.filter(t => !isListed.has(t.file))] }))
   // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
   // fingerprint, so a change made between sessions is still caught at a turn's end
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
@@ -1334,7 +1455,7 @@ const listNew = async ($: EngineInterface): Promise<void> => {
   const listed = await testFiles($, cwd)
   if (listed === null) return
   const files = new Set(listed.map(rel => `${cwd}/${rel}`))
-  const run = await read($, existing)
+  const run = await readRun($)
   if (run.state === 'running') return
   const known = new Set([...run.results.map(t => t.file), ...(await read($, tests)).map(t => t.file)])
   const cases: ExistingTest[] = []
@@ -1365,7 +1486,7 @@ const listNew = async ($: EngineInterface): Promise<void> => {
   }
   if (cases.length === 0 && gone.length === 0) return
   const isGone = (t: { file: string }): boolean => gone.includes(t.file)
-  await update($, existing, r => (r.state === 'running' ? r : { ...r, results: [...r.results.filter(t => !isGone(t) && !(t.file in hashes)), ...cases] }))
+  await updateRun($, r => (r.state === 'running' ? r : { ...r, results: [...r.results.filter(t => !isGone(t) && !(t.file in hashes)), ...cases] }))
   await update($, tests, list => list.filter(t => t.status === 'pending' || !isGone(t)))
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(all).filter(([f]) => !gone.includes(f))), ...hashes }))
   if (gone.length > 0) await saveGrades($)
@@ -1613,13 +1734,13 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
 const inProject = (cwd: string, given: string): string => (given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`)
 
 const regradeOnEvidence = async ($: EngineInterface, file: string, text: string, name: string, caseName: string, evidence: string, isMeasured = false): Promise<string> => {
-  const before = [...(await read($, existing)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
+  const before = [...(await readRun($)).results, ...(await read($, tests))].find(t => t.file === file && t.name === name)?.verdict
   const verdicts = await grade($, file, text, [caseName], { evidence, isMeasured, model: escalateModel ?? undefined }).catch(() => null)
   const v = verdicts?.find(x => x.name === name) ?? verdicts?.find(x => fits(caseName, x.name))
   if (!v) return `${(await unratedOf($, file))(name).reason ?? 'The grader gave no verdict.'} Nothing was regraded; send it again.`
   const judged = { verdict: v.verdict, summary: v.summary, reason: v.reason, confidence: v.confidence, evidence, evidenceOf: ownText(text, caseName, file) }
   const suite = suitesOf(text, file).get(caseName)
-  await update($, existing, r => ({
+  await updateRun($, r => ({
     ...r,
     results: r.results.some(t => t.file === file && t.name === name)
       ? r.results.map(t => (t.file === file && t.name === name ? { ...t, ...judged, isPending: undefined, isUngraded: undefined } : t))
@@ -1634,13 +1755,23 @@ const regradeOnEvidence = async ($: EngineInterface, file: string, text: string,
 }
 
 // What the project runs its tests with, found at its root as a session starts
+// a package script that runs node's own test runner: node --test, or tsx --test
+const nodeTest = /"[^"]*\b(?:node|tsx)\b[^"]*\s--test\b[^"]*"/
 let runners: Runners = {}
 const detectRunners = async ($: EngineInterface, cwd: string): Promise<Runners> => {
   const has = async (name: string): Promise<boolean> => (await mtime($, `${cwd}/${name}`)) !== null
   const pkg = (await has('package.json')) ? await $.fs.read(`${cwd}/package.json`).catch(() => '') : ''
   const composer = (await has('composer.json')) ? await $.fs.read(`${cwd}/composer.json`).catch(() => '') : ''
   return {
-    ...(/"vitest"/.test(pkg) ? { js: 'vitest' as const } : /"jest"/.test(pkg) ? { js: 'jest' as const } : /"@playwright\/test"/.test(pkg) ? { js: 'playwright' as const } : {}),
+    ...(/"vitest"/.test(pkg)
+      ? { js: 'vitest' as const }
+      : /"jest"/.test(pkg)
+        ? { js: 'jest' as const }
+        : nodeTest.test(pkg)
+          ? { js: 'node' as const, ...(/--import[= ]tsx\b|\btsx --test\b/.test(pkg) ? { isTsx: true } : {}), ...(/"@playwright\/test"/.test(pkg) ? { hasPlaywright: true } : {}) }
+          : /"@playwright\/test"/.test(pkg)
+            ? { js: 'playwright' as const }
+            : {}),
     ...((await has('build.gradle')) || (await has('build.gradle.kts')) ? { jvm: 'gradle' as const } : (await has('pom.xml')) ? { jvm: 'maven' as const } : {}),
     ...((await has('Gemfile')) ? { isBundled: true } : {}),
     ...(/"pestphp\/pest"/.test(composer) ? { isPest: true } : {}),
@@ -1651,9 +1782,14 @@ const detectRunners = async ($: EngineInterface, cwd: string): Promise<Runners> 
 // language's mark (backend/go.mod, mobile/package.json), with the runners found there; else the
 // project's root. Kept by folder in this load of the module
 const basesAt = new Map<string, Promise<{ base: string; runners: Runners }>>()
+// the ones found, for the pane to draw with without waiting: a reload starts them over, and a
+// project of many test folders takes a while to look up
+const basesDone = new Map<string, { base: string; runners: Runners }>()
+const baseKey = (file: string): string => `${kindOf(file)}:${file.slice(0, file.lastIndexOf('/'))}`
+let isFindingBases = false
 const baseOf = async ($: EngineInterface, cwd: string, file: string): Promise<{ base: string; runners: Runners }> => {
   const marks = PROJECT_MARKS[kindOf(file)] ?? []
-  const key = `${kindOf(file)}:${file.slice(0, file.lastIndexOf('/'))}`
+  const key = baseKey(file)
   const known = basesAt.get(key)
   if (known) return known
   const found = (async () => {
@@ -1666,6 +1802,7 @@ const baseOf = async ($: EngineInterface, cwd: string, file: string): Promise<{ 
     return { base: cwd, runners }
   })()
   basesAt.set(key, found)
+  void found.then(v => basesDone.set(key, v)).catch(() => undefined)
   return found
 }
 
@@ -1771,7 +1908,14 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
     return `The mutated code did not build, so the test never ran: that measures nothing. Pick a change that compiles and alters behaviour. The end of the output:\n${mutated.tail}\nThe file is back as it was; nothing was regraded.`
   }
   if (mutated.isPassed) {
-    return `The test still passes with ${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}: it does not catch that change. The file is back as it was; nothing was regraded.`
+    // the grader hears of it at the test's next grading
+    const change = `${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}`
+    const key = `${file}::${caseName}`
+    await update($, survived, all => {
+      const kept = Object.entries({ ...all, [key]: [...(all[key] ?? []).filter(m => m.change !== change), { change, textOf: ownText(text, caseName, file) }].slice(-MAX_SURVIVED) })
+      return Object.fromEntries(kept.slice(-MAX_SURVIVED_TESTS))
+    })
+    return `The test still passes with ${JSON.stringify(find)} replaced by ${JSON.stringify(replace)} in ${shortPath(target, cwd)}: it does not catch that change. The file is back as it was; nothing was regraded, and the grader is told of it when the test is next graded.`
   }
   const evidence = clamp(
     [
@@ -1795,7 +1939,7 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
   const scope = given === '' || given === '.' ? '' : given.startsWith('/') ? given : `${cwd}/${given.replace(/^\.\//, '')}`
   const limit = typeof input.limit === 'number' && input.limit >= 1 ? Math.floor(input.limit) : GRADES_LIMIT
   const isWritten = input.written === true
-  const inScope = entriesOf(await read($, existing), await read($, tests), await read($, modified)).filter(
+  const inScope = entriesOf(await readRun($), await read($, tests), await read($, modified)).filter(
     t => (scope === '' || t.file === scope || t.file.startsWith(`${scope}/`)) && (!isWritten || t.isNew || t.isModified === true),
   )
   const where = (isWritten ? ' written or edited this session' : '') + (scope === '' ? '' : ` in ${shortPath(scope, cwd)}`)
@@ -1816,7 +1960,7 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
     .join(' or ')
   const waiting = count('reviewing') > 0 ? `\n${count('reviewing')} still being graded: ask again in a moment for their grades.` : ''
   // what the last grading run found changed, in scope: the files to look at first
-  const last = await read($, existing)
+  const last = await readRun($)
   const inScopeFile = (rel: string): boolean => scope === '' || `${cwd}/${rel}` === scope || `${cwd}/${rel}`.startsWith(`${scope}/`)
   const files = [...namedFiles('The last run graded again, changed since their last grading', (last.changed ?? []).filter(inScopeFile)), ...namedFiles('The last run graded for the first time', (last.added ?? []).filter(inScopeFile))]
   const runLines = isWritten || files.length === 0 ? '' : `\n${files.join('\n')}`
@@ -1869,7 +2013,7 @@ const branchFiles = async ($: EngineInterface, cwd: string): Promise<{ base: str
 }
 
 const gradeBranch = async ($: EngineInterface): Promise<string> => {
-  if ((await read($, existing)).state === 'running') return 'Grading is already under way.'
+  if ((await readRun($)).state === 'running') return 'Grading is already under way.'
   const found = await branchFiles($, await projectDir($))
   if (typeof found === 'string') return found
   if (found.files.length === 0) return `No test files changed against ${found.base}.`
@@ -1880,7 +2024,7 @@ const gradeBranch = async ($: EngineInterface): Promise<string> => {
 // Claude's grade tool: a run over the project, or a file or folder of it, waited for, its note
 // the answer. Short of again, the tests already rated in files unchanged since keep their grades
 const answerGrade = async ($: EngineInterface, input: { path?: unknown; again?: unknown }): Promise<string> => {
-  if ((await read($, existing)).state === 'running') return 'Grading is already under way; wait for it to finish, then call test_grades.'
+  if ((await readRun($)).state === 'running') return 'Grading is already under way; wait for it to finish, then call test_grades.'
   const cwd = await projectDir($)
   const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '').replace(/^\.\//, '') : ''
   const abs = given === '' || given === '.' ? cwd : given.startsWith('/') ? given : `${cwd}/${given}`
@@ -1905,7 +2049,7 @@ const answerContext = async ($: EngineInterface, input: { file?: unknown; test?:
   const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
   const { source, underTest, ask } = await askOf($, file, text, [name])
-  const last = entriesOf(await read($, existing), await read($, tests)).find(t => t.file === file && t.name === name)
+  const last = entriesOf(await readRun($), await read($, tests)).find(t => t.file === file && t.name === name)
   const lines = [
     `What the grader reads for ${JSON.stringify(name)} in ${shortPath(file, cwd)}, as a plain grade sends it. A regrade of an unchanged file adds the last grades; evidence and a second look add theirs.`,
     `System: the grading rubric, the same for every test${projectRules ? `, then the project's rules (${RUBRIC_FILE}):\n${projectRules}` : '. The project has no rules file.'}`,
@@ -1925,7 +2069,7 @@ const REPORT = 'test-grader-report'
 const writeReport = async ($: EngineInterface): Promise<string> => {
   const cwd = await projectDir($)
   if (!cwd) return 'No project folder to write the report to.'
-  const entries = entriesOf(await read($, existing), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
+  const entries = entriesOf(await readRun($), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
   if (entries.length === 0) return 'No tests to report: Grade all tests grades the project first.'
   const texts = new Map<string, string | null>()
   const rows: { file: string; line: number | null; name: string; state: State; summary: string | null; reason: string | null; onEvidence: boolean }[] = []
@@ -2111,10 +2255,10 @@ export const register: Register = (on, options) => {
       // a file written afresh holds its old cases too: only the ones it did not hold, not tracked
       // yet nor graded, are new. A row listed but never graded (the watcher may list the file
       // before this hook runs) is not a grade: its test is graded like any other new one, once
-      const listed = [...(await read($, tests)), ...(await read($, existing)).results.filter(t => !t.isUngraded)].filter(t => t.file === e.file_path)
+      const listed = [...(await read($, tests)), ...(await readRun($)).results.filter(t => !t.isUngraded)].filter(t => t.file === e.file_path)
       const known = new Set([...listed.map(t => t.name), ...(prior === null || prior === e.content ? [] : caseNames(prior, e.file_path))])
       const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
-      if (fresh.length > 0) await update($, existing, r => ({ ...r, results: r.results.filter(t => !(t.isUngraded && t.file === e.file_path && fresh.includes(t.name))) }))
+      if (fresh.length > 0) await updateRun($, r => ({ ...r, results: r.results.filter(t => !(t.isUngraded && t.file === e.file_path && fresh.includes(t.name))) }))
       // a file written over: only the tests whose text changed are touched
       await refresh($, e.file_path, prior !== null && prior !== e.content ? changedCases(prior, e.content, e.file_path) : names)
       if (fresh.length > 0) await track($, e.file_path, fresh)
@@ -2179,7 +2323,7 @@ export const register: Register = (on, options) => {
     if (!e.tools.includes(`mcp__test-grader__${GRADES_TOOL}`)) return composed
 
     // the languages the project's tests are in, as listed: the guide for each, and no other
-    const kinds = new Set([...(await read($, existing)).results, ...(await read($, tests))].map(t => kindOf(t.file)))
+    const kinds = new Set([...(await readRun($)).results, ...(await read($, tests))].map(t => kindOf(t.file)))
     const guides = LANGUAGE_ORDER.filter(k => kinds.has(k)).map(k => `- ${LANGUAGE_NAMES[k]}: ${guideOf($.plugin.root, k)}`)
     const text =
       guides.length > 0
@@ -2210,7 +2354,7 @@ export const register: Register = (on, options) => {
     // coverage is shown where the project has a run test-grader knows, or a report to read
     const coverRun = await read($, coverWith)
     const hasCoverage = coverRun !== null || cov !== null
-    const graded = await read($, existing)
+    const graded = await readRun($)
     const noteFailed = await read($, noteError)
     const openFailed = await read($, openError)
     const saveFailed = await read($, saveError)
@@ -2228,9 +2372,23 @@ export const register: Register = (on, options) => {
 
     const entries = entriesOf(graded, list, await read($, modified))
     // whether each file's tests can be run one at a time, by the runners where they run from
-    const runnable = new Map(
-      await Promise.all([...new Set(entries.map(t => t.file))].map(async file => [file, runArgv({ rel: '', kind: kindOf(file), plain: '', groups: [], line: 1 }, (await baseOf($, cwd, file)).runners) !== null] as const)),
-    )
+    // not waited for: a file whose folder is not looked up yet goes by the project's runners until
+    // the lookup, done after this drawing, draws the pane again
+    await read($, basesFound)
+    const listedFiles = [...new Set(entries.map(t => t.file))]
+    const unfound = [...new Map(listedFiles.filter(f => !basesDone.has(baseKey(f))).map(f => [baseKey(f), f])).values()]
+    if (unfound.length > 0 && !isFindingBases) {
+      isFindingBases = true
+      $.clock.after(1, () =>
+        void (async () => {
+          // one that cannot be looked up goes by the project's runners, and is not looked up again
+          for (const file of unfound) await baseOf($, cwd, file).catch(() => basesDone.set(baseKey(file), { base: cwd, runners }))
+          isFindingBases = false
+          await update($, basesFound, n => n + 1)
+        })(),
+      )
+    }
+    const runnable = new Map(listedFiles.map(file => [file, runArgv({ rel: '', kind: kindOf(file), plain: '', groups: [], line: 1 }, basesDone.get(baseKey(file))?.runners ?? runners) !== null] as const))
     const tally = (of: Entry[], s: State): number => of.filter(t => t.state === s).length
 
     // grouped: a Go suite over its files, else by file; the worst group first, and in a

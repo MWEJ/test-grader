@@ -4,7 +4,11 @@ import type { Kind } from './discovery'
 
 // what the project runs its tests with, as found at its root
 export type Runners = {
-  js?: 'vitest' | 'jest' | 'playwright'
+  js?: 'vitest' | 'jest' | 'node' | 'playwright'
+  /** node: its script loads TypeScript with tsx */
+  isTsx?: boolean
+  /** node: the package has Playwright too, for its .spec files */
+  hasPlaywright?: boolean
   jvm?: 'gradle' | 'maven'
   isBundled?: boolean
   isPest?: boolean
@@ -14,6 +18,7 @@ export type Runners = {
 // it, its line, and a Go suite test's suite
 export type RunTarget = { rel: string; kind: Kind; plain: string; groups: string[]; line: number; suite?: string }
 
+const SPEC = /\.spec\.[cm]?[jt]sx?$/
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 // a test's class: its innermost group, else the file's name less its extension
 const classOf = (t: RunTarget): string => t.groups[t.groups.length - 1] ?? t.rel.slice(t.rel.lastIndexOf('/') + 1).replace(/\.\w+$/, '')
@@ -26,7 +31,11 @@ export const runArgv = (t: RunTarget, runners: Runners): string[] | null => {
       const full = escapeRegex([...t.groups, t.plain].join(' '))
       if (runners.js === 'vitest') return ['npx', 'vitest', 'run', t.rel, '-t', `^${full}$`]
       if (runners.js === 'jest') return ['npx', 'jest', t.rel, '-t', `^${full}$`]
-      if (runners.js === 'playwright') return ['npx', 'playwright', 'test', `${t.rel}:${t.line}`]
+      // node's own runner, for a package whose scripts run node --test; its Playwright, if it has
+      // one, runs the .spec files
+      if (runners.js === 'node' && !(runners.hasPlaywright && SPEC.test(t.rel)))
+        return ['node', ...(runners.isTsx ? ['--import', 'tsx'] : []), '--test', '--test-name-pattern', `${escapeRegex(t.plain)}$`, t.rel]
+      if (runners.js === 'playwright' || runners.js === 'node') return ['npx', 'playwright', 'test', `${t.rel}:${t.line}`]
       return null
     }
     case 'py':
