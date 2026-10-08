@@ -1,0 +1,14 @@
+{
+  "name": "test-grader",
+  "description": "test-grader, a Claude Code plugin that grades the project's tests and shows coverage.",
+  "owner": {
+    "name": "Martin Hygge"
+  },
+  "plugins": [
+    {
+      "name": "test-grader",
+      "source": "./",
+      "description": "A side pane that grades every test in the project, tells Claude how to write tests that grade strong, and shows coverage."
+    }
+  ]
+}

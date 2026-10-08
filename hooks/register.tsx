@@ -6,13 +6,13 @@ import type { Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '
 import { attr, byDirOf, coverageNote, pct } from './coverage'
 import type { CoverCommand } from './coverage'
 import { TEST_FILE, among, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
-import { MAX_REPLY, caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
+import { MAX_REPLY, asAsked, caseTextOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, moduleOf } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
 import type { KeptGrades, SavedGrades } from './kept'
 import { costOf } from './prices'
-import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, FOLLOW_UP, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
+import { EVIDENCE_DESCRIPTION, EVIDENCE_HINT, EVIDENCE_MAX, EVIDENCE_SCHEMA, EVIDENCE_TOOL, FOLLOW_UP, GRADE_DESCRIPTION, GRADE_SCHEMA, GRADE_TOOL, GRADES_DESCRIPTION, GRADES_LIMIT, GRADES_SCHEMA, GRADES_TOOL, GRADING_SECTION, LANGUAGE_NAMES, LANGUAGE_ORDER, MAX_ROUNDS, RUBRIC, SPENT_FOLLOW_UP, VERIFY_DESCRIPTION, VERIFY_SCHEMA, VERIFY_TOOL, guideOf } from './prompts'
 import { runArgv, shown, tailOf } from './runner'
 import type { RunTarget, Runners } from './runner'
 import { DEFAULT_MODEL, modelOf, workersOf } from './settings'
@@ -326,7 +326,9 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
     }
     addUsage(spent, request.model, reply.usage)
     if (reply.isAnswered) {
-      const { verdicts, isCut } = parseVerdicts(reply.text)
+      const parsed = parseVerdicts(reply.text)
+      const verdicts = asAsked(names, parsed.verdicts)
+      const { isCut } = parsed
       if (isCut) {
         $.ui.log(`test-grader: a grader reply was cut off (${reply.usage?.output_tokens ?? '?'} of ${MAX_REPLY} tokens) for ${file}: kept ${verdicts.length} verdicts of ${JSON.stringify(names)}`, { to: 'debug' })
       }
@@ -734,30 +736,35 @@ const testFiles = async ($: EngineInterface, cwd: string): Promise<string[] | nu
 let stopRun: AbortController | null = null
 const stopGrading = (): void => stopRun?.abort()
 
-// isFresh: grade every file again, the remembered ones too; only: these files alone (their
-// paths in the project), the rest of the project's results left as they are
-type RunOptions = { isFresh?: boolean; only?: string[] }
-const gradeAll = ($: EngineInterface, isFresh = false, only?: string[]): Promise<void> => busy($, () => gradeAllNow($, { isFresh, only }))
-const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOptions): Promise<void> => {
+// isFresh: grade every test again, the rated ones too; only: these files alone (their paths
+// in the project), the rest of the project's results left as they are; scope: what Claude's
+// note says the run graded; isQuiet: no note, the run's text answers whoever asked (a tool).
+// It comes to what the note says, or why nothing was graded
+type RunOptions = { isFresh?: boolean; only?: string[]; scope?: string; isQuiet?: boolean }
+const gradeAll = ($: EngineInterface, options: RunOptions = {}): Promise<string> => busy($, () => gradeAllNow($, options))
+const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, isQuiet = false }: RunOptions): Promise<string> => {
   const before = await read($, existing)
-  if (before.state === 'running') return
+  if (before.state === 'running') return 'Grading is already under way; wait for it to finish.'
   const cwd = await $.session.cwd()
-  const fail = (message: string) => update($, existing, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
+  const fail = async (message: string): Promise<string> => {
+    await update($, existing, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
+    return message
+  }
   const stop = new AbortController()
   stopRun = stop
   try {
     const listed = only ?? (await testFiles($, cwd))
-    if (listed === null) return void (await fail('Not a git repository: there is no list of test files to grade.'))
+    if (listed === null) return await fail('Not a git repository: there is no list of test files to grade.')
     const files = only ? listed.filter(f => TEST_FILE.test(f)) : listed
     // nothing to grade: the pane says why, and Claude is told nothing
     if (!only && files.length === 0) {
       const ignored = (await $.process.run(['git', 'check-ignore', '-q', '.'], { cwd, timeoutMs: 10_000 }).catch(() => null))?.exitCode === 0
-      return void (await fail(ignored ? `No test files in ${cwd}: git ignores this folder. Open the session in the project's root to grade its tests.` : `No test files in ${cwd}: git lists none here.`))
+      return await fail(ignored ? `No test files in ${cwd}: git ignores this folder. Open the session in the project's root to grade its tests.` : `No test files in ${cwd}: git lists none here.`)
     }
     const inRun = new Set(files.map(rel => `${cwd}/${rel}`))
     // a narrowed run leaves the other files' results be
     const others = only ? before.results.filter(t => !inRun.has(t.file)) : []
-    await update($, existing, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}) }))
+    await update($, existing, r => ({ ...r, state: 'running' as const, done: 0, total: files.length, isFresh, ...(only ? { only } : {}), ...(scope ? { scope } : {}) }))
     const hashes: Record<string, string> = {}
     const spent: Spent = { input: 0, cached: 0, output: 0, cost: 0, unpriced: 0 }
     // tests whose results stand from before
@@ -806,8 +813,10 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
           done += 1
           continue
         }
-        // a test graded on evidence, its own text unchanged since, keeps that grade
-        const held = kept.filter(t => isHeld(t, text, file))
+        // a test graded on evidence, its own text unchanged since, keeps that grade; so does
+        // every rated test of a file unchanged since its last grading, short of a regrade
+        const isSame = !isFresh && before.hashes?.[file] === hash
+        const held = kept.filter(t => isHeld(t, text, file) || (isSame && t.verdict !== undefined))
         const toGrade = names.filter(name => !held.some(t => fits(name, t.name)))
         if (held.length > 0) {
           entry.slots.push({ items: held, waiting: held, was: held, isDone: true })
@@ -895,11 +904,13 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only }: RunOpt
     }))
     await saveGrades($)
     await update($, seen, all => ({ ...all, ...hashes }))
-    if (isStopped) return
+    if (isStopped) return `Stopped: ${done} of ${files.length} files graded.`
     const told = results.filter(t => inRun.has(t.file))
-    await share($, existingNote(told, cwd, only ? 'the files changed on this branch' : undefined))
+    const note = existingNote(told, cwd, scope)
+    if (!isQuiet) await share($, note)
+    return note
   } catch (err) {
-    await fail(err instanceof Error ? err.message : String(err))
+    return await fail(err instanceof Error ? err.message : String(err))
   } finally {
     if (stopRun === stop) stopRun = null
   }
@@ -1005,8 +1016,8 @@ const resume = async ($: EngineInterface): Promise<void> => {
   if (working > 0) return
   const run = await read($, existing)
   if (run.state === 'running') {
-    await update($, existing, ({ isFresh: _, only: _o, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
-    soon($, () => gradeAll($, run.isFresh === true, run.only))
+    await update($, existing, ({ isFresh: _, only: _o, scope: _s, ...r }): ExistingRun => ({ ...r, state: 'idle', results: r.results.map(({ isPending: _p, ...t }) => t) }))
+    soon($, async () => void (await gradeAll($, { isFresh: run.isFresh === true, ...(run.only ? { only: run.only } : {}), ...(run.scope ? { scope: run.scope } : {}) })))
   } else {
     const byFile = new Map<string, string[]>()
     for (const t of run.results) if (t.isPending) byFile.set(t.file, [...(byFile.get(t.file) ?? []), t.name])
@@ -1557,8 +1568,26 @@ const gradeBranch = async ($: EngineInterface): Promise<string> => {
   const found = await branchFiles($, await $.session.cwd())
   if (typeof found === 'string') return found
   if (found.files.length === 0) return `No test files changed against ${found.base}.`
-  soon($, () => gradeAll($, true, found.files))
+  soon($, async () => void (await gradeAll($, { isFresh: true, only: found.files, scope: 'the files changed on this branch' })))
   return `Grading the ${found.files.length} test ${found.files.length === 1 ? 'file' : 'files'} changed against ${found.base}.`
+}
+
+// Claude's grade tool: a run over the project, or a file or folder of it, waited for, its note
+// the answer. Short of again, the tests already rated in files unchanged since keep their grades
+const answerGrade = async ($: EngineInterface, input: { path?: unknown; again?: unknown }): Promise<string> => {
+  if ((await read($, existing)).state === 'running') return 'Grading is already under way; wait for it to finish, then call test_grades.'
+  const cwd = await $.session.cwd()
+  const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '').replace(/^\.\//, '') : ''
+  const abs = given === '' || given === '.' ? cwd : given.startsWith('/') ? given : `${cwd}/${given}`
+  const isFresh = input.again === true
+  if (abs === cwd) return gradeAll($, { isFresh, isQuiet: true })
+  if (!abs.startsWith(`${cwd}/`)) return `${given} is outside the project (${cwd}).`
+  const rel = abs.slice(cwd.length + 1)
+  const listed = await testFiles($, cwd)
+  if (listed === null) return 'Not a git repository: there is no list of test files to grade.'
+  const only = listed.filter(f => f === rel || f.startsWith(`${rel}/`))
+  if (only.length === 0) return `No test files in ${rel}.`
+  return gradeAll($, { isFresh, only, scope: only.length === 1 && only[0] === rel ? rel : `${rel}/`, isQuiet: true })
 }
 
 // The grades written out, for a review or CI: a Markdown page and its JSON, at the project's root
@@ -1645,6 +1674,12 @@ export const register: Register = (on, options) => {
     return isGuide ? { decision: 'allow' as const } : next(e)
   }).catch(($, e, next) => next(e))
 
+  // grading reads files and calls the grader, as Grade all tests does: no permission asked
+  on('tool.check', { tool: 'mcp__test-grader__test_grade' }, () => ({ decision: 'allow' as const })).catch(() => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: 'mcp__test-grader__test_grade' }, async ($, e) => ({ result: await answerGrade($, e as never) })).catch(
+    (_$, _e, next) => ({ result: `The grade tool could not answer (${next.error.kind}); ask again.` }),
+  )
+
   // the verify tool runs commands and changes a file for a moment: the person is asked first,
   // as for any tool, so no allow here
   on('tool.call', { tool: 'mcp__test-grader__test_verify' }, async ($, e) => ({ result: await answerVerify($, e as never) })).catch(
@@ -1663,6 +1698,9 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: GRADES_TOOL, description: GRADES_DESCRIPTION, inputSchema: GRADES_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the grades tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await $.tool
+      .register({ name: GRADE_TOOL, description: GRADE_DESCRIPTION, inputSchema: GRADE_SCHEMA })
+      .catch(error => $.ui.log(`test-grader: the grade tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
     await $.tool
       .register({ name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the verify tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
@@ -1871,9 +1909,12 @@ export const register: Register = (on, options) => {
       ...(entries.some(t => t.isModified) ? [`${entries.filter(t => t.isModified).length} modified`] : []),
     ].join(' · ')
 
-    // a group's header line: its toggle, its counts, and new when it holds a new test
+    // a group's header line: its toggle, its counts, new when it holds a new test, and Regrade,
+    // which grades its files again alone (scope: what Claude's note says was graded)
     // lines: the folder's line coverage, when the report has it
-    const header = (key: string, label: string, of: Entry[], indent: number, open: boolean, onPress: () => Promise<void>, lines?: { total: number; covered: number }): unknown => {
+    const header = (key: string, label: string, of: Entry[], indent: number, open: boolean, onPress: () => Promise<void>, scope: string, lines?: { total: number; covered: number }): unknown => {
+      const only = [...new Set(of.map(t => t.file).filter(f => f.startsWith(`${cwd}/`)).map(f => f.slice(cwd.length + 1)))]
+      const canRegrade = graded.state !== 'running' && only.length > 0
       const linePct = lines && lines.total > 0 ? Math.round((lines.covered / lines.total) * 100) : null
       const worst = worstFirst(of)[0]!.state
       const groupCounts = [
@@ -1883,11 +1924,12 @@ export const register: Register = (on, options) => {
       ].join(' · ')
       return (
         <Box key={`h-${key}`} flexDirection="row" gap={1} marginLeft={indent}>
-          <Button key={key} plain label={`${open ? '▾' : '▸'} ${clamp(label, Math.max(16, columns - groupCounts.length - 10 - indent))}`} onPress={onPress} />
+          <Button key={key} plain label={`${open ? '▾' : '▸'} ${clamp(label, Math.max(16, columns - groupCounts.length - 10 - (canRegrade ? 10 : 0) - indent))}`} onPress={onPress} />
           <Text color={stateColor(worst)}>{groupCounts}</Text>
           {linePct !== null && <Text color={pctColor(linePct)}>{`${linePct}% ${cov?.lines === null && cov?.statements !== null ? 'statements' : 'lines'}`}</Text>}
           {of.some(t => t.isNew) && <Text color={VIOLET}>new</Text>}
           {of.some(t => t.isModified) && <Text color={BLUE}>modified</Text>}
+          {canRegrade && <Button key={`g-${key}`} plain label="↻ Regrade" onPress={() => soon($, async () => void (await gradeAll($, { isFresh: true, only, scope })))} />}
         </Box>
       )
     }
@@ -1911,7 +1953,7 @@ export const register: Register = (on, options) => {
     // openKey: where its open or closed is kept; a top-level file's, by its path as before
     const drawFile = (key: string, openKey: string, label: string, of: Entry[], indent: number, siblings: number): void => {
       const open = isGroupOpen(openKey, siblings)
-      drawn.push(header(key, label, of, indent, open, flip(openKey, open)))
+      drawn.push(header(key, label, of, indent, open, flip(openKey, open), shortPath(of[0]!.file, cwd)))
       if (!open) return
       for (const t of of) {
         const key = `r:${t.file}:${t.name}`
@@ -2003,7 +2045,7 @@ export const register: Register = (on, options) => {
         if (c.kind === 'dir') {
           const key = `d:${c.folder.path}`
           const open = isGroupOpen(key, children.length)
-          drawn.push(header(key, `${prefix}${c.name}/`, c.of, indent, open, flip(key, open), cov?.byDir?.[c.folder.path]))
+          drawn.push(header(key, `${prefix}${c.name}/`, c.of, indent, open, flip(key, open), `${c.folder.path}/`, cov?.byDir?.[c.folder.path]))
           if (open) drawLevel(c.folder, '', indent + 2)
           continue
         }
@@ -2015,7 +2057,7 @@ export const register: Register = (on, options) => {
         // a suite names its package's folder where no row above does
         const key = `s:${g.id}`
         const open = isGroupOpen(key, children.length)
-        drawn.push(header(key, prefix ? `${g.suite} · ${prefix.slice(0, -1)}` : g.suite, g.of, indent, open, flip(key, open)))
+        drawn.push(header(key, prefix ? `${g.suite} · ${prefix.slice(0, -1)}` : g.suite, g.of, indent, open, flip(key, open), `the ${g.suite} suite`))
         if (!open) continue
         const files = byFile(g.of)
         for (const { file, of } of files) drawFile(`sf:${g.id}:${file}`, `sf:${g.id}:${file}`, shortPath(file, cwd), of, indent + 2, files.length)
@@ -2105,11 +2147,11 @@ export const register: Register = (on, options) => {
               key="gradeAll"
               label={graded.state === 'running' ? `Grading… ${graded.done}/${graded.total} files done` : 'Grade all tests'}
               // on a timer: a run outlasts the press that starts it
-              onPress={() => (graded.state === 'running' ? undefined : soon($, () => gradeAll($)))}
+              onPress={() => (graded.state === 'running' ? undefined : soon($, async () => void (await gradeAll($))))}
             />
             {graded.state === 'running' && <Button key="stopGrading" label="Stop" onPress={() => stopGrading()} />}
             {graded.state !== 'running' && graded.hashes && Object.keys(graded.hashes).length > 0 && (
-              <Button key="regradeAll" label="Regrade all" onPress={() => soon($, () => gradeAll($, true))} />
+              <Button key="regradeAll" label="Regrade all" onPress={() => soon($, async () => void (await gradeAll($, { isFresh: true })))} />
             )}
           </Box>
         </Box>

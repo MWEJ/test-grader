@@ -472,6 +472,16 @@ test('a grader answer holding no verdict for the tests asked about says what cam
   expect(JSON.stringify(await ui.drawn())).toContain('1 test · 1 strong')
 })
 
+test('a test named with a curly apostrophe is graded when the grader echoes it straight', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const straight = { isAnswered: true, text: '[{"name":"no nudges for a subagent\'s call","summary":"s","verdict":"brittle","reason":"Exact mock calls."}]', usage: {} }
+  project(on, { 'src/a.test.ts': "it('no nudges for a subagent’s call', () => { expect(nudges()).toEqual([]) })\n" }, { reply: () => straight })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 strong · 1 brittle')
+})
 
 // one test a first pass grades shallow, with the reply the grader gives
 const ONE = { 'src/a.test.ts': "it('totals', () => { expect(total([])).toBeDefined() })\n" }

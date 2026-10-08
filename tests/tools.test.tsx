@@ -6,7 +6,7 @@ test('evidence the grader accepts turns a shallow test strong, and the row says 
   const clock = mock.clock(on, { now: 1_000_000 })
   const { prompts, tools } = project(on, { 'src/e.test.ts': E_TEST }, { rule: swayed })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
-  expect(tools).toEqual(['test_evidence', 'test_grades', 'test_verify'])
+  expect([...tools].sort()).toEqual(['test_evidence', 'test_grade', 'test_grades', 'test_verify'])
   const ui = await mount($)
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)

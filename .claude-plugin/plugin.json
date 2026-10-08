@@ -1,6 +1,6 @@
 {
   "name": "test-grader",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "description": "A side pane that grades every test in the project (strong, shallow, brittle, hollow, duplicate), tells Claude how to write tests that grade strong, and shows coverage.",
   "author": {
     "name": "Martin Hygge"

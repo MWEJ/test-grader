@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { ExistingTest } from '../types'
 import { attr, byDirOf, pct } from '../hooks/coverage'
-import { excerptOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
+import { asAsked, excerptOf, parseVerdicts, unratedWhy } from '../hooks/excerpt'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
 import { modelOf, workersOf } from '../hooks/settings'
@@ -302,4 +302,33 @@ test('a test the grader left out says how many of the batch it answered', () => 
   expect(whyOf('[{"name":"adds","summary":"s","verdict":"strong","reason":"r"}]', 'subtracts')).toBe(
     'The grader (haiku) left this test out of its answer: it gave 1 of the 2 verdicts asked for.',
   )
+})
+
+// the name a verdict came back under, against the names asked: a model echoing a name with
+// its quotes, dashes, escapes or spacing changed still answers for that test
+const v = (name: string) => ({ name, verdict: 'strong' as const })
+
+test('a verdict echoing a curly apostrophe as a straight one answers for the test asked', () => {
+  expect(asAsked(['no nudges for a subagent’s call'], [v("no nudges for a subagent's call")])).toEqual([v('no nudges for a subagent’s call')])
+})
+
+test('a verdict echoing a straight apostrophe as a curly one answers for the test asked', () => {
+  expect(asAsked(["the engine's cap"], [v('the engine’s cap')])).toEqual([v("the engine's cap")])
+})
+
+test('a verdict with an escaped quote, a long dash or doubled spaces answers for the test asked', () => {
+  const asked = ['keeps "quoted" text - as is', 'reads a file\'s tail']
+  expect(asAsked(asked, [v('keeps \\"quoted\\" text — as  is'), v("reads a file\\'s tail")]).map(x => x.name)).toEqual(asked)
+})
+
+test('a verdict that differs from the test asked by more than its punctuation keeps its own name', () => {
+  expect(asAsked(['adds two numbers'], [v('adds two number'), v('Adds two numbers')]).map(x => x.name)).toEqual(['adds two number', 'Adds two numbers'])
+})
+
+test('a verdict alike to two tests asked is given to neither', () => {
+  expect(asAsked(["it's done", 'it’s done'], [v('it‘s done')]).map(x => x.name)).toEqual(['it‘s done'])
+})
+
+test('a verdict under a loop\'s case keeps the case\'s name', () => {
+  expect(asAsked(['adds ${a} and ${b}'], [v('adds 1 and 2')]).map(x => x.name)).toEqual(['adds 1 and 2'])
 })

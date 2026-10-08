@@ -120,6 +120,27 @@ export const parseVerdicts = (text: string): { verdicts: { name: string; summary
 
 export type Graded = { name: string; summary: string; verdict: Verdict; reason: string }
 
+// a name as a model may echo it back: curly quotes straight, dashes plain, an escape's
+// backslash dropped, each run of space one
+const loose = (name: string): string =>
+  name
+    .replace(/[‘’‚‛′]/g, "'")
+    .replace(/[“”„‟″]/g, '"')
+    .replace(/[‐‑‒–—]/g, '-')
+    .replace(/…/g, '...')
+    .replace(/\\(['"`\\])/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+// each verdict under the name it was asked by: a verdict whose name differs from one asked
+// name alone only in its quotes, dashes, escapes or spacing answers for that test
+export const asAsked = <V extends { name: string }>(names: string[], verdicts: V[]): V[] =>
+  verdicts.map(v => {
+    if (among(names, v.name)) return v
+    const alike = [...new Set(names)].filter(n => !isTemplate(n) && loose(n) === loose(v.name))
+    return alike.length === 1 ? { ...v, name: alike[0]! } : v
+  })
+
 // the grader's reply limit, in tokens: a reply cut off there loses the verdicts it had not reached
 export const MAX_REPLY = 4000
 

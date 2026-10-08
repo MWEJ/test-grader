@@ -51,9 +51,10 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Three rounds per test.** A test still flagged after three rounds is reported once more, telling Claude to tell you what is left. After that, test-grader stops on it. Evidence the grader rejects counts as a round too.
 - **A suggestion after the turn.** When a turn ends with flagged tests Claude wrote, the prompt box offers "Fix the 2 flagged tests you wrote this session", once for each set of such tests. It is only a suggestion: nothing is sent unless you send it.
 - **The pane follows the files as they change.** Every 2 seconds, the listed test files are checked for changes made outside Claude's Write and Edit: by the shell, an editor or a checkout. Their new and removed tests show at once, and changed tests are graded again. A file whose modification time has not changed is not read again. Right after each shell command, and every 10 seconds otherwise, the project's test files are listed again: a new one shows ungraded, with no grader call, and a removed one leaves the pane with its grades. The same check runs at the end of each turn.
-- **Grade all tests** grades the whole project. It grades only the files that changed since their last grading. Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, then the flagged tests, worst first. No turn starts for it.
+- **Grade all tests** grades the whole project. It grades only the tests not rated yet: every test of a file changed since its last grading, and in an unchanged file only the tests with no verdict (the rated ones keep theirs). Rows waiting for the grader are marked *reviewing*. Files are read while the first ones are already being graded. A file git lists but that cannot be read (deleted, or too large) is passed over, and the pane says so. When the run finishes, its result goes to Claude as a note: the counts, then the flagged tests, worst first. No turn starts for it.
 - **Stop** cuts a run short. No more grader calls start, the tests not yet graded keep what they had, and the pane says how far the run got. The next run grades the rest.
 - **Regrade all** grades every file again, unchanged ones included.
+- **↻ Regrade** on a folder's, a file's or a suite's row grades just those files again, the rest of the project's grades left as they are. Claude's note names what was graded, as in "finished for src/api/".
 - **`/test-grader diff`** grades only the test files changed on this branch: against where it left `main` (or `master`), with the changes not committed yet and new files. The rest of the project's grades stay as they are.
 - **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, becomes one entry per case the loop generates. Graded again, each case is sent with its loop's code, and the grader is told which loop the case comes from.
 - **Tests of one name are told apart.** Two tests named alike in one file are named by the groups around them, as in `parser › empty input` and `lexer › empty input`. Failing that, they are named by their order: `works`, `works (2)`.
@@ -98,6 +99,8 @@ An unrated test says why on its row, in `test_grades` and in the report, as its 
 | The grader answered under a name no test was asked by | the names it used |
 | The grader left the test out | how many of the batch's verdicts it gave |
 | The grading failed outright | the error |
+
+A verdict whose name differs from one test's only in its quotes, dashes, escapes or spacing counts for that test: a grader often echoes `subagent’s` as `subagent's`. Two tests that read alike that way get neither verdict.
 
 The reason is kept with the grades, and goes once the test is graded. `test_evidence` answers with it too, when the grader gives no verdict on the evidence.
 
@@ -167,6 +170,17 @@ By default the tool lists the flagged tests, worst first, after a line of counts
 | `limit` | how many tests to list at most, 50 by default. The answer says how many it left out. |
 
 The tool reads the grades the pane shows and starts no grading. Tests still being graded are counted, and the answer says to ask again in a moment.
+
+#### Grading now: `test_grade`
+
+Claude can grade tests itself, as Grade all tests does, and wait for the result: the counts, then every flagged and unrated test. That answer is the tool's result, so no note follows. It asks for no permission.
+
+| Input | What it does |
+| --- | --- |
+| `path` | only the test files in this file or folder. The default is the whole project. |
+| `again` | grade every test in scope again, the rated ones too, as Regrade all does |
+
+By default it grades the tests not rated yet and keeps the grades that stand, so it is the way to retry unrated tests. While another run is under way it says so and grades nothing.
 
 #### Sending evidence: `test_evidence`
 
@@ -253,8 +267,14 @@ A reload of the mod does not lose grading in progress. If a run, a regrade or a 
 
 The mod is a Claude Code plugin made of one hooks module.
 
+- **From this repository:** the repository is its own marketplace (`.claude-plugin/marketplace.json`). At the prompt of a terminal session, run:
+
+  ```
+  /plugin install test-grader --marketplace MWEJ/test-grader
+  ```
+
+  Answer `y` to add the marketplace, then choose a scope (user scope loads it in every session, the desktop app's included), then set the options. It is active at once.
 - **For one session:** run `claude --plugin-dir /path/to/test-grader`.
-- **From this repository:** run `/plugin install test-grader --marketplace MWEJ/test-grader`. This needs a marketplace file in the repository.
 
 ## Development
 

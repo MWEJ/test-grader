@@ -50,6 +50,8 @@ export type ExistingRun = {
   isFresh?: boolean
   /** while running: a run of these files alone (their paths in the project), the rest left be */
   only?: string[]
+  /** while running: what a narrowed run grades, as Claude's note names it (a folder, the branch's changes) */
+  scope?: string
   /** what the last run's grader calls cost, in tokens: in (of them from the prompt cache) and out */
   spent?: { input: number; cached: number; output: number; cost?: number; unpriced?: number }
 }
