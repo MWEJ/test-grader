@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { mount, project, buttonsOf, appended, JEST_PROJECT, SUMMARY, jest } from './helpers'
+import type { Engine, On } from './helpers'
 
 test('Run coverage shows only in a project with a way to measure it; a report written by other means still shows its figures', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -211,8 +212,38 @@ test('a Go coverage run shows a statements bar for each package under the total,
   expect(packages).toEqual(['pkg/p0/', 'pkg/p1/', 'pkg/p2/', 'pkg/p3/', 'pkg/p4/', 'pkg/p5/', 'pkg/p6/', 'pkg/p7/'])
   expect(texts).toContain('0%')
   expect(texts).toContain('70%')
-  expect(texts).toContain('3 more packages, up to 100%')
+  expect(buttonsOf(await ui.drawn()).get('cov:packages')).toBe('▸ 3 more packages, up to 100%')
   expect(texts).not.toContain('pkg/p9/')
+})
+
+// a Go project of ten packages and a root one, its coverage run done and drawn
+const runTenPackages = async ($: Engine, on: On) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...GO_MODULE }
+  const blocks = Array.from({ length: 10 }, (_, i) => [`example.com/shop/pkg/p${i}/p.go:1.1,2.2 ${i} 1`, `example.com/shop/pkg/p${i}/p.go:3.1,4.2 ${10 - i} 0`]).flat()
+  project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = ['mode: set', 'example.com/shop/main.go:1.1,2.2 10 1', ...blocks, ''].join('\n')
+      return { stdout: '', exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  return ui
+}
+const packagesDrawn = async (ui: Awaited<ReturnType<typeof mount>>) => (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => /^pkg\/|^\.\/$/.test(t))
+
+test('pressing the packages left out shows every package, lowest first, and pressing again only the eight', async ($, on) => {
+  const ui = await runTenPackages($, on)
+  await ui.press({ key: 'cov:packages' })
+  expect(await packagesDrawn(ui)).toEqual(['pkg/p0/', 'pkg/p1/', 'pkg/p2/', 'pkg/p3/', 'pkg/p4/', 'pkg/p5/', 'pkg/p6/', 'pkg/p7/', 'pkg/p8/', 'pkg/p9/', './'])
+  expect(buttonsOf(await ui.drawn()).get('cov:packages')).toBe('▾ the 8 least covered only')
+
+  await ui.press({ key: 'cov:packages' })
+  expect(await packagesDrawn(ui)).toHaveLength(8)
+  expect(buttonsOf(await ui.drawn()).get('cov:packages')).toBe('▸ 3 more packages, up to 100%')
 })
 
 test('a Go coverage run that wrote no profile falls back to the mean of the figures it printed', async ($, on) => {
@@ -392,16 +423,39 @@ test('Run coverage pressed again while a run is under way starts no second run',
   await second
 })
 
-test('a session moved from a folder with no way to measure coverage to the project root offers Run coverage within one watch period', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000_000 })
-  // the session opens in the coverage report's folder, which holds no package.json
-  let where = '/proj/coverage'
-  project(on, { 'package.json': '{ "scripts": { "coverage": "node scripts/coverage.mjs" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }, { cwd: () => where })
-  await $.session.start({ source: 'startup', cwd: '/proj/coverage', surface: null, isInteractive: true } as never)
-  const ui = await mount($)
-  expect(buttonsOf(await ui.drawn()).has('run')).toBe(false)
+// a project whose coverage script is in its root, and one test file
+const SCRIPTED = { 'package.json': '{ "scripts": { "coverage": "node scripts/coverage.mjs" } }', 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" }
 
-  where = '/proj'
+test('a session that moves into a subfolder keeps the folder it started in: its coverage run and its tests', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  let where = '/proj'
+  const { prompts } = project(on, SCRIPTED, { cwd: () => where })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+
+  where = '/proj/src'
   await clock.advance(2_000)
   expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts.map(p => p.match(/Test file: (\S+)/)?.[1])).toEqual(['/proj/src/a.test.ts'])
+
+  // a reload of the mod starts the same session again: still the folder it started in
+  await $.session.start({ source: 'startup', cwd: '/proj/src', surface: null, isInteractive: true } as never)
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+})
+
+test('a new session takes the folder it starts in, not the last one\'s', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  let where = '/proj'
+  const { session } = project(on, SCRIPTED, { cwd: () => where })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  expect(buttonsOf(await ui.drawn()).get('run')).toBe('Run coverage')
+
+  // started in the report's folder, which holds no package.json: no coverage run to offer
+  session.id = 's2'
+  where = '/proj/coverage'
+  await $.session.start({ source: 'startup', cwd: '/proj/coverage', surface: null, isInteractive: true } as never)
+  expect(buttonsOf(await ui.drawn()).has('run')).toBe(false)
 })

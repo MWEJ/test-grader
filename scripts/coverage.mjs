@@ -3,17 +3,20 @@
 // instruments its hooks with Istanbul, runs the tests there, and has each test hand back the
 // counters (the module's through a command it answers, the test file's own from its global).
 // Usage: node scripts/coverage.mjs   (writes coverage/lcov.info and prints a table)
-import { execFileSync, spawnSync } from 'node:child_process'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { availableParallelism, tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
 const root = join(import.meta.dirname, '..')
 const work = mkdtempSync(join(tmpdir(), 'test-grader-cov-'))
-const deps = join(work, 'deps')
-mkdirSync(deps)
-execFileSync('npm', ['install', '--silent', '--prefix', deps, 'istanbul-lib-instrument@6', 'istanbul-lib-coverage@3', 'istanbul-lib-report@3', 'istanbul-reports@3'], { stdio: 'inherit' })
+// Istanbul, installed once and kept for later runs
+const deps = join(tmpdir(), 'test-grader-cov-deps')
+if (!existsSync(join(deps, 'node_modules', 'istanbul-reports'))) {
+  mkdirSync(deps, { recursive: true })
+  execFileSync('npm', ['install', '--silent', '--prefix', deps, 'istanbul-lib-instrument@6', 'istanbul-lib-coverage@3', 'istanbul-lib-report@3', 'istanbul-reports@3'], { stdio: 'inherit' })
+}
 const require = createRequire(join(deps, 'node_modules', 'x.js'))
 const { createInstrumenter } = require('istanbul-lib-instrument')
 const libCoverage = require('istanbul-lib-coverage')
@@ -63,24 +66,39 @@ const test = ((name: string, ...rest: any[]) => {
   writeFileSync(path, readFileSync(path, 'utf8').replace(/import \{ ([^}]*)\btest\b,? ?([^}]*)\} from 'claude-code\/testing'/, (_m, a, b) => `import { ${a}${b}} from 'claude-code/testing'${wrap}`))
 }
 
-// one test file at a time: the kit runs each file in a child of its own, and run together their
-// long counter lines can arrive cut into pieces. The others are set aside for each run, and the
-// kit writes its report to stderr, so both streams are read
+// each test file in a process of its own (--file), as many at once as the machine has cores:
+// one process's output is its file's alone, so the long counter lines of two files never
+// interleave. The kit writes its report to stderr, so both streams are read
 const files = readdirSync(tests).filter(f => /\.test\.tsx?$/.test(f))
-const outputs = []
-let passed = 0
-let failedCount = 0
-for (const name of files) {
-  for (const other of files) if (other !== name) renameSync(join(tests, other), join(tests, `${other}.off`))
-  const ran = spawnSync('claude', ['plugin', 'test', copy], { encoding: 'utf8', maxBuffer: 1 << 30 })
-  for (const other of files) if (other !== name) renameSync(join(tests, `${other}.off`), join(tests, other))
-  const out = `${ran.stdout ?? ''}\n${ran.stderr ?? ''}`
-  outputs.push(out)
-  passed += Number(out.match(/^ *(\d+) pass$/m)?.[1] ?? 0)
-  failedCount += Number(out.match(/^ *(\d+) fail$/m)?.[1] ?? 0)
+const runFile = name =>
+  new Promise(resolve => {
+    const child = spawn('claude', ['plugin', 'test', '--file', join(tests, name), copy])
+    // each stream on its own, so a line of one is never split by the other's
+    const out = []
+    const err = []
+    child.stdout.on('data', c => out.push(c))
+    child.stderr.on('data', c => err.push(c))
+    child.on('close', () => resolve(`${Buffer.concat(out).toString('utf8')}\n${Buffer.concat(err).toString('utf8')}`))
+    child.on('error', err => resolve(`(fail) ${name}: ${err.message}`))
+  })
+const outputs = new Array(files.length)
+let next = 0
+const worker = async () => {
+  while (next < files.length) {
+    const at = next++
+    outputs[at] = await runFile(files[at])
+  }
 }
+await Promise.all(Array.from({ length: Math.min(files.length, availableParallelism()) }, worker))
+// a file's results, from the report line the kit prints for --file
+const results = outputs.flatMap(out => {
+  const line = out.split('\n').find(l => l.startsWith('claude-plugin-test-report '))
+  return line ? JSON.parse(line.slice('claude-plugin-test-report '.length)).results : []
+})
+const passed = results.filter(r => r.failure === null).length
+const failedCount = results.length - passed
 const output = outputs.join('\n')
-const failed = output.split('\n').filter(line => line.startsWith('(fail)'))
+const failed = [...results.filter(r => r.failure !== null).map(r => `(fail) ${r.title}`), ...output.split('\n').filter(line => line.startsWith('(fail)'))]
 if (failed.length > 0) process.stderr.write(`${failed.join('\n')}\nthe tests failed under instrumentation: coverage is of the runs that finished\n`)
 const map = libCoverage.createCoverageMap({})
 // a line the kit's output cut off or interleaved is passed over: the counters only grow, so a

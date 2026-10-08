@@ -80,6 +80,8 @@ declare module 'claude-code' {
       seen: Record<string, string>
       /** the session the open and closed files are kept for: a new one starts them closed */
       openFor: string | null
+      /** the folder the session started in, which the pane lists and grades, for that session */
+      root: { session: string | null; dir: string } | null
       /** the project's coverage run as a note names it (npx jest --coverage); null: none test-grader knows */
       coverWith: string | null
       /** how many weak or useless grades in a row each test Claude wrote or edited has had, by file::name; a good one leaves */

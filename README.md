@@ -239,9 +239,13 @@ The pane offers **Run coverage** when it finds a way to measure it, in this orde
 
 It reads the figures from `coverage/coverage-summary.json`, `coverage/lcov.info`, `coverage.xml` or Go's coverage profile. It shows lines, statements, branches and functions where the report has them. From a per-file report, `coverage-summary.json` or `lcov.info`, it also sums the line coverage of each folder and shows it on the folder's row.
 
-Go measures statements alone, so a Go project shows statements and nothing else: Go has no line, branch or function figures to show. From the profile, the total is weighted by each file's statements, a block two test runs both cover counts once, and each folder's row shows its own statement coverage. Under the total, each package gets its own Statements bar, least covered first: the first eight, then how many more there are and the best of them. A package's bar is the coverage of all its tests together: Go measures a package's tests as one run, so a testify suite gets no figure of its own. A run that wrote no profile falls back to the plain mean of the per-package figures `go test` printed.
+Go measures statements alone, so a Go project shows statements and nothing else: Go has no line, branch or function figures to show. From the profile, the total is weighted by each file's statements, a block two test runs both cover counts once, and each folder's row shows its own statement coverage. Under the total, each package gets its own Statements bar, least covered first: the first eight, then how many more there are and the best of them. Press that line to show every package; press again for the eight alone. A package's bar is the coverage of all its tests together: Go measures a package's tests as one run, so a testify suite gets no figure of its own. A run that wrote no profile falls back to the plain mean of the per-package figures `go test` printed.
 
-The pane follows the report: one written by a run outside the pane, from the shell or CI, shows within 2 seconds. The run is found as the session starts, and found again within 2 seconds when the session moves to another folder.
+The pane follows the report: one written by a run outside the pane, from the shell or CI, shows within 2 seconds. The run is found as the session starts.
+
+#### The project is the folder the session started in
+
+The pane lists, grades and measures coverage for the folder the session started in. A session that later moves into a subfolder, as when Claude changes directory to run a command, keeps that folder: its tests, its coverage run and its rules. A reload of the mod or a compaction keeps it too. A new session takes the folder it starts in.
 
 When a run finishes, Claude is told the figures in a note, along with the least covered folders: up to five of them, each under 80% with at least 20 lines. When a run fails, Claude is told how it failed, with the last lines it printed.
 
@@ -290,10 +294,10 @@ The tests live in `tests/`, one file per area: the pane, Grade all, the grader, 
 
 1. It copies the mod to a temporary folder.
 2. It instruments the hooks with Istanbul.
-3. It runs the tests there one file at a time, with each test handing back the counters. Run together, the kit's children cut each other's long output lines.
+3. It runs each test file in a process of its own (`claude plugin test --file`), as many at once as the machine has cores, with each test handing back the counters. One process's output is one file's alone, so the long counter lines never interleave.
 4. It prints a table, and writes `coverage/lcov.info` and `coverage/coverage-summary.json`.
 
-It needs Node and npm, and installs the Istanbul libraries into the temporary folder.
+It needs Node and npm. It installs the Istanbul libraries once, into `test-grader-cov-deps` in the system's temporary folder, and reuses them on later runs.
 
 The engine keeps every function that is handed the engine interface `$` in `hooks/register.tsx`, so only code that never touches `$` lives in other files.
 

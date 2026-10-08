@@ -30,6 +30,7 @@ const fileOpen = atom({ plugin: 'test-grader', key: 'fileOpen' } as const, {})
 const openError = atom({ plugin: 'test-grader', key: 'openError' } as const, null)
 const seen = atom({ plugin: 'test-grader', key: 'seen' } as const, {})
 const openFor = atom({ plugin: 'test-grader', key: 'openFor' } as const, null)
+const root = atom({ plugin: 'test-grader', key: 'root' } as const, null)
 const rounds = atom({ plugin: 'test-grader', key: 'rounds' } as const, {})
 const outbox = atom({ plugin: 'test-grader', key: 'outbox' } as const, { accepted: [], going: [], spent: [] })
 const coverWith = atom({ plugin: 'test-grader', key: 'coverWith' } as const, null)
@@ -53,6 +54,8 @@ const CELLS = 12
 // Go's package bars: how many show, and how wide their labels may be
 const PACKAGE_BARS = 8
 const PACKAGE_LABEL = 28
+// where the pane keeps whether every package is shown
+const ALL_PACKAGES = 'cov:packages'
 // Grade all tests: cases per grader call
 const BATCH = 10
 // grader calls in flight at once, from the graderWorkers setting (1 to 20), 10 by default
@@ -143,7 +146,7 @@ const RUBRIC_FILE = '.test-grader.md'
 const MAX_RULES = 4_000
 let projectRules = ''
 const readRules = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   projectRules = cwd ? ((await $.fs.read(`${cwd}/${RUBRIC_FILE}`).catch(() => '')) ?? '').trim().slice(0, MAX_RULES) : ''
 }
 
@@ -168,7 +171,7 @@ const codeUnderTest = async ($: EngineInterface, file: string, text: string): Pr
   const hash = fingerprint(text)
   const kept = underTestCache.get(file)
   if (kept?.hash === hash) return kept.text
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const paths = await candidatesFor($, file, text, cwd)
   const found: { path: string; text: string }[] = []
   for (const path of paths) {
@@ -426,7 +429,7 @@ const flush = async ($: EngineInterface): Promise<void> => {
   const { accepted, going, spent } = box
   if (accepted.length + going.length + spent.length === 0) return
   await update($, outbox, () => ({ accepted: [], going: [], spent: [] }))
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const lines = [
     ...(accepted.length > 0 ? ['Now graded strong (test-grader):', ...accepted.map(t => `- strong · ${shortPath(t.file, cwd)} · ${t.name}`)] : []),
     ...(going.length > 0 ? ['Tests that need work (test-grader):', ...flaggedLines(going, cwd), FOLLOW_UP] : []),
@@ -518,7 +521,7 @@ const mtime = async ($: EngineInterface, path: string): Promise<number | null> =
 }
 
 const readCoverage = async ($: EngineInterface): Promise<Coverage | null> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
   const lcovPath = `${cwd}/coverage/lcov.info`
   const xmlPath = `${cwd}/coverage.xml`
@@ -604,7 +607,7 @@ const GO_PROFILE = '.test-grader-go-cover.out'
 const REPORTS = ['coverage/coverage-summary.json', 'coverage/lcov.info', 'coverage.xml', GO_PROFILE, '.test-grader-go-coverage.txt']
 let reportsAt = ''
 const refreshCoverageIfChanged = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const at = (await Promise.all(REPORTS.map(r => mtime($, `${cwd}/${r}`)))).join(',')
   if (at === reportsAt) return
   reportsAt = at
@@ -638,7 +641,7 @@ const detectCommand = async ($: EngineInterface, cwd: string): Promise<CoverComm
 }
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const setRun = (state: 'idle' | 'running' | 'failed', message?: string) => update($, run, () => ({ state, message }))
   try {
     const command = await detectCommand($, cwd)
@@ -685,7 +688,7 @@ const isHeld = (t: { name: string; evidence?: string; evidenceOf?: string }, tex
   Boolean(t.evidence && t.evidenceOf && t.evidenceOf === ownText(text, t.name, file))
 
 const saveGrades = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   if (!cwd) return
   const run = await read($, existing)
   const saved: SavedGrades = {
@@ -715,7 +718,7 @@ const saveGrades = async ($: EngineInterface): Promise<void> => {
 const loadGrades = async ($: EngineInterface): Promise<void> => {
   const run = await read($, existing)
   if (run.hashes || run.results.some(t => !t.isUngraded)) return
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   if (!cwd) return
   const kept = (await $.store.get(gradesKey(cwd)).catch(() => undefined)) as KeptGrades | SavedGrades | undefined
   if (!kept || !('v' in kept ? kept.files : Array.isArray(kept.results))) return
@@ -745,7 +748,7 @@ const gradeAll = ($: EngineInterface, options: RunOptions = {}): Promise<string>
 const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, isQuiet = false }: RunOptions): Promise<string> => {
   const before = await read($, existing)
   if (before.state === 'running') return 'Grading is already under way; wait for it to finish.'
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const fail = async (message: string): Promise<string> => {
     await update($, existing, () => ({ state: 'failed' as const, done: 0, total: 0, message, results: before.results, hashes: before.hashes }))
     return message
@@ -1045,7 +1048,7 @@ const readAt = new Map<string, number>()
 // means is compared with it test by test, so only the tests it touched are graded again
 const lastText = new Map<string, string>()
 const catchUp = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const run = await read($, existing)
   const files = [...new Set([...(await read($, tests)).map(t => t.file), ...run.results.map(t => t.file)])].filter(f => cwd !== '' && f.startsWith(`${cwd}/`))
   const last = await read($, seen)
@@ -1099,7 +1102,7 @@ const prune = async ($: EngineInterface): Promise<void> => {
 // The project's tests as the pane first shows them: every case of every test file git
 // tracks, with its result from before when it has one, ungraded otherwise. No grader call
 const listAll = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const listed = await testFiles($, cwd)
   if (listed === null) return
   const files = listed.map(rel => `${cwd}/${rel}`)
@@ -1127,7 +1130,7 @@ const listAll = async ($: EngineInterface): Promise<void> => {
 // A test file the pane does not list yet, made by the shell, an editor or a checkout, is
 // listed ungraded; a listed one git no longer has and that cannot be read leaves
 const listNew = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const listed = await testFiles($, cwd)
   if (listed === null) return
   const files = new Set(listed.map(rel => `${cwd}/${rel}`))
@@ -1167,13 +1170,22 @@ let checks = 0
 // the check under way: a timer's check is passed over while one runs; a listing one waits for it
 let checking: Promise<void> | null = null
 let watcher: Timer | null = null
-// What the session's folder offers, found as a session starts and again when the session moves
-// to another folder: its test runners, its coverage run (the pane offers Run coverage only
-// then), its report, and its rules
-let detectedFor: string | null = null
+// The project is the folder the session started in: a session that moves to a subfolder (cd
+// in a command, a tool changing its folder) keeps the same tests, coverage and rules. A
+// reload or compaction starts the same session again and keeps it; a new session takes its own
+const projectDir = async ($: EngineInterface): Promise<string> => (await read($, root))?.dir ?? (await $.session.cwd())
+const pinProject = async ($: EngineInterface): Promise<void> => {
+  const id = await $.session.id().catch(() => null)
+  const pinned = await read($, root)
+  if (pinned !== null && pinned.session === id) return
+  const dir = await $.session.cwd()
+  await update($, root, () => ({ session: id, dir }))
+}
+
+// What the project offers, found as a session starts: its test runners, its coverage run (the
+// pane offers Run coverage only then), its report, and its rules
 const detectProject = async ($: EngineInterface): Promise<void> => {
-  const cwd = await $.session.cwd()
-  detectedFor = cwd
+  const cwd = await projectDir($)
   runners = await detectRunners($, cwd).catch(() => ({}))
   await refreshCoverage($)
   const cover = await detectCommand($, cwd).catch(() => undefined)
@@ -1186,10 +1198,7 @@ const check = async ($: EngineInterface, isListing = false): Promise<void> => {
   const after = checking ?? Promise.resolve()
   const now = after.then(async () => {
     checks += 1
-    // a session moved to another folder: what that folder offers, and its tests listed now
-    const moved = (await $.session.cwd().catch(() => detectedFor)) !== detectedFor
-    if (moved) await detectProject($).catch(() => undefined)
-    if (moved || isListing || checks % LIST_EVERY === 0) await listNew($).catch(() => undefined)
+    if (isListing || checks % LIST_EVERY === 0) await listNew($).catch(() => undefined)
     await catchUp($).catch(() => undefined)
     await refreshCoverageIfChanged($).catch(() => undefined)
   })
@@ -1328,7 +1337,7 @@ const openInEditor = async ($: EngineInterface, file: string, name: string): Pro
       why = err instanceof Error ? err.message : String(err)
     }
   }
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   await update($, openError, () => `Couldn't open ${shortPath(file, cwd)} in an editor: ${why}`)
 }
 
@@ -1358,7 +1367,7 @@ const entriesOf = (graded: ExistingRun, list: TrackedTest[], edited: string[] = 
 
 // The test regraded with the session's evidence; its verdict replaces the one in both lists
 const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?: unknown; evidence?: unknown }): Promise<string> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const file = inProject(cwd, String(input.file ?? ''))
   const name = String(input.test ?? '')
   const evidence = String(input.evidence ?? '').trim().slice(0, EVIDENCE_MAX)
@@ -1421,7 +1430,7 @@ const RUN_TAIL = 12
 const RUN_TIMEOUT = 300_000
 type Ran = { isPassed: boolean; command: string; tail: string }
 const runOne = async ($: EngineInterface, file: string, name: string): Promise<Ran | string> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}.`
   const target = targetOf(cwd, file, text, name)
@@ -1445,7 +1454,7 @@ const runFromPane = async ($: EngineInterface, file: string, name: string): Prom
 }
 
 const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: unknown; mutate?: unknown; find?: unknown; replace?: unknown }): Promise<string> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const file = inProject(cwd, String(input.file ?? ''))
   const name = String(input.test ?? '')
   const target = inProject(cwd, String(input.mutate ?? ''))
@@ -1489,7 +1498,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
 }
 
 const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown }): Promise<string> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const asked = Array.isArray(input.verdicts) ? input.verdicts.filter((v): v is State => (LISTED as readonly unknown[]).includes(v)) : []
   const wanted = new Set<State>(asked.length > 0 ? asked : FLAGGED)
   const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '') : ''
@@ -1565,7 +1574,7 @@ const branchFiles = async ($: EngineInterface, cwd: string): Promise<{ base: str
 
 const gradeBranch = async ($: EngineInterface): Promise<string> => {
   if ((await read($, existing)).state === 'running') return 'Grading is already under way.'
-  const found = await branchFiles($, await $.session.cwd())
+  const found = await branchFiles($, await projectDir($))
   if (typeof found === 'string') return found
   if (found.files.length === 0) return `No test files changed against ${found.base}.`
   soon($, async () => void (await gradeAll($, { isFresh: true, only: found.files, scope: 'the files changed on this branch' })))
@@ -1576,7 +1585,7 @@ const gradeBranch = async ($: EngineInterface): Promise<string> => {
 // the answer. Short of again, the tests already rated in files unchanged since keep their grades
 const answerGrade = async ($: EngineInterface, input: { path?: unknown; again?: unknown }): Promise<string> => {
   if ((await read($, existing)).state === 'running') return 'Grading is already under way; wait for it to finish, then call test_grades.'
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   const given = typeof input.path === 'string' ? input.path.trim().replace(/\/+$/, '').replace(/^\.\//, '') : ''
   const abs = given === '' || given === '.' ? cwd : given.startsWith('/') ? given : `${cwd}/${given}`
   const isFresh = input.again === true
@@ -1593,7 +1602,7 @@ const answerGrade = async ($: EngineInterface, input: { path?: unknown; again?: 
 // The grades written out, for a review or CI: a Markdown page and its JSON, at the project's root
 const REPORT = 'test-grader-report'
 const writeReport = async ($: EngineInterface): Promise<string> => {
-  const cwd = await $.session.cwd()
+  const cwd = await projectDir($)
   if (!cwd) return 'No project folder to write the report to.'
   const entries = entriesOf(await read($, existing), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
   if (entries.length === 0) return 'No tests to report: Grade all tests grades the project first.'
@@ -1704,6 +1713,7 @@ export const register: Register = (on, options) => {
     await $.tool
       .register({ name: VERIFY_TOOL, description: VERIFY_DESCRIPTION, inputSchema: VERIFY_SCHEMA })
       .catch(error => $.ui.log(`test-grader: the verify tool could not be registered: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' }))
+    await pinProject($)
     await detectProject($)
     await renameGrades($).catch(() => undefined)
     await loadGrades($).catch(() => undefined)
@@ -1842,7 +1852,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
-    const cwd = await $.session.cwd()
+    const cwd = await projectDir($)
     // only this session's folder: a test written elsewhere is graded and told, not listed
     const list = (await read($, tests)).filter(t => cwd !== '' && t.file.startsWith(`${cwd}/`))
     const cov = await read($, coverage)
@@ -2092,8 +2102,10 @@ export const register: Register = (on, options) => {
     const packages = (cov?.byPackage ?? []).length > 1
       ? cov!.byPackage!.map(p => ({ name: p.name, pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name))
       : []
-    const packageBars = packages.slice(0, PACKAGE_BARS)
-    const packagesLeft = packages.slice(PACKAGE_BARS)
+    // the rest behind a press, kept open as a group is
+    const isAllPackages = filesOpen[ALL_PACKAGES] === true
+    const packageBars = isAllPackages ? packages : packages.slice(0, PACKAGE_BARS)
+    const packagesLeft = isAllPackages ? [] : packages.slice(PACKAGE_BARS)
     const packageWidth = Math.min(PACKAGE_LABEL, Math.max(9, ...packageBars.map(p => p.name.length)))
 
     return (
@@ -2128,7 +2140,12 @@ export const register: Register = (on, options) => {
               {packageBars.map(p => bar(`cov-pkg-${p.name}`, p.name, p.pct, packageWidth, 2)) as never}
               {packagesLeft.length > 0 && (
                 <Box marginLeft={2}>
-                  <Text color={MUTED}>{`${plural(packagesLeft.length, 'more package')}, up to ${Math.max(...packagesLeft.map(p => p.pct))}%`}</Text>
+                  <Button key={ALL_PACKAGES} plain label={`▸ ${plural(packagesLeft.length, 'more package')}, up to ${Math.max(...packagesLeft.map(p => p.pct))}%`} onPress={flip(ALL_PACKAGES, false)} />
+                </Box>
+              )}
+              {isAllPackages && packages.length > PACKAGE_BARS && (
+                <Box marginLeft={2}>
+                  <Button key={ALL_PACKAGES} plain label={`▾ the ${PACKAGE_BARS} least covered only`} onPress={flip(ALL_PACKAGES, true)} />
                 </Box>
               )}
               {!cov && <Text color={MUTED}>Run coverage to see the numbers.</Text>}
