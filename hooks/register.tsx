@@ -5,7 +5,7 @@ import type { Before, Confidence, Coverage, ExistingRun, ExistingTest, TrackedTe
 
 import { attr, byDirOf, coverageAnswer, coverageNote, kindAt, mergeParts, pct } from './coverage'
 import type { CoverCommand } from './coverage'
-import { TEST_FILE, among, ignoredBy, withoutTemplates, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
+import { TEST_FILE, among, byCase, caseOf, ignoredBy, uniqueRows, withoutTemplates, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, caseTextsOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
 import { goProfileOf, mergeProfile, moduleOf } from './gocover'
@@ -312,11 +312,12 @@ const MAX_SURVIVED = 3
 const MAX_SURVIVED_TESTS = 500
 const survivedOf = (all: Record<string, { change: string; textOf: string }[]>, file: string, text: string, names: string[]): string[] => {
   const own = ownTexts(text, file)
+  const cases = [...new Set(caseNames(text, file))]
   const lines = Object.entries(all).flatMap(([key, ms]) => {
     const at = key.indexOf('::')
     const [of, caseName] = [key.slice(0, at), key.slice(at + 2)]
     if (of !== file) return []
-    const name = names.find(n => fits(caseName, n))
+    const name = names.find(n => caseOf(cases, n) === caseName)
     if (name === undefined) return []
     return ms.map(m => `"${name}" still passed with ${m.change}${m.textOf === own(caseName) ? '' : ' (measured before its text last changed)'}`)
   })
@@ -604,11 +605,12 @@ const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, st
     // the file changed under the grade: graded again on its new text, not kept for the old
     if (tries < MAX_STALE && (await staleOf($, file, text, [...ids.values()])) !== null) return evaluateNow($, file, ids, model, tries + 1)
     const why = await unratedOf($, file)
+    const claimed = byCase([...new Set(ids.values())], verdicts)
     await update($, tests, list =>
       // a looped test becomes one entry per case it generates
       list.flatMap((t): TrackedTest[] => {
         if (!ids.has(t.id)) return [t]
-        const found = verdicts.filter(v => fits(t.name, v.name))
+        const found = claimed.get(t.name) ?? []
         if (found.length === 0) return [{ ...t, status: 'failed', ...why(t.name) }]
         return found.map((v, k) => ({
           ...t,
@@ -1109,7 +1111,8 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
         // tests a change touched are graded again, so a loop of fixes converges
         const isUntouched = (t: ExistingTest): boolean => !isFresh && t.verdict !== undefined && t.textOf !== undefined && t.textOf === ownNow(t.name)
         const held = kept.filter(t => isHeld(t, text, file) || (isSame && t.verdict !== undefined) || isUntouched(t))
-        const toGrade = names.filter(name => !held.some(t => fits(name, t.name)))
+        const owned = byCase(names, kept)
+        const toGrade = names.filter(name => !(owned.get(name) ?? []).some(t => held.includes(t)))
         if (held.length > 0) {
           entry.slots.push({ items: held, waiting: held, was: held, isDone: true })
           remembered += held.length
@@ -1117,7 +1120,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
         for (let at = 0; at < toGrade.length; at += BATCH) {
           const batch = toGrade.slice(at, at + BATCH)
           const was = batch.flatMap(name => {
-            const had = kept.filter(t => fits(name, t.name))
+            const had = owned.get(name) ?? []
             return had.length > 0 ? had : [{ file, name, isUngraded: true }]
           })
           const waiting = was.map(({ isUngraded: _, ...t }) => ({ ...t, isPending: true }))
@@ -1126,7 +1129,7 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
           owner.set(slot, entry)
           entry.left += 1
           // a file unchanged since: the grader sees the grades its tests had, to keep them steady
-          const graded = kept.filter(t => t.verdict !== undefined && batch.some(name => fits(name, t.name)))
+          const graded = batch.flatMap(name => owned.get(name) ?? []).filter(t => t.verdict !== undefined)
           const isSameText = before.hashes?.[file] === hash
           jobs.push({ file, text, batch, slot, prior: isSameText ? graded : [], edited: isSameText ? [] : graded })
         }
@@ -1164,9 +1167,10 @@ const gradeAllNow = async ($: EngineInterface, { isFresh = false, only, scope, i
         const suites = suitesOf(text, file)
         const why = await unratedOf($, file)
         const own = ownTexts(text, file)
+        const claimed = byCase(batch, verdicts)
         for (const name of batch) {
           const suite = suites.has(name) ? { suite: suites.get(name) } : {}
-          const found = verdicts.filter(v => fits(name, v.name))
+          const found = claimed.get(name) ?? []
           if (found.length === 0) slot.items.push({ file, name, ...suite, ...why(name) })
           for (const v of found) {
             const had = edited.find(t => t.name === v.name)
@@ -1384,7 +1388,9 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
     // the tests whose text changed; every one, where the file's text before is not known
     await refresh($, file, prior !== undefined ? changedCases(prior, text, file) : names)
     const known = [...(await read($, tests)).filter(t => t.file === file), ...(await readRun($)).results.filter(t => t.file === file)].map(t => t.name)
-    const fresh = [...new Set(names)].filter(n => !among(known, n) && !known.some(k => fits(n, k)))
+    // a case is known when a row is its own: a loop named only by its row fits every name
+    const owned = byCase([...new Set(names)], known.map(name => ({ name })))
+    const fresh = [...new Set(names)].filter(n => owned.get(n)!.length === 0)
     if (fresh.length > 0) await track($, file, fresh)
   }
 }
@@ -1408,8 +1414,14 @@ const prune = async ($: EngineInterface): Promise<void> => {
   const present = new Map<string, string[]>()
   for (const file of files) present.set(file, await $.fs.read(file).then(text => caseNames(text, file), () => []))
   const isThere = (t: { file: string; name: string }): boolean => among(present.get(t.file) ?? [], t.name)
-  await update($, tests, list => list.filter(t => t.status === 'pending' || isThere(t)))
-  await updateRun($, r => ({ ...r, results: withoutTemplates(r.results.filter(isThere)) }))
+  await updateRun($, r => ({ ...r, results: uniqueRows(withoutTemplates(r.results.filter(isThere))) }))
+  // a template the session tracked, its grading done, gives way to its cases' rows in either list
+  const results = (await readRun($)).results
+  await update($, tests, list => {
+    const kept = list.filter(t => t.status === 'pending' || isThere(t))
+    const done = withoutTemplates(kept.filter(t => t.status !== 'pending'), [...kept, ...results])
+    return kept.filter(t => t.status === 'pending' || done.includes(t))
+  })
   await saveGrades($)
 }
 
@@ -1435,13 +1447,15 @@ const listAll = async ($: EngineInterface): Promise<void> => {
     hashes[file] = fingerprint(text)
     lastText.set(file, text)
     const suites = suitesOf(text, file)
-    for (const name of new Set(caseNames(text, file))) {
-      const had = run.results.filter(t => t.file === file && fits(name, t.name))
+    const names = [...new Set(caseNames(text, file))]
+    const owned = byCase(names, run.results.filter(t => t.file === file))
+    for (const name of names) {
+      const had = owned.get(name) ?? []
       cases.push(...(had.length > 0 ? had : [{ file, name, isUngraded: true, ...(suites.has(name) ? { suite: suites.get(name) } : {}) }]))
     }
   }
   const isListed = new Set(Object.keys(hashes))
-  await updateRun($, r => (r.state === 'running' ? r : { ...r, results: [...withoutTemplates(cases), ...r.results.filter(t => !isListed.has(t.file))] }))
+  await updateRun($, r => (r.state === 'running' ? r : { ...r, results: uniqueRows([...withoutTemplates(cases), ...r.results.filter(t => !isListed.has(t.file))]) }))
   // a file never seen nor graded is seen as it is now; a graded one keeps its last grading's
   // fingerprint, so a change made between sessions is still caught at a turn's end
   await update($, seen, all => ({ ...Object.fromEntries(Object.entries(hashes).filter(([f]) => !run.hashes?.[f])), ...all }))
@@ -1725,7 +1739,7 @@ const answerEvidence = async ($: EngineInterface, input: { file?: unknown; test?
   if (!evidence) return 'No evidence was given. Nothing was regraded.'
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was regraded.`
-  const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
+  const caseName = caseOf([...new Set(caseNames(text, file))], name)
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was regraded.`
   return regradeOnEvidence($, file, text, name, caseName, evidence)
 }
@@ -1808,7 +1822,8 @@ const baseOf = async ($: EngineInterface, cwd: string, file: string): Promise<{ 
 
 // a test as its runner names it, found in its file as it is now
 const targetOf = (cwd: string, file: string, text: string, name: string): RunTarget | null => {
-  const found = casesIn(text, file).find(c => fits(c.name, name))
+  const cases = casesIn(text, file)
+  const found = cases.find(c => c.name === name) ?? cases.find(c => fits(c.name, name))
   if (!found) return null
   const suite = suitesOf(text, file).get(found.plain)
   return { rel: shortPath(file, cwd), kind: kindOf(file), plain: found.plain, groups: found.groups, line: text.slice(0, found.opens).split('\n').length, ...(suite ? { suite } : {}) }
@@ -1855,7 +1870,7 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
   if (find === '' || find === replace) return 'The mutation changes nothing: give the text to find and a different text to replace it with. Nothing was run.'
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}. Nothing was run.`
-  const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
+  const caseName = caseOf([...new Set(caseNames(text, file))], name)
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}. Nothing was run.`
   const original = await $.fs.read(target).catch(() => null)
   if (original === null) return `There is no file ${shortPath(target, cwd)} to mutate. Nothing was run.`
@@ -1965,7 +1980,7 @@ const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; pat
   const files = [...namedFiles('The last run graded again, changed since their last grading', (last.changed ?? []).filter(inScopeFile)), ...namedFiles('The last run graded for the first time', (last.added ?? []).filter(inScopeFile))]
   const runLines = isWritten || files.length === 0 ? '' : `\n${files.join('\n')}`
   if (chosen.length === 0) {
-    const hint = count('ungraded') > 0 ? ' Grade all tests in the Tests pane grades the ones never graded.' : ''
+    const hint = count('ungraded') > 0 ? ' Grade all tests in the Test Grader pane grades the ones never graded.' : ''
     return `${head}${runLines}\nNone is ${names}.${hint}${waiting}`
   }
   const shown = chosen.slice(0, limit)
@@ -2046,7 +2061,7 @@ const answerContext = async ($: EngineInterface, input: { file?: unknown; test?:
   const name = String(input.test ?? '')
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}.`
-  const caseName = [...new Set(caseNames(text, file))].find(n => fits(n, name))
+  const caseName = caseOf([...new Set(caseNames(text, file))], name)
   if (caseName === undefined) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
   const { source, underTest, ask } = await askOf($, file, text, [name])
   const last = entriesOf(await readRun($), await read($, tests)).find(t => t.file === file && t.name === name)
@@ -2220,7 +2235,7 @@ export const register: Register = (on, options) => {
       await update($, fileOpen, () => ({}))
       await update($, openFor, () => id)
     }
-    void $.ui.open({ id: PANE, title: 'Tests' })
+    void $.ui.open({ id: PANE, title: 'Test Grader' })
 
     return next(e)
   })
@@ -2229,7 +2244,7 @@ export const register: Register = (on, options) => {
   // /test-grader report writes the grades out
   on('command.run', { command: 'test-grader' }, async ($, e) => {
     const [verb] = e.args.trim().split(/\s+/)
-    await $.ui.open({ id: PANE, title: 'Tests' })
+    await $.ui.open({ id: PANE, title: 'Test Grader' })
     await refreshCoverage($)
     if (verb === 'diff') return { text: await gradeBranch($) }
     if (verb === 'report') return { text: await writeReport($) }
@@ -2257,7 +2272,8 @@ export const register: Register = (on, options) => {
       // before this hook runs) is not a grade: its test is graded like any other new one, once
       const listed = [...(await read($, tests)), ...(await readRun($)).results.filter(t => !t.isUngraded)].filter(t => t.file === e.file_path)
       const known = new Set([...listed.map(t => t.name), ...(prior === null || prior === e.content ? [] : caseNames(prior, e.file_path))])
-      const fresh = names.filter(n => !known.has(n) && !(isTemplate(n) && [...known].some(k => fits(n, k))))
+      const owned = byCase([...new Set(names)], [...known].map(name => ({ name })))
+      const fresh = names.filter(n => owned.get(n)!.length === 0)
       if (fresh.length > 0) await updateRun($, r => ({ ...r, results: r.results.filter(t => !(t.isUngraded && t.file === e.file_path && fresh.includes(t.name))) }))
       // a file written over: only the tests whose text changed are touched
       await refresh($, e.file_path, prior !== null && prior !== e.content ? changedCases(prior, e.content, e.file_path) : names)
@@ -2717,6 +2733,16 @@ export const register: Register = (on, options) => {
             )}
           </Box>
         </Box>
+      </Box>
+    )
+  }).catch(($, e, next) => {
+    // a drawing that threw or ran past its time says so, rather than leaving the pane blank
+    const why = next.error.kind === 'timeout' ? 'it took too long' : (next.error.message ?? next.error.kind)
+    $.ui.log(`test-grader: the pane could not be drawn: ${why}`, { to: 'debug' })
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        <Text color={RED}>{`test-grader could not draw this pane: ${why}. Please report it; the tools still work.`}</Text>
       </Box>
     )
   })

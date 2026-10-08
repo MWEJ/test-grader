@@ -326,6 +326,94 @@ test("a looped test's template row saved beside its graded cases leaves at the n
 })
 
 
+test("a looped test the session tracked under its template, its grading done, leaves at the next start once its cases are graded", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files = { 'src/l.test.ts': "it.each(['a', 'b'])('indexes %s', k => { expect(idx(k)).toBe(k) })\nit.each(['x'])('parses %s', k => { expect(parse(k)).toBe(k) })\n" }
+  const { store } = project(on, files)
+  store['grades:/proj'] = {
+    results: [
+      { file: '/proj/src/l.test.ts', name: 'indexes a', verdict: 'strong', summary: 'Checks a.', reason: 'strong a.' },
+      { file: '/proj/src/l.test.ts', name: 'indexes b', verdict: 'strong', summary: 'Checks b.', reason: 'strong b.' },
+      { file: '/proj/src/l.test.ts', name: 'parses x', verdict: 'strong', summary: 'Checks x.', reason: 'strong x.' },
+    ],
+    hashes: { '/proj/src/l.test.ts': fingerprint(files['src/l.test.ts']) },
+    finishedAt: 500_000,
+  }
+  // tracked by an older version, under its template: its grading failed
+  seedState(on, {
+    tests: [
+      { id: 't1', file: '/proj/src/l.test.ts', name: 'indexes %s', at: 1, status: 'failed' },
+    ],
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const answer = await askGrades($, { path: 'src', verdicts: ['unrated'] })
+  expect(answer).not.toContain('indexes %s')
+  expect(answer).toMatch(/^3 tests in src: 3 strong/)
+})
+
+
+// a plain test beside a loop named only by its row: '%s' fits every name in the file
+const BESIDE_LOOP = "it('plain', () => { expect(f(1)).toBe(1) })\nit.each([['a', 1]])('%s', (_n, v) => { expect(f(v)).toBe(v) })\n"
+const besideLoop = (rows: Record<string, unknown>[]) => ({
+  results: rows,
+  hashes: { '/proj/src/l.test.ts': fingerprint(BESIDE_LOOP) },
+  finishedAt: 500_000,
+})
+const PLAIN = { file: '/proj/src/l.test.ts', name: 'plain', verdict: 'strong', summary: 'Checks plain.', reason: 'strong plain.' }
+const ROW_A = { file: '/proj/src/l.test.ts', name: 'a', verdict: 'strong', summary: 'Checks a.', reason: 'strong a.' }
+
+test('a test beside a loop named only by its row is listed once at the start, and saved once by the Grade all after it', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { store } = project(on, { 'src/l.test.ts': BESIDE_LOOP })
+  store['grades:/proj'] = besideLoop([PLAIN, ROW_A])
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(unkeep(store['grades:/proj'] as never).results.map(t => t.name).sort()).toEqual(['a', 'plain'])
+})
+
+test('a test saved many times over by that fault is listed once', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { store } = project(on, { 'src/l.test.ts': BESIDE_LOOP })
+  store['grades:/proj'] = besideLoop([PLAIN, PLAIN, PLAIN, PLAIN, ROW_A, ROW_A])
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  expect(await askGrades($, { path: 'src' })).toMatch(/^2 tests in src: 2 strong/)
+  expect(unkeep(store['grades:/proj'] as never).results.map(t => t.name).sort()).toEqual(['a', 'plain'])
+})
+
+test("Grade all tests gives a test beside a loop named only by its row its own verdict, once, and the loop its case's", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts, store } = project(on, { 'src/l.test.ts': BESIDE_LOOP }, { expand: { '%s': ['a'] } })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(ASKED(prompts)).toEqual(['%s', 'plain'])
+  expect(await askGrades($, { path: 'src' })).toMatch(/^2 tests in src: 2 strong/)
+  expect(unkeep(store['grades:/proj'] as never).results.map(t => t.name).sort()).toEqual(['a', 'plain'])
+  // one row each in the pane, so no two rows share a key
+  expect([...buttonsOf(await ui.drawn()).keys()].filter(k => k.startsWith('r:')).sort()).toEqual(['r:/proj/src/l.test.ts:a', 'r:/proj/src/l.test.ts:plain'])
+})
+
+
+test("Grade all tests grades a loop named only by its row whose case has no verdict, though a rated test beside it fits its name", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const { prompts, store } = project(on, { 'src/l.test.ts': BESIDE_LOOP }, { expand: { '%s': ['a'] } })
+  store['grades:/proj'] = besideLoop([PLAIN, { file: '/proj/src/l.test.ts', name: 'a' }])
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(ASKED(prompts)).toEqual(['%s'])
+  expect(await askGrades($, { path: 'src' })).toMatch(/^2 tests in src: 2 strong/)
+})
+
+
 test('a test graded before own texts were kept gains its own on a run that finds its file unchanged, so a later change to a sibling grades the sibling alone', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const adds = "it('adds', () => { expect(add(1, 2)).toBe(3) })\n"

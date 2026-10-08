@@ -40,7 +40,7 @@ for (const surface of ['desktop', 'terminal'] as const) {
       surface,
       component: 'Pane',
       requestId: 'test-grader',
-      props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
+      props: { title: 'Test Grader', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
     })
     await ui.press({ key: `r:${FILE}:does nothing` })
     const tree = JSON.stringify(await ui.drawn())
@@ -67,7 +67,7 @@ test('a non-test file is ignored', async ($, on) => {
     surface: 'terminal',
     component: 'Pane',
     requestId: 'test-grader',
-    props: { title: 'Tests', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
+    props: { title: 'Test Grader', isFocused: false, bodyColumns: 60, placement: 'inline' } as never,
   })
   expect(JSON.stringify(await ui.drawn())).toContain('0 tests · 0 strong"')
 })
@@ -380,7 +380,7 @@ for (const [surface, perLine] of [
     await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
     const ui = await $.ui.mount({
       plugin: 'test-grader', surface, component: 'Pane', requestId: 'test-grader',
-      props: { title: 'Tests', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
+      props: { title: 'Test Grader', isFocused: false, bodyColumns: 50, placement: 'dock' }, viewport: { columns: 160, rows: 60 },
     } as never)
     await ui.press({ key: 'gradeAll' })
     await clock.advance(10)
@@ -500,4 +500,21 @@ test('an opened row\'s actions are drawn as buttons, apart from its text; the ti
   expect(buttons.get('gradeAll')).toEqual({ label: 'Grade all tests', plain: false })
   // the title that opens the row is read as text, not as a button
   expect(buttons.get('r:/proj/src/v.test.ts:a shallow check')).toEqual({ label: 'a shallow check', plain: true })
+})
+
+test('a pane whose drawing fails says why, in place of a blank pane', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  project(on, { 'src/a.test.ts': "it('adds', () => { expect(add(1, 2)).toBe(3) })\n" })
+  // after the start, the rows pressed open read back as no list at all
+  let isBroken = false
+  on('state.get', async (_$, e, next) => {
+    if (isBroken && (e as { key: string }).key === 'open') return { value: { value: 42, version: 1 } } as never
+    return next(e)
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  await clock.advance(10)
+  isBroken = true
+  const texts = (await (await mount($)).findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toHaveLength(1)
+  expect(texts[0]).toMatch(/^test-grader could not draw this pane: Type error\. Please report it; the tools still work\.$/)
 })

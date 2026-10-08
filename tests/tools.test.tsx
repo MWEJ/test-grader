@@ -137,7 +137,7 @@ test('test_grades before any grading says none is flagged, and how to grade the 
   await clock.advance(10)
 
   expect(await askGrades($)).toBe(
-    '4 tests: 0 strong, 4 never graded.\nNone is flagged or unrated. Grade all tests in the Tests pane grades the ones never graded.',
+    '4 tests: 0 strong, 4 never graded.\nNone is flagged or unrated. Grade all tests in the Test Grader pane grades the ones never graded.',
   )
   expect(prompts).toHaveLength(0)
 })

@@ -16,9 +16,9 @@ Shallow and brittle are opposite problems: a shallow test misses bugs, and a bri
 
 ## What it does
 
-### The Tests pane
+### The Test Grader pane
 
-The pane opens at session start, or with `/test-grader`. It shows:
+The pane opens at session start, or with `/test-grader`. If it can't be drawn, it says why in red instead of staying blank. It shows:
 
 - **Every test in the project.** It lists them from the start: tests in files git tracks, and new files git would track. They show as ungraded until they are graded. A `.test-grader-ignore` file at the project's root leaves test files out of the list and of grading, one pattern per line as `.gitignore` reads them: `.agents/` (a folder at any depth), `/legacy/old/` (from the root), `**/*.snap.test.ts`, and `#` for a comment. Copies of the project in git worktrees (`.worktrees/`, `.claude/worktrees/`) and `node_modules/` are always left out. Coverage leaves out the files the list names too, in its totals, folders and packages.
 - **Tests grouped by folder and file, worst first.** The pane draws the project's folders as a tree. Each folder's row shows the counts for every test beneath it, and its line coverage when a coverage report has it. A folder holding only one subfolder shares its row, as in `gateways/api/`. When tests sit in a single folder, no folder row is drawn, and the list reads flat.
@@ -58,7 +58,7 @@ The pane opens at session start, or with `/test-grader`. It shows:
 - **Regrade all** grades every file again, unchanged ones included.
 - **↻ Regrade** on a folder's, a file's or a suite's row grades just those files again, the rest of the project's grades left as they are. Claude's note names what was graded, as in "finished for src/api/".
 - **`/test-grader diff`** grades only the test files changed on this branch: against where it left `main` (or `master`), with the changes not committed yet and new files. The rest of the project's grades stay as they are.
-- **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, or `it.each`'s `'adds %i and %i'` and `'$label maps to $code'`, becomes one entry per case the loop or table generates. Graded again, each case is sent with its loop's code, and the grader is told which loop the case comes from. A template's own row, saved by a version that graded a loop as one test, gives way to its cases' rows when the next session starts.
+- **Looped tests are graded case by case.** A test whose name is a template, like `` it(`rounds ${name}`) `` inside a loop, or `it.each`'s `'adds %i and %i'` and `'$label maps to $code'`, becomes one entry per case the loop or table generates. Graded again, each case is sent with its loop's code, and the grader is told which loop the case comes from. A template's own row, saved by a version that graded a loop as one test, gives way to its cases' rows when the next session starts. A loop named only by its row, `it.each(...)('%s')`, fits every test name in its file, so each graded row belongs to one case: its own name first, then the first loop it fits.
 - **Tests of one name are told apart.** Two tests named alike in one file are named by the groups around them, as in `parser › empty input` and `lexer › empty input`. Failing that, they are named by their order: `works`, `works (2)`.
 
 The grader is `haiku` by default: the alias, which Claude Code resolves to the Haiku its account, provider or gateway is set up with. It reviews up to 10 tests per call, with up to 10 calls at once.

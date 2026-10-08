@@ -20,7 +20,7 @@ it('does nothing', () => { expect(true).toBe(true) })
 
 
 // Grade all tests: the project as git tracks it, every case graded, the flagged listed
-export const PANE_PROPS = { title: 'Tests', isFocused: false, bodyColumns: 80, placement: 'inline' } as never
+export const PANE_PROPS = { title: 'Test Grader', isFocused: false, bodyColumns: 80, placement: 'inline' } as never
 
 export const mount = ($: Engine, rows = 60) =>
   $.ui.mount({ plugin: 'test-grader', surface: 'terminal', component: 'Pane', requestId: 'test-grader', props: PANE_PROPS, viewport: { columns: 80, rows } } as never)

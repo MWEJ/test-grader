@@ -340,11 +340,33 @@ export const fits = (template: string, name: string): boolean => {
 // whether a name the lists hold is still among a file's cases: itself, or a case of a loop
 export const among = (names: string[], name: string): boolean => names.some(n => fits(n, name))
 
+// Each row to one case of its file: its own name's, else the first template it fits. A loop
+// named only by its row, it.each(...)('%s'), fits every name in the file: matched by fit alone,
+// every other test's row would be counted again under it
+export const byCase = <T extends { name: string }>(names: string[], rows: T[]): Map<string, T[]> => {
+  const owned = new Map<string, T[]>(names.map(n => [n, []]))
+  const taken = new Set<T>()
+  for (const t of rows) if (owned.has(t.name)) (owned.get(t.name)!.push(t), taken.add(t))
+  for (const n of names) if (isTemplate(n)) for (const t of rows) if (!taken.has(t) && fits(n, t.name)) (owned.get(n)!.push(t), taken.add(t))
+  return owned
+}
+// the case a name is: its own, else the first loop it fits
+export const caseOf = (names: string[], name: string): string | undefined => names.find(n => n === name) ?? names.find(n => fits(n, name))
+// one row per test: a row a fault listed twice counts once
+export const uniqueRows = <T extends { file: string; name: string }>(rows: T[]): T[] => {
+  const seen = new Set<string>()
+  return rows.filter(t => {
+    const key = `${t.file}\u0000${t.name}`
+    return seen.has(key) ? false : (seen.add(key), true)
+  })
+}
+
 // A looped test's row under its template name, kept from before its cases were graded one by
-// one, gives way to those cases' rows: the test is counted once, not also as unrated
-export const withoutTemplates = <T extends { file: string; name: string }>(rows: T[]): T[] => {
+// one, gives way to those cases' rows (its own list's, or alongside, the other list's): the test
+// is counted once, not also as unrated
+export const withoutTemplates = <T extends { file: string; name: string }>(rows: T[], alongside: { file: string; name: string }[] = rows): T[] => {
   const cases = new Map<string, string[]>()
-  for (const t of rows) if (!isTemplate(t.name)) cases.set(t.file, [...(cases.get(t.file) ?? []), t.name])
+  for (const t of alongside) if (!isTemplate(t.name)) cases.set(t.file, [...(cases.get(t.file) ?? []), t.name])
   return rows.filter(t => !isTemplate(t.name) || !(cases.get(t.file) ?? []).some(n => fits(t.name, n)))
 }
 
