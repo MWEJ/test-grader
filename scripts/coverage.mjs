@@ -70,23 +70,46 @@ const test = ((name: string, ...rest: any[]) => {
 // one process's output is its file's alone, so the long counter lines of two files never
 // interleave. The kit writes its report to stderr, so both streams are read
 const files = readdirSync(tests).filter(f => /\.test\.tsx?$/.test(f))
+// every test's counters merged as its line arrives: each test runs a module of its own, so each
+// line holds that test's counters alone, and the whole output is too long to keep. A line the kit
+// cut off or interleaved is passed over and counted
+const map = libCoverage.createCoverageMap({})
+let cut = 0
 const runFile = name =>
   new Promise(resolve => {
     const child = spawn('claude', ['plugin', 'test', '--file', join(tests, name), copy])
-    // each stream on its own, so a line of one is never split by the other's
-    const out = []
-    const err = []
-    child.stdout.on('data', c => out.push(c))
-    child.stderr.on('data', c => err.push(c))
-    // each output whole is too long to keep for every file: its report line, its (fail) lines, and
-    // its last counter line, which holds all the earlier ones did, the counters only growing
+    const kept = []
+    // each stream read on its own, line by line, so a line of one is never split by the other's
+    const reader = () => {
+      let rest = ''
+      const take = line => {
+        if (line.startsWith('__COV__')) {
+          try {
+            map.merge(JSON.parse(line.slice('__COV__'.length)))
+          } catch {
+            cut += 1
+          }
+        } else if (line.startsWith('claude-plugin-test-report ') || line.startsWith('(fail)')) kept.push(line)
+      }
+      return {
+        data: chunk => {
+          const lines = (rest + chunk.toString('utf8')).split('\n')
+          rest = lines.pop() ?? ''
+          for (const line of lines) take(line)
+        },
+        end: () => rest && take(rest),
+      }
+    }
+    const out = reader()
+    const err = reader()
+    child.stdout.on('data', out.data)
+    child.stderr.on('data', err.data)
     child.on('close', () => {
-      const lines = `${Buffer.concat(out).toString('utf8')}\n${Buffer.concat(err).toString('utf8')}`.split('\n')
-      const kept = lines.filter(l => l.startsWith('claude-plugin-test-report ') || l.startsWith('(fail)'))
-      const counters = lines.filter(l => l.startsWith('__COV__'))
-      resolve({ kept, counters: counters.slice(-2) })
+      out.end()
+      err.end()
+      resolve(kept)
     })
-    child.on('error', err => resolve({ kept: [`(fail) ${name}: ${err.message}`], counters: [] }))
+    child.on('error', error => resolve([`(fail) ${name}: ${error.message}`]))
   })
 const outputs = new Array(files.length)
 let next = 0
@@ -98,25 +121,14 @@ const worker = async () => {
 }
 await Promise.all(Array.from({ length: Math.min(files.length, availableParallelism()) }, worker))
 // a file's results, from the report line the kit prints for --file
-const results = outputs.flatMap(out => {
-  const line = out.kept.find(l => l.startsWith('claude-plugin-test-report '))
+const results = outputs.flatMap(kept => {
+  const line = kept.find(l => l.startsWith('claude-plugin-test-report '))
   return line ? JSON.parse(line.slice('claude-plugin-test-report '.length)).results : []
 })
 const passed = results.filter(r => r.failure === null).length
 const failedCount = results.length - passed
-const failed = [...results.filter(r => r.failure !== null).map(r => `(fail) ${r.title}`), ...outputs.flatMap(out => out.kept.filter(line => line.startsWith('(fail)')))]
+const failed = [...results.filter(r => r.failure !== null).map(r => `(fail) ${r.title}`), ...outputs.flatMap(kept => kept.filter(line => line.startsWith('(fail)')))]
 if (failed.length > 0) process.stderr.write(`${failed.join('\n')}\nthe tests failed under instrumentation: coverage is of the runs that finished\n`)
-const map = libCoverage.createCoverageMap({})
-// a line the kit's output cut off or interleaved is passed over: the counters only grow, so a
-// later line from the same file holds what it did
-let cut = 0
-for (const line of outputs.flatMap(out => out.counters)) {
-  try {
-    map.merge(JSON.parse(line.slice('__COV__'.length)))
-  } catch {
-    cut += 1
-  }
-}
 if (cut > 0) process.stderr.write(`${cut} counter lines arrived cut off and were passed over\n`)
 console.log(`${passed} pass, ${failedCount} fail, over ${files.length} test files`)
 const dir = join(root, 'coverage')
