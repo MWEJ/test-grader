@@ -120,6 +120,10 @@ declare module 'claude-code' {
       ranRecord: { at: number; measured: string[]; by: Record<string, Record<string, 'passed' | 'failed' | 'skipped'>>; tagsBy?: Record<string, string[]> } | null
       /** the mutations test_verify measured a test let through, by file::name: the change, and the test's own text then */
       survived: Record<string, { change: string; textOf: string }[]>
+      /** the change to the code each strong grade named as the bug its test would catch, by file::name; textOf: the test's own text then */
+      proposed: Record<string, { bug: string; file: string; find: string; replace: string; textOf: string }>
+      /** what the background run measured of those changes, by file::name: held (the test failed), through (it passed: graded shallow) or unmeasured, why */
+      measuredStrong: Record<string, { state: 'held' | 'through' | 'unmeasured'; change: string; textOf: string; why?: string }>
       /** why each test its last grader call gave no verdict got none, by file::name; a verdict clears it */
       unrated: Record<string, string>
       /** why the last grader call gave no answer, with its model, until one answers */

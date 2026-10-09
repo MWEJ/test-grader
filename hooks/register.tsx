@@ -8,6 +8,8 @@ import type { CoverCommand, PackageTests, PackageView } from './coverage'
 import { TEST_FILE, among, byCase, caseOf, ignoredBy, uniqueRows, withoutTemplates, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, caseTextsOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
+import { MAX_PROPOSED, changeOf, measuredLine, mutate, overlayOf, pickToMeasure, throughGrade } from './measure'
+import type { Measured, Proposed } from './measure'
 import { goProfileOf, isGenerated, isHelperName, mergeProfile, moduleOf, roleOf } from './gocover'
 import type { PackageRole } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
@@ -96,6 +98,8 @@ const survived = atom({ plugin: 'test-grader', key: 'survived' } as const, {})
 const modified = atom({ plugin: 'test-grader', key: 'modified' } as const, [])
 const layersFound = atom({ plugin: 'test-grader', key: 'layersFound' } as const, 0)
 const ranRecord = atom({ plugin: 'test-grader', key: 'ranRecord' } as const, null)
+const proposed = atom({ plugin: 'test-grader', key: 'proposed' } as const, {})
+const measuredStrong = atom({ plugin: 'test-grader', key: 'measuredStrong' } as const, {})
 
 const GREEN = '#4ade80'
 const AMBER = '#fbbf24'
@@ -482,6 +486,7 @@ const gradeCall = async ($: EngineInterface, file: string, text: string, names: 
         await update($, graderError, () => `The grader (${request.model}) answered with no verdict it could read: "${said.length > 160 ? `${said.slice(0, 160)}…` : said}".`)
       } else await update($, graderError, () => null)
       await noteWhy(name => unratedWhy(reply.text, verdicts, isCut, names, name, request.model))
+      await recordProposals($, file, text, verdicts).catch(() => undefined)
       return verdicts
     }
     if (attempt >= RETRIES || !isPassing(reply as never)) {
@@ -2088,15 +2093,17 @@ const runEnvIn = async ($: EngineInterface, cwd: string, env: Record<string, str
   const vars = { ...(await runEnvOf($, cwd)), ...env }
   return Object.keys(vars).length > 0 ? { env: vars } : {}
 }
-const runOne = async ($: EngineInterface, file: string, name: string, env: Record<string, string> = {}): Promise<Ran | string> => {
+const runOne = async ($: EngineInterface, file: string, name: string, env: Record<string, string> = {}, overlay?: string): Promise<Ran | string> => {
   const cwd = await projectDir($)
   const text = await $.fs.read(file).catch(() => null)
   if (text === null) return `There is no file ${shortPath(file, cwd)}.`
   const { base, runners: found } = await baseOf($, cwd, file)
   const target = targetOf(base, file, text, name)
   if (!target) return `There is no test named ${JSON.stringify(name)} in ${shortPath(file, cwd)}.`
-  const argv = runArgv(target, found)
-  if (!argv) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
+  const given = runArgv(target, found)
+  if (!given) return `test-grader knows no way to run one test of ${shortPath(file, cwd)} in this project.`
+  // a Go build can take a file from elsewhere, the source left as it is
+  const argv = overlay && given[0] === 'go' ? [...given.slice(0, 2), `-overlay=${overlay}`, ...given.slice(2)] : given
   const result = await $.process.run(argv, { cwd: base, timeoutMs: RUN_TIMEOUT, ...(await runEnvIn($, cwd, env)) })
   const command = base === cwd ? shown(argv) : `cd ${shortPath(base, cwd)} && ${shown(argv)}`
   const output = [result.stdout, result.stderr].join('\n')
@@ -2208,6 +2215,171 @@ const answerVerify = async ($: EngineInterface, input: { file?: unknown; test?: 
     EVIDENCE_MAX,
   )
   return `Measured: the test passes unchanged and fails with the mutation.${siblingsSaid.length > 0 ? ` ${siblingsSaid.join(' ')}` : ''} ${await regradeOnEvidence($, file, text, name, caseName, evidence, true)}`
+}
+
+// Strong grades measured in the background. Each strong grade names a bug its test would catch;
+// where the grader saw the code, the change that makes it is kept, and while the session is idle
+// a few are made and their tests run. A test that still passes let its named bug through and is
+// graded shallow. Go builds the changed file through -overlay, its source never touched; other
+// languages change the file itself for the run, only when the person turns that on, since any
+// other session or worker in the same folder would see the change
+const MEASURE_EACH_IDLE = 3
+const MEASURE_DELAY = 5_000
+// a change left in a file by a run cut off (a reload, a crash), put back at the next start: its
+// owner's session, or any older than this
+const MUTATING_KEY = 'mutating'
+const MUTATING_STALE = 15 * 60_000
+let isMeasureOn = true
+let isInPlaceOn = false
+let isMeasuringStrong = false
+let isTurnRunning = false
+// the file changed in place for a run under way: put back the moment a turn or a tool call starts
+let inPlace: { target: string; original: string; mutated: string } | null = null
+let wasCutShort = false
+
+// the changes the grader named for these strong tests, kept to measure; any other grade drops one
+const recordProposals = async ($: EngineInterface, file: string, text: string, verdicts: Graded[]): Promise<void> => {
+  const cwd = await projectDir($)
+  const own = ownTexts(text, file)
+  await update($, proposed, all => {
+    const next: Record<string, Proposed> = { ...all }
+    for (const v of verdicts) {
+      const key = roundKey(file, v.name)
+      delete next[key]
+      const c = v.catches
+      if (v.verdict === 'strong' && c?.file && c.find !== undefined && c.replace !== undefined) next[key] = { bug: c.bug, file: inProject(cwd, c.file), find: c.find, replace: c.replace, textOf: own(v.name) }
+    }
+    const entries = Object.entries(next)
+    return entries.length > MAX_PROPOSED ? Object.fromEntries(entries.slice(-MAX_PROPOSED)) : next
+  })
+}
+
+const mutatingKey = async ($: EngineInterface): Promise<string> => `${MUTATING_KEY}:${(await $.session.id().catch(() => null)) ?? 'none'}`
+
+// a file changed in place put back, unless it has changed since: then it is told, not overwritten
+const putBack = async ($: EngineInterface, r: { target: string; original: string; mutated: string }): Promise<void> => {
+  const now = await $.fs.read(r.target).catch(() => null)
+  if (now === r.mutated) await $.fs.write(r.target, r.original)
+  else if (now !== r.original) $.ui.toast(`test-grader changed ${r.target} to measure a test, and it has changed again since: check it.`)
+}
+const revertInPlace = async ($: EngineInterface): Promise<void> => {
+  const r = inPlace
+  if (r === null) return
+  inPlace = null
+  wasCutShort = true
+  await putBack($, r).catch(() => undefined)
+  await $.store.delete(await mutatingKey($)).catch(() => undefined)
+}
+const restoreLeftChanges = async ($: EngineInterface): Promise<void> => {
+  const own = await mutatingKey($)
+  const now = await $.clock.now()
+  for (const key of (await $.store.keys()).filter(k => k.startsWith(`${MUTATING_KEY}:`))) {
+    const r = (await $.store.get(key)) as { target: string; original: string; mutated: string; at: number } | undefined
+    if (r && key !== own && now - r.at < MUTATING_STALE) continue
+    if (r) await putBack($, r).catch(() => undefined)
+    await $.store.delete(key)
+  }
+}
+
+const recordMeasured = async ($: EngineInterface, key: string, m: Measured): Promise<void> => {
+  await update($, measuredStrong, all => {
+    const { [key]: _, ...rest } = all
+    const entries = Object.entries({ ...rest, [key]: m })
+    return entries.length > MAX_PROPOSED ? Object.fromEntries(entries.slice(-MAX_PROPOSED)) : Object.fromEntries(entries)
+  })
+}
+
+// a test that let its named bug through: graded shallow, the change kept for its next grading,
+// and told to Claude where Claude wrote it
+const markThrough = async ($: EngineInterface, file: string, name: string, text: string, p: Proposed, change: string): Promise<void> => {
+  const judged = { ...throughGrade(p.bug, change), confidence: undefined, evidence: undefined, evidenceOf: undefined }
+  await updateRun($, r => ({ ...r, results: r.results.map(t => (t.file === file && t.name === name ? { ...t, ...judged } : t)) }))
+  await update($, tests, list => list.map(t => (t.file === file && t.name === name && t.status !== 'pending' ? { ...t, ...judged } : t)))
+  await saveGrades($)
+  await update($, survived, all => {
+    const key = roundKey(file, name)
+    const kept = Object.entries({ ...all, [key]: [...(all[key] ?? []).filter(m => m.change !== change), { change, textOf: ownText(text, name, file) }].slice(-MAX_SURVIVED) })
+    return Object.fromEntries(kept.slice(-MAX_SURVIVED_TESTS))
+  })
+  if ((await read($, tests)).some(t => t.file === file && t.name === name)) await reportGrades($, [{ file, name, verdict: 'shallow', reason: judged.reason, before: { verdict: 'strong' } }])
+}
+
+// one strong test measured; false when a turn started under it and nothing was recorded
+const measureOne = async ($: EngineInterface, key: string, p: Proposed): Promise<boolean> => {
+  const cwd = await projectDir($)
+  const file = key.slice(0, key.indexOf('::'))
+  const name = key.slice(key.indexOf('::') + 2)
+  const unmeasured = async (why: string): Promise<boolean> => {
+    await recordMeasured($, key, { state: 'unmeasured', change: changeOf(p.find, p.replace, shortPath(p.file, cwd)), textOf: p.textOf, why })
+    return true
+  }
+  const text = await $.fs.read(file).catch(() => null)
+  if (text === null) return true
+  const caseName = caseOf([...new Set(caseNames(text, file))], name)
+  // a test changed since its grade waits for its next one
+  if (caseName === undefined || ownText(text, caseName, file) !== p.textOf) return true
+  if (TEST_FILE.test(p.file)) return unmeasured('the change named is to a test file')
+  const original = await $.fs.read(p.file).catch(() => null)
+  if (original === null) return unmeasured(`there is no file ${shortPath(p.file, cwd)}`)
+  const made = mutate(original, p.find, p.replace)
+  if ('why' in made) return unmeasured(made.why)
+  const change = changeOf(p.find, p.replace, shortPath(p.file, cwd))
+  const clean = await runOne($, file, caseName).catch(() => null)
+  if (isTurnRunning) return false
+  if (clean === null || typeof clean === 'string' || clean.isNoneRun || !clean.isPassed) return unmeasured('the test did not pass with the code unchanged')
+  let mutated: Ran | string | null
+  if (kindOf(file) === 'go') {
+    // a folder of the session's own: two sessions measuring at once each build their own change
+    const dir = `${((await $.env.get('TMPDIR')) || '/tmp').replace(/\/+$/, '')}/test-grader-overlay-${(await $.session.id().catch(() => null)) ?? 'none'}`
+    const copy = `${dir}/${p.file.slice(p.file.lastIndexOf('/') + 1)}`
+    await $.fs.write(copy, made.code)
+    await $.fs.write(`${dir}/overlay.json`, overlayOf(p.file, copy))
+    mutated = await runOne($, file, caseName, {}, `${dir}/overlay.json`).catch(() => null)
+  } else {
+    wasCutShort = false
+    inPlace = { target: p.file, original, mutated: made.code }
+    await $.store.set(await mutatingKey($), { ...inPlace, at: await $.clock.now() })
+    try {
+      await $.fs.write(p.file, made.code)
+      mutated = await runOne($, file, caseName).catch(() => null)
+    } finally {
+      const cut = wasCutShort
+      await revertInPlace($)
+      wasCutShort = cut
+    }
+  }
+  if (isTurnRunning || wasCutShort) return false
+  if (mutated === null || typeof mutated === 'string' || mutated.isNoneRun) return unmeasured('the run with the change ran no test')
+  if (!mutated.isPassed && isBuildFailure(mutated.tail)) return unmeasured('the change did not build')
+  if (!mutated.isPassed) {
+    await recordMeasured($, key, { state: 'held', change, textOf: p.textOf })
+    return true
+  }
+  await recordMeasured($, key, { state: 'through', change, textOf: p.textOf })
+  await markThrough($, file, name, text, p, change)
+  return true
+}
+
+// a few strong tests measured while nothing else is under way, until a turn starts
+const measureSome = async ($: EngineInterface): Promise<void> => {
+  if (!isMeasureOn || isMeasuringStrong || isTurnRunning || isMeasuring || working > 0) return
+  if (await isSubagentWorking($)) return
+  isMeasuringStrong = true
+  try {
+    const cwd = await projectDir($)
+    const all = await read($, proposed)
+    const isMeasurable = (file: string): boolean => cwd !== '' && file.startsWith(`${cwd}/`) && (kindOf(file) === 'go' || isInPlaceOn)
+    const strong = [
+      ...(await readRun($)).results.filter(t => t.verdict === 'strong' && isMeasurable(t.file)).map(t => ({ key: roundKey(t.file, t.name), textOf: t.textOf })),
+      ...(await read($, tests)).filter(t => t.status === 'done' && t.verdict === 'strong' && isMeasurable(t.file)).map(t => ({ key: roundKey(t.file, t.name), textOf: undefined })),
+    ]
+    for (const key of pickToMeasure(strong, all, await read($, measuredStrong), MEASURE_EACH_IDLE)) {
+      if (isTurnRunning || working > 0) return
+      if (!(await measureOne($, key, all[key]!).catch(() => true))) return
+    }
+  } finally {
+    isMeasuringStrong = false
+  }
 }
 
 const answerGrades = async ($: EngineInterface, input: { verdicts?: unknown; path?: unknown; limit?: unknown; written?: unknown; layer?: unknown; ran?: unknown }): Promise<string> => {
@@ -2421,6 +2593,8 @@ const SETTINGS: Record<string, (value: unknown) => void> = {
   graderModel: v => (graderModel = modelOf(v, DEFAULT_MODEL)),
   graderEscalate: v => (escalateModel = v === 'off' ? null : modelOf(v, '') || null),
   graderWorkers: v => (parallel = workersOf(v)),
+  measureStrong: v => (isMeasureOn = v !== false),
+  measureInPlace: v => (isInPlaceOn = v === true),
 }
 
 // The session's tools, registered at its start; registered again at a turn's end when the
@@ -2511,6 +2685,7 @@ export const register: Register = (on, options) => {
     await loadGrades($).catch(() => undefined)
     await loadRan($).catch(() => undefined)
     await endCutOff($).catch(() => undefined)
+    await restoreLeftChanges($).catch(() => undefined)
     await prune($).catch(() => undefined)
     $.clock.after(1, () => void listAll($).catch(() => undefined))
     watcher?.cancel()
@@ -2639,7 +2814,20 @@ export const register: Register = (on, options) => {
     return { sections: [...composed.sections, { id: 'test-grader:grading', text, scope: 'session' as const }] }
   })
 
+  // a turn starting stops the background measuring: a file changed in place goes back at once
+  on('turn.start', async ($, e, next) => {
+    isTurnRunning = true
+    await revertInPlace($)
+    return next(e)
+  })
+  on('tool.call', async ($, e, next) => {
+    if (inPlace !== null) await revertInPlace($)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   on('turn.complete', async ($, e, next) => {
+    isTurnRunning = false
+    $.clock.after(MEASURE_DELAY, () => void measureSome($).catch(() => undefined))
     await restoreTools($).catch(() => undefined)
     await suggestStrengthening($).catch(() => undefined)
     await refreshCoverage($)
@@ -2681,6 +2869,7 @@ export const register: Register = (on, options) => {
     // each test's layer, and whether the last coverage run ran it
     await read($, layersFound)
     const layerLine = layersLine(entries, cwd)
+    const measureLine = measuredLine(entries.filter(t => t.state === 'strong').map(t => roundKey(t.file, t.name)), await read($, measuredStrong))
     const record = await read($, ranRecord)
     const ranOf = new Map(entries.map(t => [`${t.file}:${t.name}`, ranStateOf(record, t.file, t.name, tagsAt(t.file))] as const))
     const ranLine = record ? notRunLine([...ranOf.values()], record.at, now, unbuiltTags(entries.filter(t => ranOf.get(`${t.file}:${t.name}`) === 'not built').map(t => t.file))) : null
@@ -2986,6 +3175,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" flexGrow={1}>
         <Text bold color={VIOLET}>{counts}</Text>
         {entries.length > 0 && <Text color={MUTED}>{layerLine}</Text>}
+        {measureLine !== null && <Text color={MUTED}>{measureLine}</Text>}
         {ranLine !== null && <Text color={isRanWarning ? AMBER : MUTED}>{ranLine}</Text>}
         {graded.state === 'failed' && <Text color={RED}>{graded.message ?? 'Grading failed.'}</Text>}
         {graded.state === 'idle' && graded.graded !== undefined && (

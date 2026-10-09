@@ -31,9 +31,9 @@ test('pressing an open test title again closes its grading details', async ($, o
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
   await ui.press({ key: 'r:/proj/a.test.ts:adds' })
-  expect((await ui.findAll({ type: 'Text' })).map(n => n.text)).toContain('strong because.')
+  expect((await ui.findAll({ type: 'Text' })).map(n => n.text)).toContain('strong because. It catches: a wrong result.')
   await ui.press({ key: 'r:/proj/a.test.ts:adds' })
-  expect((await ui.findAll({ type: 'Text' })).map(n => n.text)).not.toContain('strong because.')
+  expect((await ui.findAll({ type: 'Text' })).map(n => n.text)).not.toContain('strong because. It catches: a wrong result.')
   expect((await ui.findAll({ type: 'Button' })).map(n => n.props?.label)).toContain('adds')
 })
 

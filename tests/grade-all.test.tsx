@@ -291,7 +291,7 @@ test('a finished Grade all tests saves grades a later session reads back whole, 
   expect(unkeep(store['grades:/proj'] as never)).toEqual({
     results: [
       // with each test's own text as graded, fingerprinted: a later run keeps its grade while that is the same
-      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because.', textOf: fingerprint(files['src/a.test.ts']!.trimEnd()) },
+      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because. It catches: a wrong result.', textOf: fingerprint(files['src/a.test.ts']!.trimEnd()) },
       { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'shallow because. It would miss: a wrong edge.', textOf: fingerprint(files['src/b.test.ts']!.trimEnd()) },
     ],
     hashes: { '/proj/src/a.test.ts': fingerprint(files['src/a.test.ts']!), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) },
@@ -525,7 +525,7 @@ test('a new session lists the grades saved for its project, and Grade all tests 
   // what an earlier session saved, before a.test.ts gained a test
   store['grades:/proj'] = {
     results: [
-      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because.' },
+      { file: '/proj/src/a.test.ts', name: 'adds', verdict: 'strong', summary: 'Checks adds.', reason: 'strong because. It catches: a wrong result.' },
       { file: '/proj/src/b.test.ts', name: 'a shallow check', verdict: 'shallow', summary: 'Checks a shallow check.', reason: 'saved shallow.' },
     ],
     hashes: { '/proj/src/a.test.ts': fingerprint(before), '/proj/src/b.test.ts': fingerprint(files['src/b.test.ts']!) },
@@ -577,10 +577,10 @@ test('grades too many to keep whole are kept without their summaries; failing th
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   // whole, the value runs past the limit; lean, it fits
-  room.limit = 160
+  room.limit = 189
   await ui.press({ key: 'gradeAll' })
   await clock.advance(10)
-  expect((store['grades:/proj'] as { files: Record<string, { tests: string[][] }> }).files['/proj/src/a.test.ts']!.tests).toEqual([['adds', 'g', '', 'strong because.', '', '', '', '', fingerprint(files['src/a.test.ts']!.trimEnd())]])
+  expect((store['grades:/proj'] as { files: Record<string, { tests: string[][] }> }).files['/proj/src/a.test.ts']!.tests).toEqual([['adds', 'g', '', 'strong because. It catches: a wrong result.', '', '', '', '', fingerprint(files['src/a.test.ts']!.trimEnd())]])
   expect(logs).toContain('test-grader: the grades were kept without their summaries: test-grader: $.store.set: the store is full')
   expect(JSON.stringify(await ui.drawn())).not.toContain('could not be saved')
 
@@ -933,7 +933,7 @@ test('Regrade all shows the grader the grades an unchanged file had to keep, and
   expect(firstOf('same.test.ts')).toContain('These were graded before, on this same text: [{"name":"a shallow check","verdict":"shallow","reason":"shallow because. It would miss: a wrong edge."}]')
   const edited = firstOf('edited.test.ts')
   expect(edited).not.toContain('on this same text')
-  expect(edited).toContain('These were graded before their text last changed: [{"name":"adds","verdict":"strong","reason":"strong because."}]')
+  expect(edited).toContain('These were graded before their text last changed: [{"name":"adds","verdict":"strong","reason":"strong because. It catches: a wrong result."}]')
   expect(edited).toContain('Where a change met the earlier concern, say so in reason.')
 })
 

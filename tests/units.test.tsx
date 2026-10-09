@@ -219,8 +219,8 @@ test('a reply with no list in it holds no verdicts and is not cut off', () => {
 })
 
 test('a verdict whose text holds quotes, braces and brackets is read whole', () => {
-  const reply = String.raw`Here: [{"name": "says \"}\" then ]", "summary": "s {", "verdict": "strong", "reason": "r"}]`
-  expect(parseVerdicts(reply)).toEqual({ verdicts: [{ name: 'says "}" then ]', summary: 's {', verdict: 'strong', reason: 'r' }], isCut: false })
+  const reply = String.raw`Here: [{"name": "says \"}\" then ]", "summary": "s {", "verdict": "brittle", "reason": "r"}]`
+  expect(parseVerdicts(reply)).toEqual({ verdicts: [{ name: 'says "}" then ]', summary: 's {', verdict: 'brittle', reason: 'r' }], isCut: false })
 })
 
 test('a verdict holding a nested object is read whole', () => {
@@ -229,8 +229,8 @@ test('a verdict holding a nested object is read whole', () => {
 })
 
 test('a reply cut off before its closing bracket keeps the verdicts that arrived whole', () => {
-  const reply = '[{"name": "a", "verdict": "strong", "reason": "r"}, {"name": "b", "verdict": "hol'
-  expect(parseVerdicts(reply)).toEqual({ verdicts: [{ name: 'a', summary: '', verdict: 'strong', reason: 'r' }], isCut: true })
+  const reply = '[{"name": "a", "verdict": "brittle", "reason": "r"}, {"name": "b", "verdict": "hol'
+  expect(parseVerdicts(reply)).toEqual({ verdicts: [{ name: 'a', summary: '', verdict: 'brittle', reason: 'r' }], isCut: true })
 })
 
 test('a malformed verdict is skipped and the rest still count', () => {
@@ -478,12 +478,12 @@ test('a failing test is not taken for a build failure', () => {
 
 // how sure the grader was, read from its reply and kept with the grades
 test('a verdict keeps the confidence the grader gave, whatever its case', () => {
-  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"brittle","reason":"r","confidence":"Low"},{"name":"b","summary":"s","verdict":"strong","reason":"r","confidence":"high"}]')
+  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"brittle","reason":"r","confidence":"Low"},{"name":"b","summary":"s","verdict":"hollow","reason":"r","confidence":"high"}]')
   expect(verdicts.map(v => v.confidence)).toEqual(['low', 'high'])
 })
 
 test('a confidence the grader left out or wrote as no known level is left off the verdict', () => {
-  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"strong","reason":"r"},{"name":"b","summary":"s","verdict":"strong","reason":"r","confidence":"very"}]')
+  const { verdicts } = parseVerdicts('[{"name":"a","summary":"s","verdict":"brittle","reason":"r"},{"name":"b","summary":"s","verdict":"hollow","reason":"r","confidence":"very"}]')
   expect(verdicts.map(v => 'confidence' in v)).toEqual([false, false])
 })
 

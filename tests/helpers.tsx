@@ -129,7 +129,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
       confirms.push({ prompt, model: String((e as { model?: unknown }).model) })
       const answer = first.map(v => {
         const verdict = confirm ? confirm(v.name, v.verdict) : v.verdict
-        return { name: v.name, summary: `Checks ${v.name}.`, verdict, reason: verdict === v.verdict ? `${verdict} because.` : `${verdict} on a closer look.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '' }
+        return { name: v.name, summary: `Checks ${v.name}.`, verdict, reason: verdict === v.verdict ? `${verdict} because.` : `${verdict} on a closer look.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '', ...(verdict === 'strong' ? { catches: { bug: 'a wrong result.' } } : {}) }
       })
       return { value: { isAnswered: true, usage: {}, text: JSON.stringify(answer) } } as never
     }
@@ -161,7 +161,7 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
           JSON.stringify(
             names.flatMap(name => expand[name] ?? [name]).map(name => {
               const verdict = rule ? rule(name, prompt) : name.includes('shallow') ? 'shallow' : name.includes('nothing') ? 'hollow' : 'strong'
-              return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '' }
+              return { name, summary: `Checks ${name}.`, verdict, reason: `${verdict} because.`, missed: verdict === 'shallow' ? 'a wrong edge.' : '', ...(verdict === 'strong' ? { catches: { bug: 'a wrong result.' } } : {}) }
             }),
           ),
         ),
@@ -202,6 +202,11 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
     store[key] = JSON.parse(JSON.stringify(value))
     return { value: undefined } as never
   })
+  on('store.delete', async (_$, e) => {
+    delete store[(e as { key: string }).key]
+    return { value: undefined } as never
+  })
+  on('store.keys', async () => ({ value: Object.keys(store) }) as never)
   return { prompts, notes, runs, runsIn, logs, budgets, tools, session, asked, store, gits, models, systems, writes, suggested, refused, confirms }
 }
 

@@ -126,7 +126,7 @@ test('test_grades narrows to a folder, to the verdicts asked, and to a limit, sa
   // a file's name is not a folder: src/math.test is no prefix of src/math.test.ts
   expect(await askGrades($, { path: 'src/math.test' })).toBe('test-grader lists no tests in src/math.test.')
   const strong = await askGrades($, { verdicts: ['strong'], path: '/proj/src/math.test.ts' })
-  expect(strong).toBe('2 tests in src/math.test.ts: 1 strong, 1 hollow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/math.test.ts:1 "adds": strong\n  Checks: Checks adds.\n  Why: strong because.')
+  expect(strong).toBe('2 tests in src/math.test.ts: 1 strong, 1 hollow.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/math.test.ts:1 "adds": strong\n  Checks: Checks adds.\n  Why: strong because. It catches: a wrong result.')
 })
 
 
@@ -505,9 +505,9 @@ test('evidence for a test not yet listed adds it to the grades, as graded on evi
   await clock.advance(10)
 
   // strong: no round to tell
-  expect(answer).toBe('Now strong: strong because.')
+  expect(answer).toBe('Now strong: strong because. It catches: a wrong result.')
   expect(await askGrades($, { verdicts: ['strong'] })).toBe(
-    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
+    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because. It catches: a wrong result.\n  Graded on evidence.',
   )
 })
 
@@ -523,9 +523,9 @@ test('evidence for a test listed but never graded gives it the grade the tool an
   const answer = await sendEvidence($, { file: 'src/e.test.ts', test: 'a shallow check', evidence: MUTATION })
   await clock.advance(10)
 
-  expect(answer).toBe('Now strong: strong because.')
+  expect(answer).toBe('Now strong: strong because. It catches: a wrong result.')
   expect(await askGrades($, { verdicts: ['strong'] })).toBe(
-    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because.\n  Graded on evidence.',
+    '2 tests: 1 strong, 1 never graded.\nLayers: 2 unit · 0 integration · 0 end-to-end.\nStrong, worst first:\n- src/e.test.ts:5 "a shallow check": strong\n  Checks: Checks a shallow check.\n  Why: strong because. It catches: a wrong result.\n  Graded on evidence.',
   )
 })
 

@@ -1,6 +1,6 @@
 {
   "name": "test-grader",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "A side pane that grades every test in the project (strong, shallow, brittle, hollow, duplicate), tells Claude how to write tests that grade strong, and shows coverage.",
   "author": {
     "name": "Martin Hygge"
@@ -24,6 +24,18 @@
       "title": "Grader workers",
       "description": "How many grader calls run at once during Grade all tests, from 1 to 20.",
       "default": 10
+    },
+    "measureStrong": {
+      "type": "boolean",
+      "title": "Measure strong grades",
+      "description": "While the session is idle, try the bug each strong grade names on a few tests at a time, and grade shallow any test that still passes. Go is built with the change through -overlay, its files untouched.",
+      "default": true
+    },
+    "measureInPlace": {
+      "type": "boolean",
+      "title": "Measure by changing files",
+      "description": "Measure strong grades in languages other than Go too, by changing the code under test for the run and putting it back. Off by default: another session or worker in the same folder would see the change while it runs.",
+      "default": false
     }
   }
 }

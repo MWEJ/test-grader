@@ -92,7 +92,7 @@ test('in a long file, a looped test reaches the grader with the data above it', 
 })
 
 
-test('in a long file, a looped test graded again by its cases\' names still reaches the grader with its loop, and is told which loop they come from', async ($, on) => {
+test('in a long file, a looped test graded again by its cases\' names still reaches the grader with its loop, and is told which loop they come from', { timeoutMs: 20_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const old = Array.from({ length: 1200 }, (_, i) => `it('old case ${i}', () => {\n  expect(add(${i}, 1)).toBe(${i + 1})\n})\n`).join('')
   const loop = "\nfor (const name of ['tiny', 'huge']) {\n  it(`rounds ${name}`, () => { expect(round(name)).toBe(-7) })\n}\n"

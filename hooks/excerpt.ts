@@ -129,12 +129,33 @@ export const parseVerdicts = (text: string): { verdicts: Graded[]; isCut: boolea
     const sure = typeof o.confidence === 'string' && CONFIDENCES.includes(o.confidence.trim().toLowerCase()) ? { confidence: o.confidence.trim().toLowerCase() as Confidence } : {}
     // shallow only with a bug the grader can name; told whoever fixes it, as the case to add
     if (verdict === 'shallow' && missed === '') return [{ name: o.name, summary: String(o.summary ?? ''), verdict: 'strong', reason: `${reason} (Graded strong: no bug it would miss was named.)`.trim(), ...sure }]
+    if (verdict === 'strong') {
+      // strong only with a bug the grader can name; with none, another reviewer could fairly disagree
+      const catches = catchesOf(o.catches)
+      if (catches === null) return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: `${reason} (It named no bug the test would catch.)`.trim(), confidence: 'low' }]
+      return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: `${reason} It catches: ${catches.bug}`.trim(), ...sure, catches }]
+    }
     return [{ name: o.name, summary: String(o.summary ?? ''), verdict, reason: verdict === 'shallow' ? `${reason} It would miss: ${missed}` : reason, ...sure }]
   })
   return { verdicts, isCut: !isClosed }
 }
 
-export type Graded = { name: string; summary: string; verdict: Verdict; reason: string; confidence?: Confidence }
+export type Graded = { name: string; summary: string; verdict: Verdict; reason: string; confidence?: Confidence; catches?: Catches }
+
+// The bug a strong test would catch, as its grader named it: in a sentence, and, where the grader
+// saw the code under test, the change to it that makes the bug, for a background run to measure
+export type Catches = { bug: string; file?: string; find?: string; replace?: string }
+export const catchesOf = (given: unknown): Catches | null => {
+  if (typeof given === 'string') return given.trim() === '' ? null : { bug: given.trim() }
+  if (given === null || typeof given !== 'object') return null
+  const o = given as Record<string, unknown>
+  const text = (v: unknown): string => (typeof v === 'string' ? v : '')
+  const bug = text(o.bug).trim()
+  if (bug === '') return null
+  const [file, find, replace] = [text(o.file).trim(), text(o.find), text(o.replace)]
+  // a change only where it names a file and alters something
+  return file !== '' && find !== '' && find !== replace ? { bug, file, find, replace } : { bug }
+}
 
 // A test the grader graded case by case (Test › xdr role, Test/xdr role, Test > xdr role) when
 // asked for the test: one verdict for it, the worst of its cases', its reason saying which case
