@@ -46,6 +46,20 @@ export const charCount = (tree: unknown): number => {
 
 // What the engine would refuse in a tree, as far as test-grader knows its rules, said with where
 // it is; undefined for a tree it takes
+// the engine's rules for a prop's value: a size from 0 to 10,000 (or a percentage), a margin, gap
+// or padding within 10,000, an offset a whole number of cells, a colour a name or a hex
+const MAX_CELLS = 10_000
+const SIZES = new Set(['width', 'height', 'minWidth', 'minHeight'])
+const SPACES = new Set(['flexGrow', 'flexShrink', 'gap', 'columnGap', 'rowGap', 'margin', 'marginX', 'marginY', 'marginTop', 'marginBottom', 'marginLeft', 'marginRight', 'padding', 'paddingX', 'paddingY', 'paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight'])
+const OFFSETS = new Set(['top', 'left', 'right', 'bottom'])
+const COLOURS = new Set(['color', 'backgroundColor', 'borderColor'])
+const rangeProblem = (k: string, v: unknown): string | undefined => {
+  if (SIZES.has(k)) return typeof v === 'number' ? (v >= 0 && v <= MAX_CELLS ? undefined : `is ${v}, not from 0 to ${MAX_CELLS}`) : typeof v === 'string' && /^\d{1,3}%$/.test(v) ? undefined : 'is not a number or a percentage'
+  if (SPACES.has(k)) return typeof v === 'number' && Math.abs(v) <= MAX_CELLS ? undefined : `is ${String(v)}, not a number within ${MAX_CELLS}`
+  if (OFFSETS.has(k)) return typeof v === 'number' && Number.isInteger(v) && Math.abs(v) <= MAX_CELLS ? undefined : `is ${String(v)}, not a whole number within ${MAX_CELLS}`
+  if (COLOURS.has(k)) return typeof v === 'string' && /^[#a-zA-Z0-9_().,% -]{1,40}$/.test(v) ? undefined : `is ${JSON.stringify(v)}, not a colour`
+  return undefined
+}
 const MAX_NODES = 20_000
 const MAX_DEPTH = 32
 const HAS_REFUSED = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u{10eeee}]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/u
@@ -61,6 +75,8 @@ export const problemOf = (tree: unknown): string | undefined => {
     for (const [k, v] of Object.entries(el.props ?? {})) {
       if (!(typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))) return `prop ${k} is ${v === null ? 'null' : typeof v === 'number' ? String(v) : typeof v} at ${here}`
       if (typeof v === 'string' && HAS_REFUSED.test(v)) return `prop ${k} holds a control character at ${here}`
+      const range = rangeProblem(k, v)
+      if (range) return `prop ${k} ${range} at ${here}`
     }
     if (el.type === 'Button' && (typeof el.props?.key !== 'string' || el.props.key === '' || typeof el.props?.label !== 'string')) return `a Button without a key and a label at ${here}`
     for (const c of el.children ?? []) {

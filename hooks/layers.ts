@@ -19,11 +19,13 @@ export const layerRulesOf = (text: string): LayerRules =>
   })
 
 const E2E_PATH = /(^|\/)(e2e|end-to-end|acceptance|playwright|cypress)(\/|$)|[._-]e2e([._-]|$)|\.cy\.[cm]?[jt]sx?$/i
-const INTEGRATION_PATH = /(^|\/)(integration|integration[-_]tests?|it)(\/|$)|[._-]integration([._-]|$)|\.int\.(test|spec)\.|IT\.(java|kt)$/i
+const INTEGRATION_PATH = /(^|\/)(integration|integration[-_]tests?|it)(\/|$)|[._-]integration([._-]|$)|\.(int|sqlite|db|pg|postgres|mysql)\.(test|spec)\.|IT\.(java|kt)$/i
 // a browser or device driven from the test: Playwright, Cypress, Detox, WebdriverIO, Selenium
 const E2E_TEXT = /\bfrom\s+['"](@playwright\/test|cypress|detox|webdriverio|selenium-webdriver)['"]|\brequire\(\s*['"](@playwright\/test|cypress|detox|webdriverio|selenium-webdriver)['"]\s*\)/
-// a real database or service started for the test, or a marker that says so
-const INTEGRATION_TEXT = /@pytest\.mark\.integration\b|\btestcontainers\b|@Tag\(\s*"integration"\s*\)|@SpringBootTest\b/
+// a real database or service started for the test (a database driver imported into it), or a
+// marker that says so
+const INTEGRATION_TEXT =
+  /@pytest\.mark\.integration\b|\btestcontainers\b|@Tag\(\s*"integration"\s*\)|@SpringBootTest\b|\b(?:from\s+|require\(\s*)['"](?:better-sqlite3|sqlite3|pg|mysql2|mongodb-memory-server|ioredis|redis-memory-server)['"]/
 
 // rel: the file's path in the project; text: its source, when read
 export const layerOf = (rel: string, text: string | null, rules: LayerRules = []): Layer => {

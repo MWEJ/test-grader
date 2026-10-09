@@ -169,7 +169,7 @@ test('a Go coverage run reads the profile it writes: statements weighted by each
     editor: () => {
       files['.test-grader-go-cover.out'] = GO_PROFILE
       // per package, as go test prints it: their plain mean would be 50%
-      return { stdout: 'ok  example.com/shop/pkg/a  coverage: 100.0% of statements\nok  example.com/shop/pkg/b  coverage: 0.0% of statements\n', exitCode: 0 }
+      return { stdout: '--- PASS: TestA (0.00s)\nok  example.com/shop/pkg/a  coverage: 100.0% of statements\n--- PASS: TestB (0.00s)\nok  example.com/shop/pkg/b  coverage: 0.0% of statements\n', exitCode: 0 }
     },
   })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
@@ -249,7 +249,7 @@ test('pressing the packages left out shows every package, lowest first, and pres
 test('a Go coverage run that wrote no profile falls back to the mean of the figures it printed', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...GO_MODULE }
-  const { notes } = project(on, files, { editor: () => ({ stdout: 'ok  a  coverage: 40.0% of statements\nok  b  coverage: 60.0% of statements\n', exitCode: 0 }) })
+  const { notes } = project(on, files, { editor: () => ({ stdout: '--- PASS: TestA (0.00s)\nok  example.com/shop/pkg/a  coverage: 40.0% of statements\n--- PASS: TestB (0.00s)\nok  example.com/shop/pkg/b  coverage: 60.0% of statements\n', exitCode: 0 }) })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await ui.press({ key: 'run' })
@@ -660,7 +660,7 @@ test('a Go coverage run whose tests fail still gives the figures it left, naming
   const { notes } = project(on, files, {
     editor: () => {
       files['.test-grader-go-cover.out'] = GO_PROFILE
-      return { stdout: 'ok  \texample.com/shop/pkg/a\t0.1s\n--- FAIL: TestB (0.00s)\nFAIL\nFAIL\texample.com/shop/pkg/b\t0.2s\nFAIL\n', exitCode: 1 }
+      return { stdout: '--- PASS: TestA (0.00s)\nok  \texample.com/shop/pkg/a\t0.1s\n--- FAIL: TestB (0.00s)\nFAIL\nFAIL\texample.com/shop/pkg/b\t0.2s\nFAIL\n', exitCode: 1 }
     },
   })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
@@ -696,19 +696,22 @@ test('coverage leaves out the files the project\'s ignore list names, in the tot
 })
 
 
-// A Go module with an integration test behind its build tag: go test ./... runs pkg/a's test
-// and compiles pkg/store's file out, so its test never runs
-const TAGGED_MODULE: Record<string, string> = {
+// A Go module whose pkg/store test go test ./... runs none of: its TestMain leaves before
+// running a test
+const UNRUN_MODULE: Record<string, string> = {
   'go.mod': 'module example.com/shop\n\ngo 1.22\n',
   'pkg/a/a_test.go': 'package a\n\nfunc TestA(t *testing.T) {\n\tif a() != 1 {\n\t\tt.Fatal("a")\n\t}\n}\n',
-  'pkg/store/store_test.go': '//go:build integration\n\npackage it\n\nfunc TestStore(t *testing.T) {\n\tif store() != 1 {\n\t\tt.Fatal("store")\n\t}\n}\n',
+  'pkg/store/store_test.go': 'package store\n\nfunc TestStore(t *testing.T) {\n\tif store() != 1 {\n\t\tt.Fatal("store")\n\t}\n}\n',
 }
+const UNRUN_RUN = '=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \texample.com/shop/pkg/a\t0.01s\tcoverage: 100.0% of statements\nok  \texample.com/shop/pkg/store\t0.01s [no tests to run]\n'
+// the same, its store test behind the integration build tag: go test ./... compiles it out
+const TAGGED_MODULE: Record<string, string> = { ...UNRUN_MODULE, 'pkg/store/store_test.go': `//go:build integration\n\n${UNRUN_MODULE['pkg/store/store_test.go']}` }
 const TAGGED_RUN = '=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \texample.com/shop/pkg/a\t0.01s\tcoverage: 100.0% of statements\n?   \texample.com/shop/pkg/store\t[no test files]\n'
 
 test('a coverage run marks the graded tests it never ran: in the pane, in test_grades and in its note to Claude', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const files: Record<string, string> = { ...TAGGED_MODULE }
-  const { notes } = project(on, files, { editor: () => ({ stdout: TAGGED_RUN, exitCode: 0 }) })
+  const files: Record<string, string> = { ...UNRUN_MODULE }
+  const { notes } = project(on, files, { editor: () => ({ stdout: UNRUN_RUN, exitCode: 0 }) })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
   await clock.advance(10)
@@ -726,13 +729,13 @@ test('a coverage run marks the graded tests it never ran: in the pane, in test_g
   expect(rows).toHaveLength(2)
   expect(marked).toEqual(['row-r:/proj/pkg/store/store_test.go:TestStore'])
   const listed = await $.tool.call({ tool: 'mcp__test-grader__test_grades', ran: 'never ran' } as never).then(r => String((r as { result: unknown }).result))
-  expect(listed).toContain('Never run by the last coverage run, worst first:\n- pkg/store/store_test.go:5 "TestStore": ungraded (integration, never ran)')
+  expect(listed).toContain('Never run by the last coverage run, worst first:\n- pkg/store/store_test.go:3 "TestStore": ungraded (never ran)')
   expect(listed).not.toContain('TestA')
 })
 
 test('the tests a coverage run ran outlive the session, in a file of test-grader\'s own', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  const files: Record<string, string> = { ...TAGGED_MODULE }
+  const files: Record<string, string> = { ...UNRUN_MODULE }
   const dir = '/home/u/.claude/test-grader/ran/-proj'
   files[`${dir}/ran.json`] = JSON.stringify({ at: 400_000, measured: ['/proj'], by: { '/proj/pkg/a': { TestA: 'passed' } } })
   project(on, files, { env: { HOME: '/home/u' } })
@@ -741,8 +744,37 @@ test('the tests a coverage run ran outlive the session, in a file of test-grader
 
   const answer = await $.tool.call({ tool: 'mcp__test-grader__test_grades', verdicts: ['ungraded'] } as never).then(r => String((r as { result: unknown }).result))
   expect(answer).toContain('\nThe last coverage run (10m ago): 1 never ran: test_grades with ran lists them.')
-  expect(answer).toContain('"TestStore": ungraded (integration, never ran)')
+  expect(answer).toContain('"TestStore": ungraded (never ran)')
   expect(answer).toContain('"TestA": ungraded\n')
+})
+
+test('a test behind a build tag the coverage run was not given is not built, told apart from one that never ran, and runs once .test-grader-env gives the tag', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...TAGGED_MODULE }
+  const { notes, runs } = project(on, files, {
+    editor: (argv, env) => ({ stdout: env?.GOFLAGS === '-tags=integration' ? TAGGED_RUN.replace('?   \texample.com/shop/pkg/store\t[no test files]', '--- PASS: TestStore (0.00s)\nok  \texample.com/shop/pkg/store\t0.01s') : TAGGED_RUN, exitCode: 0 }),
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  expect(notes.at(-1)).toContain('\n1 graded test is in files with a build tag the run was not given (integration), so it was not compiled: the coverage command leaves that tag out, which says nothing of the tests. To measure them too, put GOFLAGS=-tags=integration in .test-grader-env')
+  expect(notes.at(-1)).not.toContain('never ran')
+  // the line is muted, not the amber of a test that should have run
+  const line = (await ui.findAll({ type: 'Text' })).find(t => t.text === 'The last coverage run (0m ago): 1 not built (no -tags integration)')
+  expect(line?.props?.color).not.toBe('#fbbf24')
+  const listed = await $.tool.call({ tool: 'mcp__test-grader__test_grades', ran: 'not built' } as never).then(r => String((r as { result: unknown }).result))
+  expect(listed).toContain('- pkg/store/store_test.go:5 "TestStore": ungraded (integration, not built)')
+  expect(listed).not.toContain('TestA')
+
+  // with the tag given through the project's run variables, the test runs
+  files['.test-grader-env'] = 'GOFLAGS=-tags=integration\n'
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+  expect(runs).toHaveLength(2)
+  expect((await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.startsWith('The last coverage run'))).toEqual([])
 })
 
 test('a Jest coverage run reports which tests it ran, in a file of test-grader\'s own, and a skipped test is told apart', async ($, on) => {
@@ -796,8 +828,8 @@ test('a project\'s .test-grader-layers names a layer its paths do not show, and 
 
 test('a pane whose drawing the engine would refuse whole says why in red, in place of the engine\'s blank placeholder', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
-  // 500 packages, each a bar of cells once every package is shown: past the engine's 20,000 elements
-  const profile = ['mode: set', ...Array.from({ length: 500 }, (_, i) => `example.com/shop/pkg/p${i}/a.go:3.14,5.2 4 ${i % 2}`), ''].join('\n')
+  // 2,500 packages, each a bar once every package is shown: past the engine's 20,000 elements
+  const profile = ['mode: set', ...Array.from({ length: 2500 }, (_, i) => `example.com/shop/pkg/p${i}/a.go:3.14,5.2 4 ${i % 2}`), ''].join('\n')
   const files: Record<string, string> = { 'go.mod': 'module example.com/shop\n\ngo 1.22\n', 'pkg/p0/a_test.go': 'package p0\n\nfunc TestA(t *testing.T) {}\n', '.test-grader-go-cover.out': profile }
   const { logs } = project(on, files)
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)

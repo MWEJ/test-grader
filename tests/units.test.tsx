@@ -5,7 +5,7 @@ import { asAsked, excerptOf, foldCases, othersOf, parseVerdicts, unratedWhy } fr
 import { goTagsOf, isBuildFailure, isNoneRun, runArgv } from '../hooks/runner'
 import { charCount, nodeCount, printable, problemOf } from '../hooks/tree'
 import { layerOf, layerRulesOf } from '../hooks/layers'
-import { goRanOf, jsRanOf, mergeRan, ranStateOf } from '../hooks/ran'
+import { goRanOf, jsRanOf, mergeRan, ranStateOf, tagsOfArgv } from '../hooks/ran'
 import { fits, ignoredBy, isTemplate } from '../hooks/discovery'
 import { goProfileOf, moduleOf } from '../hooks/gocover'
 import { keep, unkeep, type SavedGrades } from '../hooks/kept'
@@ -622,6 +622,44 @@ test('a graded test is run, skipped or never run by the record, and unknown wher
 })
 
 
+test('a Go file behind a build tag the run was not given is not built, and never ran once the run had the tag', async () => {
+  const record = { at: 1, measured: ['/p/go'], by: { '/p/go/pkg': { TestA: 'passed' as const } }, tagsBy: { '/p/go': [] } }
+  expect(ranStateOf(record, '/p/go/pkg/store_test.go', 'TestStore', ['integration'])).toBe('not built')
+  // an untagged file the run did not run is still never ran, and a tagged test that ran, ran
+  expect(ranStateOf(record, '/p/go/pkg/plain_test.go', 'TestPlain')).toBe('never ran')
+  expect(ranStateOf(record, '/p/go/pkg/a_test.go', 'TestA', ['integration'])).toBe('ran')
+  const tagged = { ...record, tagsBy: { '/p/go': ['integration'] } }
+  expect(ranStateOf(tagged, '/p/go/pkg/store_test.go', 'TestStore', ['integration'])).toBe('never ran')
+  // a JS file has no build tags to miss
+  expect(ranStateOf({ ...record, measured: ['/p/js'], by: {} }, '/p/js/a.test.ts', 'adds', ['integration'])).toBe('never ran')
+})
+
+for (const [name, argv, tags] of [
+  ['-tags a,b', ['go', 'test', './...', '-tags', 'a,b'], ['a', 'b']],
+  ['-tags=a', ['go', 'test', '-tags=a', './...'], ['a']],
+  ['GOFLAGS style --tags=a b', ['go', 'test', '--tags=a b'], ['a', 'b']],
+  ['no tags', ['go', 'test', './...', '-cover'], []],
+] as const) {
+  test(`the build tags a go test argv gives: ${name}`, async () => {
+    expect(tagsOfArgv([...argv])).toEqual([...tags])
+  })
+}
+
+test('a later run keeps the tags of the folders it did not reach and replaces the rest', async () => {
+  const before = { at: 1, measured: ['/p/a', '/p/b'], by: {}, tagsBy: { '/p/a': ['integration'], '/p/b': ['integration'] } }
+  expect(mergeRan(before, { at: 2, measured: ['/p/b'], by: {}, tagsBy: { '/p/b': [] } }).tagsBy).toEqual({ '/p/a': ['integration'], '/p/b': [] })
+})
+
+test('a test file that imports a database driver, or is named for a database, is integration', async () => {
+  expect(layerOf('mobile/src/store.sqlite.test.ts', null)).toBe('integration')
+  expect(layerOf('mobile/src/store.sqlite.test.tsx', null)).toBe('integration')
+  expect(layerOf('mobile/src/store.test.ts', "import Database from 'better-sqlite3'\n")).toBe('integration')
+  expect(layerOf('api/users.test.js', "const { Pool } = require('pg')\n")).toBe('integration')
+  // a name that only holds the word is no driver
+  expect(layerOf('src/pgformat.test.ts', "import { format } from './pgformat'\n")).toBe('unit')
+  expect(layerOf('src/sqlite-ui.test.ts', null)).toBe('unit')
+})
+
 // what the engine would refuse whole, said with where it is
 const box = (props: Record<string, unknown>, children: unknown[] = []) => ({ type: 'Box', props, children })
 test('a tree the engine takes has no problem; one it would refuse names what and where', async () => {
@@ -634,6 +672,16 @@ test('a tree the engine takes has no problem; one it would refuse names what and
   expect(problemOf(box({ label: 'x\u{10eeee}' }))).toBe('prop label holds a control character at pane > Box')
   expect(problemOf(box({}, ['a whole 🍅']))).toBeUndefined()
   expect(problemOf(box({}, [{ type: 'Button', props: { key: '', label: 'Run' } }]))).toBe('a Button without a key and a label at pane > Box > Button ""')
+})
+
+test('a size below 0, an offset not a whole number or a colour that is no colour is a problem', async () => {
+  expect(problemOf(box({ width: -3 }))).toBe('prop width is -3, not from 0 to 10000 at pane > Box')
+  expect(problemOf(box({ width: '50%', minHeight: 0, marginLeft: -2 }))).toBeUndefined()
+  expect(problemOf(box({ height: 'tall' }))).toBe('prop height is not a number or a percentage at pane > Box')
+  expect(problemOf(box({ gap: 20_000 }))).toBe('prop gap is 20000, not a number within 10000 at pane > Box')
+  expect(problemOf(box({ top: 1.5 }))).toBe('prop top is 1.5, not a whole number within 10000 at pane > Box')
+  expect(problemOf(box({}, [{ type: 'Text', props: { color: 'red;' }, children: ['x'] }]))).toBe('prop color is "red;", not a colour at pane > Box > Text')
+  expect(problemOf(box({ backgroundColor: '#343848' }))).toBeUndefined()
 })
 
 test('a tree past the engine\'s node or depth limit is a problem, one at the limit is not', async () => {

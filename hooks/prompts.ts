@@ -134,7 +134,7 @@ export const GRADES_SCHEMA = {
     path: { type: 'string', description: 'Only tests in this file or folder, absolute or relative to the project' },
     written: { type: 'boolean', description: 'Only the tests written or edited this session' },
     layer: { type: 'string', enum: ['unit', 'integration', 'e2e'], description: "Only tests of this layer, as their file's path, build tag or imports, or the project's .test-grader-layers, say" },
-    ran: { type: 'string', enum: ['never ran', 'skipped'], description: 'List the tests the last coverage run reached but never ran, or skipped, whatever their grade' },
+    ran: { type: 'string', enum: ['never ran', 'skipped', 'not built'], description: 'List the tests the last coverage run reached but never ran, skipped, or did not build (a Go file with a build tag the run was not given), whatever their grade' },
     limit: { type: 'number', description: `How many tests to list at most; default ${GRADES_LIMIT}` },
   },
 }
