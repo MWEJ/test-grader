@@ -880,6 +880,26 @@ test("a Go total leaves out generated files, a part's gitignored folders and its
   expect(texts[texts.indexOf('internal/mocks/') + 2]).toBe('test helper')
 })
 
+for (const list of ['.gitignore', '.test-grader-ignore']) {
+  test(`a root ${list} rule with no slash before its end leaves a part's folder of that name out at any depth`, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const files: Record<string, string> = { ...PARTS, [list]: 'tmp/\n' }
+    // pkg/a 10 of 10; backend/tmp and backend/tmp/coverage-audit 0 of 90, both ignored
+    const { notes } = project(on, files, {
+      editor: (argv: string[]) => {
+        if (argv[0] === 'go') files['backend/.test-grader-go-cover.out'] = ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/tmp/test_fs.go:1.1,2.2 40 0', 'example.com/shop/tmp/coverage-audit/main.go:1.1,2.2 50 0', ''].join('\n')
+        else files['mobile/coverage/lcov.info'] = 'SF:src/x.ts\nLF:10\nLH:6\nend_of_record\n'
+        return { stdout: '', exitCode: 0 }
+      },
+    })
+    await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+    const ui = await mount($)
+    await ui.press({ key: 'run' })
+    await clock.advance(10)
+    expect(notes.at(-1)).toContain('backend/ statements 100% (go test -coverprofile)')
+  })
+}
+
 test('a project of parts that each counted statements shows the whole project\'s, their counts added up, above the parts', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...PARTS }
