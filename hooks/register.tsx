@@ -3138,7 +3138,8 @@ export const register: Register = (on, options) => {
           {/* two runs of cells, filled and not, rather than a box a cell: a list of packages opened
               is a few elements a bar */}
           <Box flexDirection="row" width={CELLS} flexShrink={0}>
-            {filled > 0 && <Text backgroundColor={pctColor(value)}>{' '.repeat(filled)}</Text>}
+            {/* a figure with a note (a helper, a package not built) is not one to read as low or high */}
+            {filled > 0 && <Text backgroundColor={note === undefined ? pctColor(value) : MUTED}>{' '.repeat(filled)}</Text>}
             {filled < CELLS && <Text backgroundColor={TRACK}>{' '.repeat(CELLS - filled)}</Text>}
           </Box>
           {/* a figure with a note is not one to read as low: muted, the note beside it */}
@@ -3153,7 +3154,8 @@ export const register: Register = (on, options) => {
     // not built, no tests, commands, test helpers, each named so
     const views = cov?.byPackage?.length ? packageViews(cov.byPackage, packageTestsOf(entries, t => ranOf.get(`${t.file}:${t.name}`), cwd)) : []
     const ORDER: PackageView['state'][] = ['tested', 'not built', 'no tests', 'command', 'helper']
-    type Pkg = { name: string; pct: number; note?: string }
+    // aside: a command with no tests or a test helper, counted on one line rather than drawn
+    type Pkg = { name: string; pct: number; note?: string; aside?: 'command' | 'helper' }
     const noteOf = (v: PackageView): string | undefined =>
       v.state === 'tested'
         ? v.unbuilt > 0 ? `without its ${plural(v.unbuilt, 'test')} not built` : undefined
@@ -3162,12 +3164,16 @@ export const register: Register = (on, options) => {
       of.length > 1
         ? [...of]
             .sort((a, b) => ORDER.indexOf(a.state) - ORDER.indexOf(b.state) || a.pct - b.pct || a.name.localeCompare(b.name))
-            .map(v => ({ name: v.name.slice(prefix.length) || './', pct: v.pct, ...(noteOf(v) ? { note: noteOf(v) } : {}) }))
+            .map(v => ({ name: v.name.slice(prefix.length) || './', pct: v.pct, ...(noteOf(v) ? { note: noteOf(v) } : {}), ...(v.state === 'command' || v.state === 'helper' ? { aside: v.state } : {}) }))
         : []
     // the label column of a group of bars, the figures' and their packages' one width, so every bar
     // starts in line, opened or not
     const labelWidth = (packages: { name: string }[]): number => Math.min(PACKAGE_LABEL, Math.max(11, ...packages.map(p => p.name.length)))
-    const packagesDrawn = (packages: Pkg[], prefix: string, key: string, width: number): unknown[] => {
+    const packagesDrawn = (all: Pkg[], prefix: string, key: string, width: number): unknown[] => {
+      const packages = all.filter(p => p.aside === undefined)
+      const commands = all.filter(p => p.aside === 'command').length
+      const helpers = all.filter(p => p.aside === 'helper').length
+      const asides = [...(commands > 0 ? [`${plural(commands, 'command')} with no tests`] : []), ...(helpers > 0 ? [plural(helpers, 'test helper')] : [])]
       const isAll = filesOpen[key] === true
       const shown = isAll ? packages : packages.slice(0, PACKAGE_BARS)
       const left = isAll ? [] : packages.slice(PACKAGE_BARS)
@@ -3185,6 +3191,13 @@ export const register: Register = (on, options) => {
           ? [
               <Box key={`${key}-less`} marginLeft={2}>
                 <Button key={key} plain label={`▾ the ${PACKAGE_BARS} least covered only`} onPress={flip(key, true)} />
+              </Box>,
+            ]
+          : []),
+        ...(asides.length > 0
+          ? [
+              <Box key={`${key}-aside`} marginLeft={2}>
+                <Text color={MUTED}>{`${asides.join(' and ')}: not code a test is meant for, left out of the tested figure`}</Text>
               </Box>,
             ]
           : []),

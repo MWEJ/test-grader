@@ -828,14 +828,16 @@ test('a Go coverage run says which packages hold its total down without wanting 
 
   // the bars' cells are texts of spaces, passed over
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.trim() !== '')
-  // the tested package first, its figure its own; the rest after it, each muted and named for what it is
+  // the tested package first, its figure its own; the one not built after it, muted and named for
+  // what it is; the command and the helper on one line after them, drawn as no bars
   const at = (name: string) => texts.indexOf(name)
+  const aside = '1 command with no tests and 1 test helper: not code a test is meant for, left out of the tested figure'
   expect(at('pkg/a/')).toBeGreaterThanOrEqual(0)
-  expect([at('pkg/a/'), at('pkg/store/'), at('cmd/seed/'), at('internal/mocks/')]).toEqual([...[at('pkg/a/'), at('pkg/store/'), at('cmd/seed/'), at('internal/mocks/')]].sort((a, b) => a - b))
+  expect(at('pkg/a/')).toBeLessThan(at('pkg/store/'))
+  expect(at('pkg/store/')).toBeLessThan(at(aside))
+  expect([at('cmd/seed/'), at('internal/mocks/')]).toEqual([-1, -1])
   expect(texts[at('pkg/store/') + 1]).toBe('2.5%')
   expect(texts[at('pkg/store/') + 2]).toBe('unmeasured: its 1 test not built')
-  expect(texts[at('cmd/seed/') + 2]).toBe('command, no tests')
-  expect(texts[at('internal/mocks/') + 2]).toBe('test helper')
   const figure = (await ui.findAll({ type: 'Text' })).find(t => t.text === '2.5%')
   expect(figure?.props?.color).toBe('#8b90a0')
   const tested = '90% over the 1 package whose tests ran (median package 90%); the total also counts 1 command (package main) with no tests, 1 test helper, 1 package whose 1 test was not built (unmeasured, not low).'
@@ -844,6 +846,34 @@ test('a Go coverage run says which packages hold its total down without wanting 
   // pkg/a's 90% once pkg/store is left out, not 20%
   expect(notes.at(-1)).toContain(`statements 10% (go test -coverprofile).\n${tested}`)
   expect(notes.at(-1)).not.toContain('Least covered folders')
+})
+
+test('a package whose figure has a note is drawn with grey cells, however much of it ran; a plain one in its figure\'s colour', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { ...MIXED_MODULE }
+  // pkg/store 30 of 40 run, its own test not built: 75%, not a figure to read as good or bad
+  const profile = MIXED_PROFILE.replace('pkg/store/store.go:3.1,4.2 39 0', 'pkg/store/store.go:3.1,4.2 29 1\nexample.com/shop/pkg/store/store.go:5.1,6.2 10 0')
+  project(on, files, {
+    editor: () => {
+      files['.test-grader-go-cover.out'] = profile
+      return { stdout: TAGGED_RUN, exitCode: 0 }
+    },
+  })
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await clock.advance(10)
+  await ui.press({ key: 'run' })
+  await clock.advance(10)
+
+  // the filled cells of a package's bar, by their colour; the empty track left out
+  const tree = await ui.drawn()
+  const cells = (key: string) =>
+    nodesOf(nodesOf(tree).find(n => n.props?.key === key))
+      .filter(n => n.type === 'Text' && typeof n.props?.backgroundColor === 'string' && n.props.backgroundColor !== '#343848')
+      .map(n => n.props!.backgroundColor)
+  expect(cells('cov-pkg-pkg/store/')).toEqual(['#8b90a0'])
+  expect(cells('cov-pkg-pkg/a/')).toHaveLength(1)
+  expect(cells('cov-pkg-pkg/a/')).not.toEqual(['#8b90a0'])
 })
 
 test("a Go total leaves out generated files, a part's gitignored folders and its own ignore list, and treats a folder named as test code as a helper", async ($, on) => {
@@ -875,9 +905,9 @@ test("a Go total leaves out generated files, a part's gitignored folders and its
   expect(notes.at(-1)).toContain('backend/ statements 21.4% (go test -coverprofile)')
   const texts = (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => t.trim() !== '')
   expect(texts.filter(t => /^(tmp|scratch)\//.test(t))).toEqual([])
-  expect(texts[texts.indexOf('internal/receipttest/') + 2]).toBe('test helper')
-  expect(texts[texts.indexOf('internal/mocks/') + 1]).toBe('0%')
-  expect(texts[texts.indexOf('internal/mocks/') + 2]).toBe('test helper')
+  // the hand-written mocks and receipttest, run or not, are counted as helpers, not drawn as packages
+  expect(texts.filter(t => /^internal\/(mocks|receipttest)\//.test(t))).toEqual([])
+  expect(texts).toContain('2 test helpers: not code a test is meant for, left out of the tested figure')
 })
 
 for (const list of ['.gitignore', '.test-grader-ignore']) {
