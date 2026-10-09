@@ -752,7 +752,7 @@ test('a test behind a build tag the coverage run was not given is not built, tol
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...TAGGED_MODULE }
   const { notes, runs } = project(on, files, {
-    editor: (argv, env) => ({ stdout: env?.GOFLAGS === '-tags=integration' ? TAGGED_RUN.replace('?   \texample.com/shop/pkg/store\t[no test files]', '--- PASS: TestStore (0.00s)\nok  \texample.com/shop/pkg/store\t0.01s') : TAGGED_RUN, exitCode: 0 }),
+    editor: (argv, env) => ({ stdout: env?.GOFLAGS === '-tags=integration -p=1' ? TAGGED_RUN.replace('?   \texample.com/shop/pkg/store\t[no test files]', '--- PASS: TestStore (0.00s)\nok  \texample.com/shop/pkg/store\t0.01s') : TAGGED_RUN, exitCode: 0 }),
   })
   await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
   const ui = await mount($)
@@ -760,7 +760,7 @@ test('a test behind a build tag the coverage run was not given is not built, tol
   await ui.press({ key: 'run' })
   await clock.advance(10)
 
-  expect(notes.at(-1)).toContain('\n1 graded test is in files with a build tag the run was not given (integration), so it was not compiled: the coverage command leaves that tag out, which says nothing of the tests. To measure them too, put GOFLAGS=-tags=integration in .test-grader-env')
+  expect(notes.at(-1)).toContain('\n1 graded test is in files with a build tag the run was not given (integration), so it was not compiled: the coverage command leaves that tag out, which says nothing of the tests. To measure them too, put GOFLAGS="-tags=integration -p=1" in .test-grader-env')
   expect(notes.at(-1)).not.toContain('never ran')
   // the line is muted, not the amber of a test that should have run
   const line = (await ui.findAll({ type: 'Text' })).find(t => t.text === 'The last coverage run (0m ago): 1 not built (no -tags integration)')
@@ -770,7 +770,7 @@ test('a test behind a build tag the coverage run was not given is not built, tol
   expect(listed).not.toContain('TestA')
 
   // with the tag given through the project's run variables, the test runs
-  files['.test-grader-env'] = 'GOFLAGS=-tags=integration\n'
+  files['.test-grader-env'] = 'GOFLAGS="-tags=integration -p=1"\n'
   await ui.press({ key: 'run' })
   await clock.advance(10)
   expect(runs).toHaveLength(2)

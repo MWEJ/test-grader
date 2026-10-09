@@ -302,7 +302,7 @@ A coverage run test-grader starts also records which tests ran: Go's runs add `-
 
 A test that never ran is graded on its reading alone: its grade says nothing of whether it passes. End-to-end tests that need a service up are the usual case.
 
-A Go file behind a build tag the run wasn't given, such as `//go:build integration` under a plain `go test ./...`, is never compiled: its tests are *not built*, counted apart and drawn grey, since leaving the tag out is the project's choice. The note says which tags. To measure them too, give the tag through the run's variables: `GOFLAGS=-tags=integration` in `.test-grader-env`, with whatever else those tests need to run. A tag in the coverage command itself (`-tags integration`) counts the same.
+A Go file behind a build tag the run wasn't given, such as `//go:build integration` under a plain `go test ./...`, is never compiled: its tests are *not built*, counted apart and drawn grey, since leaving the tag out is the project's choice. The note says which tags. To measure them too, give the tag through the run's variables: `GOFLAGS="-tags=integration -p=1"` in `.test-grader-env`, with whatever else those tests need to run. `-p=1` runs one package at a time, for tests that share one database or emulator. The variables apply to every run test-grader starts, so `test_verify` and Run test then need that service up too. A tag in the coverage command itself (`-tags integration`) counts the same.
 
 #### The project is the folder the session started in
 

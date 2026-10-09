@@ -946,7 +946,7 @@ const notRunNote = async ($: EngineInterface): Promise<string> => {
   const unbuiltNote =
     unbuilt.length === 0
       ? ''
-      : `\n${unbuilt.length === 1 ? '1 graded test is' : `${unbuilt.length} graded tests are`} in files with a build tag the run was not given (${tags.join(', ')}), so ${unbuilt.length === 1 ? 'it was' : 'they were'} not compiled: the coverage command leaves ${tags.length === 1 ? 'that tag' : 'those tags'} out, which says nothing of the tests. To measure them too, put GOFLAGS=-tags=${tags.join(',')} in ${ENV_FILE} (with what they need to run). test_grades with ran: "not built" lists them.`
+      : `\n${unbuilt.length === 1 ? '1 graded test is' : `${unbuilt.length} graded tests are`} in files with a build tag the run was not given (${tags.join(', ')}), so ${unbuilt.length === 1 ? 'it was' : 'they were'} not compiled: the coverage command leaves ${tags.length === 1 ? 'that tag' : 'those tags'} out, which says nothing of the tests. To measure them too, put GOFLAGS="-tags=${tags.join(',')} -p=1" in ${ENV_FILE}, with what they need to run (-p=1 runs one package at a time, for tests that share one database or emulator); it applies to every run test-grader starts, test_verify's and Run test's too. test_grades with ran: "not built" lists them.`
   if (missed.length === 0) return unbuiltNote
   const byFile = new Map<string, number>()
   for (const t of missed) byFile.set(t.file, (byFile.get(t.file) ?? 0) + 1)
