@@ -40,15 +40,20 @@ export const mergeParts = (found: { dir: string; cov: Coverage }[]): Coverage | 
   const byPackage = found.flatMap(({ dir, cov }) => (cov.byPackage ?? []).map(p => ({ ...p, name: p.name === './' ? `${dir}/` : `${dir}/${p.name}` })))
   const parts: CoveragePart[] = found.map(({ dir, cov }) => ({ dir, lines: cov.lines, statements: cov.statements, branches: cov.branches, functions: cov.functions, source: cov.source }))
   const only = found.length === 1 ? found[0]!.cov : null
+  // statements add up across parts, Go's and jest's alike: the project's figure where every part
+  // counted them
+  const counts = found.map(f => f.cov.statementCount)
+  const statementCount = counts.every(c => c !== undefined) ? counts.reduce((a, c) => ({ total: a.total + c!.total, covered: a.covered + c!.covered }), { total: 0, covered: 0 }) : undefined
   return {
     lines: only?.lines ?? null,
-    statements: only?.statements ?? null,
+    statements: only?.statements ?? (statementCount && statementCount.total > 0 ? pct((statementCount.covered / statementCount.total) * 100) : null),
     branches: only?.branches ?? null,
     functions: only?.functions ?? null,
     source: parts.map(p => `${p.dir}/: ${p.source}`).join(' · '),
     updatedAt: Math.max(...found.map(f => f.cov.updatedAt ?? 0)) || null,
     byDir,
     ...(byPackage.length > 0 ? { byPackage } : {}),
+    ...(statementCount ? { statementCount } : {}),
     parts,
   }
 }
@@ -68,12 +73,69 @@ const figuresOf = (c: { lines: number | null; statements: number | null; branche
     .map(([name, v]) => `${name} ${v}%`)
     .join(' · ')
 
-// the least covered folders, a few lines each at least, lowest first: where more tests would pay
+// Go's packages as the figure should read them: tested (tests of it were built and run, some of
+// its tests maybe not built), not built (every test of it has a build tag the run was not given:
+// unmeasured, not low), no tests, a command with no tests, or a test helper. tests: by package
+// name, how many listed tests it has and how many of them were not built
+export type PackageTests = { tests: number; unbuilt: number }
+export type PackageState = 'tested' | 'not built' | 'no tests' | 'command' | 'helper'
+export type PackageView = { name: string; total: number; covered: number; pct: number; state: PackageState; unbuilt: number }
+// where no package has a listed test the list is not known yet, and a package is taken as tested
+// unless its role says otherwise
+export const packageViews = (packages: { name: string; total: number; covered: number; role?: 'command' | 'helper' }[], tests: Record<string, PackageTests>): PackageView[] => {
+  const isListed = packages.some(p => (tests[p.name]?.tests ?? 0) > 0)
+  return packages
+    .filter(p => p.total > 0)
+    .map(p => {
+      const t = tests[p.name] ?? { tests: 0, unbuilt: 0 }
+      const state: PackageState =
+        p.role === 'helper' ? 'helper' : t.tests > t.unbuilt ? 'tested' : t.unbuilt > 0 ? 'not built' : p.role === 'command' ? 'command' : isListed ? 'no tests' : 'tested'
+      return { name: p.name, total: p.total, covered: p.covered, pct: pct((p.covered / p.total) * 100)!, state, unbuilt: t.unbuilt }
+    })
+}
+
+// what a statements total over every package hides: the figure over the tested packages, their
+// median, and what the total counts that no test is meant for or no test was built for; null
+// where every package is tested
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+export const testedLine = (views: PackageView[]): string | null => {
+  const tested = views.filter(v => v.state === 'tested')
+  if (tested.length === views.length || tested.length === 0) return null
+  const total = tested.reduce((s, v) => s + v.total, 0)
+  const covered = tested.reduce((s, v) => s + v.covered, 0)
+  const sorted = tested.map(v => v.pct).sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  const median = sorted.length % 2 === 1 ? sorted[mid]! : pct((sorted[mid - 1]! + sorted[mid]!) / 2)!
+  const count = (state: PackageState): number => views.filter(v => v.state === state).length
+  const unbuilt = views.filter(v => v.state === 'not built')
+  const left = [
+    ...(count('command') > 0 ? [`${plural(count('command'), 'command')} (package main) with no tests`] : []),
+    ...(count('no tests') > 0 ? [`${plural(count('no tests'), 'other package')} with no tests`] : []),
+    ...(count('helper') > 0 ? [`${plural(count('helper'), 'test helper')}`] : []),
+    ...(unbuilt.length > 0 ? (n => [`${plural(unbuilt.length, 'package')} whose ${plural(n, 'test')} ${n === 1 ? 'was' : 'were'} not built (unmeasured, not low)`])(unbuilt.reduce((s, v) => s + v.unbuilt, 0)) : []),
+  ]
+  return `${pct((covered / total) * 100)}% over the ${plural(tested.length, 'package')} whose tests ran (median package ${median}%); the total also counts ${left.join(', ')}.`
+}
+
+// the least covered folders, a few lines each at least, lowest first: where more tests would pay;
+// a folder of Go packages none of which is tested is left out: more tests are not what it lacks
 const LEAST_COVERED = 5
 const MIN_LINES = 20
-const leastCovered = (cov: Coverage | null): string[] =>
+// whether a folder holds packages and none of them tested
+export const isUntestedDir = (views: PackageView[], dir: string): boolean => {
+  const under = views.filter(v => v.name === `${dir}/` || v.name.startsWith(`${dir}/`))
+  return under.length > 0 && under.every(v => v.state !== 'tested')
+}
+// a folder's figure less its packages that are not tested, which would rank it low for code no
+// test is meant for
+const testedOf = (views: PackageView[], dir: string, d: { total: number; covered: number }): { total: number; covered: number } =>
+  views
+    .filter(v => v.state !== 'tested' && (v.name === `${dir}/` || v.name.startsWith(`${dir}/`)))
+    .reduce((t, v) => ({ total: t.total - v.total, covered: t.covered - v.covered }), d)
+const leastCovered = (cov: Coverage | null, views: PackageView[]): string[] =>
   Object.entries(cov?.byDir ?? {})
-    .filter(([dir, d]) => dir !== '' && d.total >= MIN_LINES)
+    .map(([dir, d]) => [dir, testedOf(views, dir, d)] as const)
+    .filter(([dir, d]) => dir !== '' && d.total >= MIN_LINES && !isUntestedDir(views, dir))
     .map(([dir, d]) => ({ dir, p: (d.covered / d.total) * 100 }))
     .filter(d => d.p < 80)
     .sort((a, b) => a.p - b.p)
@@ -86,16 +148,28 @@ export type CoverCommand = { argv: string[]; label: string; goOutput?: string }
 // what a finished coverage run tells Claude: the figures it left, or how it failed and
 // the end of what it printed
 const COVER_TAIL = 20
-export const coverageNote = (command: CoverCommand, exitCode: number, output: string, cov: Coverage | null): string => {
+// views: Go's packages, as packageViews reads them
+// a Go total's tested line, under the part it is of where there are parts
+const testedNote = (cov: Coverage | null, views: PackageView[]): string => {
+  const parts = cov?.parts && cov.parts.length > 1 ? cov.parts : null
+  const lines = parts
+    ? parts.flatMap(p => {
+        const line = testedLine(views.filter(v => v.name.startsWith(`${p.dir}/`)))
+        return line ? [`${p.dir}/: ${line}`] : []
+      })
+    : [testedLine(views)].filter((l): l is string => l !== null)
+  return lines.map(l => `\n${l}`).join('')
+}
+export const coverageNote = (command: CoverCommand, exitCode: number, output: string, cov: Coverage | null, views: PackageView[] = []): string => {
   const figures = !cov
     ? ''
     : cov.parts && cov.parts.length > 1
-      ? cov.parts.map(p => `${p.dir}/ ${figuresOf(p)} (${p.source})`).join('; ')
+      ? (cov.statements !== null ? `the whole project ${cov.statements}% of statements (its parts' added up); ` : '') + cov.parts.map(p => `${p.dir}/ ${figuresOf(p)} (${p.source})`).join('; ')
       : figuresOf(cov) && `${figuresOf(cov)} (${cov.source})`
   if (exitCode === 0) {
-    const least = leastCovered(cov)
+    const least = leastCovered(cov, views)
     return figures
-      ? `Coverage run (test-grader) finished: ${figures}.${least.length > 0 ? `\nLeast covered folders (${kindOf(cov)}): ${least.join(', ')}.` : ''}`
+      ? `Coverage run (test-grader) finished: ${figures}.${testedNote(cov, views)}${least.length > 0 ? `\nLeast covered folders (${kindOf(cov)}): ${least.join(', ')}.` : ''}`
       : `Coverage run (test-grader) finished, but ${command.label} wrote no report test-grader reads.`
   }
   const lines = output.split('\n').filter(l => l.trim() !== '').slice(-COVER_TAIL)
@@ -113,7 +187,7 @@ export const coverageNote = (command: CoverCommand, exitCode: number, output: st
 // what Claude's coverage tool answers: a folder's figure (the project's, rel '') now and before
 // the run, the project's beside it, and the least covered folders under it, lowest first
 const UNDER = 8
-export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: number, output: string, before: Coverage | null, after: Coverage | null): string => {
+export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: number, output: string, before: Coverage | null, after: Coverage | null, views: PackageView[] = []): string => {
   const of = (cov: Coverage | null, dir: string): number | null => {
     const d = cov?.byDir?.[dir]
     return d && d.total > 0 ? pct((d.covered / d.total) * 100) : null
@@ -130,10 +204,13 @@ export const coverageAnswer = (rel: string, command: CoverCommand, exitCode: num
   // a project of parts has no one figure: each part's, or the part the folder is in
   const parts = after?.parts && after.parts.length > 1 ? after.parts : null
   if (!(parts && rel === '')) lines.push(figure(where, rel))
+  else if (after?.statements != null) lines.push(`The whole project: ${after.statements}% of statements, its parts' added up${before?.statements != null && before.statements !== after.statements ? `, was ${before.statements}%` : ''}.`)
   if (parts) lines.push(...parts.filter(p => rel === '' || rel.startsWith(`${p.dir}/`)).map(p => figure(`${p.dir}/`, p.dir)))
   else if (rel !== '') lines.push(figure('The project', ''))
+  if (rel === '') lines.push(...testedNote(after, views).split('\n').filter(Boolean))
   const under = Object.entries(after?.byDir ?? {})
-    .filter(([dir, d]) => d.total > 0 && dir !== rel && (rel === '' ? dir !== '' : dir.startsWith(`${rel}/`)))
+    .map(([dir, d]) => [dir, testedOf(views, dir, d)] as const)
+    .filter(([dir, d]) => d.total > 0 && dir !== rel && (rel === '' ? dir !== '' : dir.startsWith(`${rel}/`)) && !isUntestedDir(views, dir))
     .map(([dir, d]) => ({ dir, p: (d.covered / d.total) * 100, d }))
     .sort((a, b) => a.p - b.p || a.dir.localeCompare(b.dir))
     .slice(0, UNDER)

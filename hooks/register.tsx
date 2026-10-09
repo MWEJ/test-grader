@@ -3,12 +3,13 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Before, Confidence, Coverage, ExistingRun, ExistingTest, TrackedTest, Verdict } from '../types'
 
-import { attr, byDirOf, coverageAnswer, coverageNote, kindAt, mergeParts, pct } from './coverage'
-import type { CoverCommand } from './coverage'
+import { attr, byDirOf, coverageAnswer, coverageNote, kindAt, mergeParts, packageViews, pct, testedLine } from './coverage'
+import type { CoverCommand, PackageTests, PackageView } from './coverage'
 import { TEST_FILE, among, byCase, caseOf, ignoredBy, uniqueRows, withoutTemplates, caseLine, caseNames, casesAround, casesIn, changedCases, fits, isTemplate, kindOf, shortPath, suitesOf } from './discovery'
 import { MAX_REPLY, asAsked, caseTextOf, caseTextsOf, foldCases, othersOf, clamp, excerptOf, loopsOf, parseVerdicts, unratedWhy } from './excerpt'
 import type { Graded } from './excerpt'
-import { goProfileOf, mergeProfile, moduleOf } from './gocover'
+import { goProfileOf, isGenerated, isHelperName, mergeProfile, moduleOf, roleOf } from './gocover'
+import type { PackageRole } from './gocover'
 import { gradesKey, keep, unkeep } from './kept'
 import type { KeptGrades, SavedGrades } from './kept'
 import { costOf } from './prices'
@@ -672,12 +673,24 @@ const mtime = async ($: EngineInterface, path: string): Promise<number | null> =
   }
 }
 
+// a Go file none of whose code ran, as read: whether it is generated, and its package's role
+const filesRead = new Map<string, { isGenerated: boolean; role: PackageRole | undefined }>()
+const GENERATED_READS = 300
+
 // the report a coverage run left in this folder (the project's, or a part's), its paths relative to it
 const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage | null> => {
   // a file the project's ignore list names does not count (scratch code in backend/tmp/)
+  // so does one git ignores, by the root's .gitignore or the part's, and one the part's own
+  // .test-grader-ignore names, read from the part's folder
   const root = await projectDir($)
   const isIgnored = await ignoreOf($, root)
-  const isKept = (file: string): boolean => !isIgnored(shortPath(file, root))
+  const listOf = async (path: string): Promise<string> => (await $.fs.read(path).catch(() => '')).split('\n').filter(l => !l.trim().startsWith('!')).join('\n')
+  const isGitIgnored = ignoredBy(await listOf(`${root}/.gitignore`))
+  const isPartIgnored = cwd === root ? () => false : ignoredBy([await listOf(`${cwd}/.gitignore`), await listOf(`${cwd}/${IGNORE}`)].join('\n'))
+  const isKept = (file: string): boolean => {
+    const rel = shortPath(file, root)
+    return !isIgnored(rel) && !isGitIgnored(rel) && !(file.startsWith(`${cwd}/`) && isPartIgnored(file.slice(cwd.length + 1)))
+  }
   const summaryPath = `${cwd}/coverage/coverage-summary.json`
   const lcovPath = `${cwd}/coverage/lcov.info`
   const xmlPath = `${cwd}/coverage.xml`
@@ -697,6 +710,7 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
         statements: pct(total.statements?.pct),
         branches: pct(total.branches?.pct),
         functions: pct(total.functions?.pct),
+        ...(Number(total.statements?.total) > 0 ? { statementCount: { total: Number(total.statements!.total), covered: Number(total.statements!.covered ?? 0) } } : {}),
         source: 'coverage-summary.json',
         updatedAt: at,
       }
@@ -733,8 +747,39 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
   const profileAt = await mtime($, `${cwd}/${GO_PROFILE}`)
   if (profileAt !== null) {
     const goMod = await $.fs.read(`${cwd}/go.mod`).catch(() => '')
-    const { statements, byFile, byPackage } = goProfileOf(await $.fs.read(`${cwd}/${GO_PROFILE}`), moduleOf(goMod), cwd, isKept)
-    if (statements !== null) return { byDir: byDirOf(byFile, cwd), byPackage, lines: null, statements: pct(statements), branches: null, functions: null, source: 'go test -coverprofile', updatedAt: profileAt }
+    const profile = await $.fs.read(`${cwd}/${GO_PROFILE}`)
+    // generated code (mockery's mocks, protobuf) is left out: a file none of whose code ran is
+    // read for Go's generated-code header, at most GENERATED_READS of them, each once a session
+    const first = goProfileOf(profile, moduleOf(goMod), cwd, isKept)
+    const unrun = first.byFile.filter(f => f.covered === 0 && f.file.startsWith('/')).slice(0, GENERATED_READS)
+    for (const f of unrun) if (!filesRead.has(f.file)) filesRead.set(f.file, await $.fs.read(f.file).then(text => ({ isGenerated: isGenerated(text), role: roleOf(text) }), () => ({ isGenerated: false, role: undefined })))
+    const { statements, byFile, byPackage } = goProfileOf(profile, moduleOf(goMod), cwd, file => isKept(file) && filesRead.get(file)?.isGenerated !== true)
+    if (statements !== null) {
+      // each package's role, read from its first file: a command or test helper is not code its
+      // tests are missing. Only a package none of whose code ran is read (Go counts a package's
+      // own tests alone, so one with no tests is at 0%), at most ROLE_READS of them, each file
+      // read once a session
+      const firstFile = new Map<string, string>()
+      for (const f of byFile) {
+        const dir = f.file.slice(0, f.file.lastIndexOf('/'))
+        const name = dir === cwd ? './' : `${dir.startsWith(`${cwd}/`) ? dir.slice(cwd.length + 1) : dir}/`
+        if (!firstFile.has(name) && f.file.startsWith('/')) firstFile.set(name, f.file)
+      }
+      // a package is a helper by its folder's name, read or not; else by its first file read
+      const roled = byPackage.map(p => {
+        const folder = p.name.replace(/\/$/, '').split('/').pop() ?? ''
+        const file = firstFile.get(p.name)
+        const role = isHelperName(folder) ? 'helper' : file ? filesRead.get(file)?.role : undefined
+        return role ? { ...p, role } : p
+      })
+      const statementCount = { total: byFile.reduce((n, f) => n + f.total, 0), covered: byFile.reduce((n, f) => n + f.covered, 0) }
+      // the build tags the last run here was given, named with the figures: a total that counts the
+      // integration tests says so
+      const tagsBy = (await read($, ranRecord))?.tagsBy ?? {}
+      const tags = [...new Set(Object.entries(tagsBy).filter(([dir]) => dir === cwd || dir.startsWith(`${cwd}/`)).flatMap(([, t]) => t))].sort()
+      const source = tags.length > 0 ? `go test -coverprofile -tags=${tags.join(',')}` : 'go test -coverprofile'
+      return { byDir: byDirOf(byFile, cwd), byPackage: roled, statementCount, lines: null, statements: pct(statements), branches: null, functions: null, source, updatedAt: profileAt }
+    }
   }
   const goAt = await mtime($, goPath)
   if (goAt !== null) {
@@ -929,7 +974,30 @@ const resetView = async ($: EngineInterface): Promise<string> => {
 
 const runCoverage = async ($: EngineInterface): Promise<void> => {
   const ran = await measure($)
-  if (typeof ran !== 'string') await share($, coverageNote(ran.command, ran.exitCode, ran.output, await read($, coverage)) + (await notRunNote($)))
+  if (typeof ran === 'string') return
+  const cov = await read($, coverage)
+  await share($, coverageNote(ran.command, ran.exitCode, ran.output, cov, await viewsOf($, cov)) + (await notRunNote($)))
+}
+
+// Go's packages as the coverage figure should read them, by the listed tests in each package's
+// folder and how many of them the last run did not build
+const packageTestsOf = (entries: { file: string; name: string }[], stateOf: (t: { file: string; name: string }) => RanState | undefined, cwd: string): Record<string, PackageTests> => {
+  const by: Record<string, PackageTests> = {}
+  for (const t of entries) {
+    if (!t.file.endsWith('.go')) continue
+    const dir = t.file.slice(0, t.file.lastIndexOf('/'))
+    const tally = (by[dir === cwd ? './' : `${shortPath(dir, cwd)}/`] ??= { tests: 0, unbuilt: 0 })
+    tally.tests++
+    if (stateOf(t) === 'not built') tally.unbuilt++
+  }
+  return by
+}
+const viewsOf = async ($: EngineInterface, cov: Coverage | null): Promise<PackageView[]> => {
+  if (!cov?.byPackage?.length) return []
+  const cwd = await projectDir($)
+  const record = await read($, ranRecord)
+  const entries = entriesOf(await readRun($), (await read($, tests)).filter(t => t.file.startsWith(`${cwd}/`)), await read($, modified))
+  return packageViews(cov.byPackage, packageTestsOf(entries, t => ranStateOf(record, t.file, t.name, tagsAt(t.file)), cwd))
 }
 
 // what a coverage run tells Claude of the listed tests it reached but did not run: how many, and
@@ -967,7 +1035,8 @@ const answerCoverage = async ($: EngineInterface, input: { path?: unknown }): Pr
   const before = await read($, coverage)
   const ran = await measure($, rel)
   if (typeof ran === 'string') return `Coverage could not be measured: ${ran}`
-  return coverageAnswer(rel, ran.command, ran.exitCode, ran.output, before, await read($, coverage)) + (await notRunNote($))
+  const after = await read($, coverage)
+  return coverageAnswer(rel, ran.command, ran.exitCode, ran.output, before, after, await viewsOf($, after)) + (await notRunNote($))
 }
 
 // what a finished Grade all tests run tells Claude: the counts, then every flagged and
@@ -2843,7 +2912,7 @@ export const register: Register = (on, options) => {
       : []
     const age = cov?.updatedAt ? Math.max(0, Math.round((now - cov.updatedAt) / 60_000)) : null
     // a coverage figure as a bar: its label, its cells filled by the figure, and the figure
-    const bar = (key: string, label: string, value: number, width: number, indent: number): unknown => {
+    const bar = (key: string, label: string, value: number, width: number, indent: number, note?: string): unknown => {
       const filled = Math.round((Math.min(100, value) / 100) * CELLS)
       return (
         <Box key={key} flexDirection="row" gap={1} marginLeft={indent}>
@@ -2856,27 +2925,43 @@ export const register: Register = (on, options) => {
             {filled > 0 && <Text backgroundColor={pctColor(value)}>{' '.repeat(filled)}</Text>}
             {filled < CELLS && <Text backgroundColor={TRACK}>{' '.repeat(CELLS - filled)}</Text>}
           </Box>
-          <Text bold color={pctColor(value)}>{`${value}%`}</Text>
+          {/* a figure with a note is not one to read as low: muted, the note beside it */}
+          <Text bold={note === undefined} color={note === undefined ? pctColor(value) : MUTED}>{`${value}%`}</Text>
+          {note !== undefined && <Text color={MUTED}>{note}</Text>}
         </Box>
       )
     }
     // Go's packages under the total (a part's under that part, named in it), least covered first:
     // a few, then how many more and their best, the rest behind a press, kept open as a group is
-    const packagesOf = (of: { name: string; total: number; covered: number }[], prefix: string) =>
-      of.length > 1 ? of.map(p => ({ name: p.name.slice(prefix.length) || './', pct: pct((p.covered / p.total) * 100)! })).sort((a, b) => a.pct - b.pct || a.name.localeCompare(b.name)) : []
+    // tested packages first, least covered first; then those the figure should not be read for:
+    // not built, no tests, commands, test helpers, each named so
+    const views = cov?.byPackage?.length ? packageViews(cov.byPackage, packageTestsOf(entries, t => ranOf.get(`${t.file}:${t.name}`), cwd)) : []
+    const ORDER: PackageView['state'][] = ['tested', 'not built', 'no tests', 'command', 'helper']
+    type Pkg = { name: string; pct: number; note?: string }
+    const noteOf = (v: PackageView): string | undefined =>
+      v.state === 'tested'
+        ? v.unbuilt > 0 ? `without its ${plural(v.unbuilt, 'test')} not built` : undefined
+        : v.state === 'not built' ? `unmeasured: its ${plural(v.unbuilt, 'test')} not built` : v.state === 'command' ? 'command, no tests' : v.state === 'helper' ? 'test helper' : 'no tests'
+    const packagesOf = (of: PackageView[], prefix: string): Pkg[] =>
+      of.length > 1
+        ? [...of]
+            .sort((a, b) => ORDER.indexOf(a.state) - ORDER.indexOf(b.state) || a.pct - b.pct || a.name.localeCompare(b.name))
+            .map(v => ({ name: v.name.slice(prefix.length) || './', pct: v.pct, ...(noteOf(v) ? { note: noteOf(v) } : {}) }))
+        : []
     // the label column of a group of bars, the figures' and their packages' one width, so every bar
     // starts in line, opened or not
     const labelWidth = (packages: { name: string }[]): number => Math.min(PACKAGE_LABEL, Math.max(11, ...packages.map(p => p.name.length)))
-    const packagesDrawn = (packages: { name: string; pct: number }[], prefix: string, key: string, width: number): unknown[] => {
+    const packagesDrawn = (packages: Pkg[], prefix: string, key: string, width: number): unknown[] => {
       const isAll = filesOpen[key] === true
       const shown = isAll ? packages : packages.slice(0, PACKAGE_BARS)
       const left = isAll ? [] : packages.slice(PACKAGE_BARS)
+      const best = left.filter(p => p.note === undefined)
       return [
-        ...shown.map(p => bar(`cov-pkg-${prefix}${p.name}`, p.name, p.pct, width, 2)),
+        ...shown.map(p => bar(`cov-pkg-${prefix}${p.name}`, p.name, p.pct, width, 2, p.note)),
         ...(left.length > 0
           ? [
               <Box key={`${key}-more`} marginLeft={2}>
-                <Button key={key} plain label={`▸ ${plural(left.length, 'more package')}, up to ${Math.max(...left.map(p => p.pct))}%`} onPress={flip(key, false)} />
+                <Button key={key} plain label={`▸ ${plural(left.length, 'more package')}${best.length > 0 ? `, up to ${Math.max(...best.map(p => p.pct))}%` : ''}`} onPress={flip(key, false)} />
               </Box>,
             ]
           : []),
@@ -2922,24 +3007,31 @@ export const register: Register = (on, options) => {
                 {/* a project of parts names each part's source under its own heading */}
                 <Text color={MUTED}>{cov ? [...(parts ? [] : [cov.source]), ...(age !== null ? [`${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago`] : [])].join(' – ') : 'no report found'}</Text>
               </Box>
-              {/* a project of parts: each part's figures, and its packages, under its folder */}
+              {/* a project of parts: the whole project's statements, its parts' added up, then each
+                  part's figures, and its packages, under its folder */}
+              {(parts && cov?.statements != null ? bar('cov-whole', 'All statements', cov.statements, 14, 0) : null) as never}
               {(parts
                 ? parts.flatMap(part => {
-                    const packages = packagesOf((cov?.byPackage ?? []).filter(p => p.name.startsWith(`${part.dir}/`)), `${part.dir}/`)
+                    const of = views.filter(v => v.name.startsWith(`${part.dir}/`))
+                    const packages = packagesOf(of, `${part.dir}/`)
                     const width = labelWidth(packages)
+                    const tested = testedLine(of)
                     return [
                       <Text key={`cov-part-${part.dir}`} color={MUTED}>{`${part.dir}/ · ${part.source}`}</Text>,
                       ...([['Lines', part.lines], ['Statements', part.statements], ['Branches', part.branches], ['Functions', part.functions]] as const)
                         .filter(([, v]) => v !== null)
                         .map(([label, v]) => bar(`cov-${part.dir}-${label}`, label, v as number, width, 2)),
+                      ...(tested ? [<Box key={`cov-tested-${part.dir}`} marginLeft={2}><Text color={MUTED}>{tested}</Text></Box>] : []),
                       ...packagesDrawn(packages, `${part.dir}/`, `${ALL_PACKAGES}:${part.dir}`, width),
                     ]
                   })
                 : (() => {
-                    const packages = packagesOf(cov?.byPackage ?? [], '')
+                    const packages = packagesOf(views, '')
                     const width = labelWidth(packages)
+                    const tested = testedLine(views)
                     return [
                       ...metrics.filter(([, v]) => v !== null).map(([label, v]) => bar(`cov-${label}`, label, v as number, width + 2, 0)),
+                      ...(tested ? [<Text key="cov-tested" color={MUTED}>{tested}</Text>] : []),
                       ...packagesDrawn(packages, '', ALL_PACKAGES, width),
                     ]
                   })()) as never}

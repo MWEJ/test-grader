@@ -33,10 +33,13 @@ export type Coverage = {
   updatedAt: number | null
   /** line coverage by folder, its path in the project ('' the project), each with all beneath it */
   byDir?: Record<string, { total: number; covered: number }>
-  /** Go's statements by package, by its path in the project ('./' the module's root) */
-  byPackage?: { name: string; total: number; covered: number }[]
+  /** Go's statements by package, by its path in the project ('./' the module's root); role: a
+   * command (package main) or a test helper (mocks, code that imports testing), told by its source */
+  byPackage?: { name: string; total: number; covered: number; role?: 'command' | 'helper' }[]
   /** a project of parts each measured on its own (backend/ in Go, mobile/ with jest): each part's figures, by its folder */
   parts?: CoveragePart[]
+  /** the statements the report counted and those covered, which add up across parts where lines and percentages do not */
+  statementCount?: { total: number; covered: number }
 }
 export type CoveragePart = { dir: string; lines: number | null; statements: number | null; branches: number | null; functions: number | null; source: string }
 
@@ -114,7 +117,7 @@ declare module 'claude-code' {
       /** how many times the files' layers were read: a reading done draws the pane again */
       layersFound: number
       /** the tests the last coverage run ran, by a JS file's path or a Go package's folder, each with how it ended; measured: the folders it reached */
-      ranRecord: { at: number; measured: string[]; by: Record<string, Record<string, 'passed' | 'failed' | 'skipped'>> } | null
+      ranRecord: { at: number; measured: string[]; by: Record<string, Record<string, 'passed' | 'failed' | 'skipped'>>; tagsBy?: Record<string, string[]> } | null
       /** the mutations test_verify measured a test let through, by file::name: the change, and the test's own text then */
       survived: Record<string, { change: string; textOf: string }[]>
       /** why each test its last grader call gave no verdict got none, by file::name; a verdict clears it */

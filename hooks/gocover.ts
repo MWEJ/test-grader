@@ -55,3 +55,29 @@ export const mergeProfile = (whole: string, part: string, module: string | null,
   const mode = part.match(/^mode: .+$/m)?.[0] ?? whole.match(/^mode: .+$/m)?.[0] ?? 'mode: set'
   return [mode, ...blocks(whole).filter(l => !isInFolder(l)), ...blocks(part), ''].join('\n')
 }
+
+// what a package is for, read from one of its files: a command (package main), or a test helper
+// (mocks, or code that imports testing or a mocking library), which coverage tells apart from the
+// code tests are written for; undefined for anything else
+export type PackageRole = 'command' | 'helper'
+const HELPER_IMPORT = /^\s*(?:import\s+)?(?:[\w.]+\s+)?"(?:testing|github\.com\/stretchr\/testify\/mock|go\.uber\.org\/mock\/gomock|github\.com\/golang\/mock\/gomock)"/m
+export const roleOf = (source: string): PackageRole | undefined => {
+  const name = source.match(/^package\s+(\w+)/m)?.[1]
+  if (name === undefined) return undefined
+  if (name === 'main') return 'command'
+  return isHelperName(name) || HELPER_IMPORT.test(source) ? 'helper' : undefined
+}
+
+// a folder or package named as test code: mocks, fakes, testutil, fixtures, or Go's xxxtest
+// convention (httptest, receipttest), not an English word that happens to end in test
+const NOT_HELPERS = new Set(['latest', 'contest', 'protest', 'attest', 'detest', 'greatest', 'smallest', 'fastest', 'shortest', 'longest', 'biggest', 'smartest'])
+export const isHelperName = (name: string): boolean =>
+  /^(?:\w*mocks?|fakes?|testutils?|testhelpers?|testing|fixtures|testdata|testkit|testsupport)$/.test(name) || (/^\w+test$/.test(name) && !NOT_HELPERS.has(name))
+
+// Go's standard header for generated code, "Code generated … DO NOT EDIT.", before the package
+// clause: code no one writes tests for
+export const isGenerated = (source: string): boolean => {
+  const at = source.search(/^package\s/m)
+  const head = at === -1 ? source : source.slice(0, at)
+  return /^\/\/ Code generated .* DO NOT EDIT\.$/m.test(head)
+}
