@@ -31,7 +31,9 @@ export const mount = ($: Engine, rows = 60) =>
 export type Project = { isGit?: boolean; gate?: () => Promise<void>; expand?: Record<string, string[]>; held?: { calls: number; release: () => void }; rule?: (name: string, prompt: string) => Verdict; editor?: Shell; env?: Record<string, string>; outside?: Record<string, string>; cut?: (reply: string) => string; refuse?: string; room?: { limit: number }; git?: (argv: string[]) => { stdout: string; exitCode?: number } | undefined; reply?: (call: number) => unknown; older?: (request: Record<string, unknown>) => boolean; confirm?: (name: string, first: Verdict) => Verdict; cwd?: () => string; slow?: { paths: Set<string>; until: Promise<void> } }
 
 // a command's answer: its exit code, or what it printed too
-export type Shell = (argv: string[], env?: Record<string, string>) => number | { stdout?: string; stderr?: string; exitCode?: number }
+type Said = number | { stdout?: string; stderr?: string; exitCode?: number }
+// a run that takes a while answers with a promise
+export type Shell = (argv: string[], env?: Record<string, string>) => Said | Promise<Said>
 
 // env: the variables the mod reads; outside: files by their full path, outside the project
 export function project(on: On, files: Record<string, string>, { isGit = true, gate, expand = {}, held, rule, editor, env = {}, outside = {}, cut, refuse, room, git, reply, older, confirm, cwd, slow }: Project = {}) {
@@ -94,9 +96,9 @@ export function project(on: On, files: Record<string, string>, { isGit = true, g
       runs.push(argv)
       runsIn.push(String((e as { init?: { cwd?: string } }).init?.cwd ?? ''))
       // a command that cannot start (editor throws) is refused with its error, as the host refuses one
-      let said: ReturnType<Shell>
+      let said: Said
       try {
-        said = editor(argv, (e as { init?: { env?: Record<string, string> } }).init?.env ?? {})
+        said = await editor(argv, (e as { init?: { env?: Record<string, string> } }).init?.env ?? {})
       } catch (err) {
         return { deny: err instanceof Error ? err.message : String(err) } as never
       }

@@ -753,7 +753,9 @@ const readCoverageAt = async ($: EngineInterface, cwd: string): Promise<Coverage
     const first = goProfileOf(profile, moduleOf(goMod), cwd, isKept)
     const unrun = first.byFile.filter(f => f.covered === 0 && f.file.startsWith('/')).slice(0, GENERATED_READS)
     for (const f of unrun) if (!filesRead.has(f.file)) filesRead.set(f.file, await $.fs.read(f.file).then(text => ({ isGenerated: isGenerated(text), role: roleOf(text) }), () => ({ isGenerated: false, role: undefined })))
-    const { statements, byFile, byPackage } = goProfileOf(profile, moduleOf(goMod), cwd, file => isKept(file) && filesRead.get(file)?.isGenerated !== true)
+    // parsed again only where generated files are to be left out: a large profile is slow to parse
+    const isAnyGenerated = first.byFile.some(f => filesRead.get(f.file)?.isGenerated === true)
+    const { statements, byFile, byPackage } = isAnyGenerated ? goProfileOf(profile, moduleOf(goMod), cwd, file => isKept(file) && filesRead.get(file)?.isGenerated !== true) : first
     if (statements !== null) {
       // each package's role, read from its first file: a command or test helper is not code its
       // tests are missing. Only a package none of whose code ran is read (Go counts a package's
@@ -818,7 +820,11 @@ const refreshCoverage = async ($: EngineInterface): Promise<void> => {
 const GO_PROFILE = '.test-grader-go-cover.out'
 const REPORTS = ['coverage/coverage-summary.json', 'coverage/lcov.info', 'coverage.xml', GO_PROFILE, '.test-grader-go-coverage.txt']
 let reportsAt = ''
+// not while a run of test-grader's own is writing them: Go writes its profile package by package,
+// and a half-written one would be parsed every period and drawn as the figures; the run reads them
+// once it ends
 const refreshCoverageIfChanged = async ($: EngineInterface): Promise<void> => {
+  if (isMeasuring) return
   const cwd = await projectDir($)
   const bases = coverParts.length > 0 ? coverParts.map(p => (p.dir ? `${cwd}/${p.dir}` : cwd)) : [cwd]
   const at = (await Promise.all(bases.flatMap(base => REPORTS.map(r => mtime($, `${base}/${r}`))))).join(',')
