@@ -941,7 +941,7 @@ test('a project of parts one of which counted no statements shows no whole-proje
   expect(texts).not.toContain('All statements')
 })
 
-test("a Go profile half written by a run under way is not drawn: the pane keeps the last figures until the run ends", async ($, on) => {
+test("a Go profile half written by a run under way is not drawn: the pane keeps the last figures, said to be the previous run's, until the run ends", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { ...GO_MODULE, '.test-grader-go-cover.out': ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/pkg/b/b.go:1.1,2.2 10 1', ''].join('\n') }
   let finish = () => {}
@@ -967,11 +967,14 @@ test("a Go profile half written by a run under way is not drawn: the pane keeps 
   // three watch periods while the run holds: the half-written profile's 0% is not drawn
   await clock.advance(6_500)
   expect(await statements()).toBe('100%')
+  const isPrevious = async () => (await ui.findAll({ type: 'Text' })).some(t => t.text.startsWith('previous run, a new one under way'))
+  expect(await isPrevious()).toBe(true)
 
   finish()
   await pressed
   await clock.advance(10)
   expect(await statements()).toBe('50%')
+  expect(await isPrevious()).toBe(false)
 })
 
 test('a Jest coverage run reports which tests it ran, in a file of test-grader\'s own, and a skipped test is told apart', async ($, on) => {

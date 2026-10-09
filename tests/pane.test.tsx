@@ -144,10 +144,10 @@ test('a single file starts open, and every one of its tests is listed, however m
 })
 
 
-test('a test written this session and graded again by Grade all tests shows once, marked new, with the newer verdict', async ($, on) => {
+test('a test written this session and graded again by Regrade all shows once, marked new, with the newer verdict', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { 'src/c.test.ts': "it('a shallow check', () => { expect(h).toBeDefined() })\n" }
-  // shallow when written, strong by the time Grade all tests reads it
+  // shallow when written, strong by the time Regrade all reads it
   let isLater = false
   project(on, files, { rule: () => (isLater ? 'strong' : 'shallow') })
   on('tool.call', async () => ok as never)
@@ -158,7 +158,10 @@ test('a test written this session and graded again by Grade all tests shows once
   expect(JSON.stringify(await ui.drawn())).toContain('1 test · 0 strong · 1 shallow · 1 new')
 
   isLater = true
+  // Grade all keeps the grade the test has; Regrade all grades it again
   await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  await ui.press({ key: 'regradeAll' })
   await clock.advance(10)
 
   const tree = JSON.stringify(await ui.drawn())

@@ -332,6 +332,8 @@ Grades are saved per project, with a fingerprint of each file. Each file's path 
 
 Claude Code keeps 4 MiB of saved values for all of a plugin's projects together, so a project whose grades come to more than 1 MB saves them in files of their own, under `~/.claude/test-grader/grades/` (or `$CLAUDE_CONFIG_DIR`), and the store only names them. When a save takes fewer files than the one before, the extra files are emptied (Claude Code gives a plugin no way to delete a file). If they can't be written there and are too many to save whole, they are saved without their one-line summaries. If even that fails, the pane says the grades will not outlive the session. In the session itself, the grades are held in chunks, so a project of many thousands of tests is not held to the 4 MiB one value can hold.
 
+The grade of a test Claude writes is saved the same way, with a fingerprint of the test's own text, so a later session lists it graded and **Grade all tests** keeps it while its text is unchanged.
+
 A reload of the mod does not lose grading in progress. If a run, a regrade or a new test's grading was cut off, it starts again at the next session start. A Regrade all that was cut off resumes as a Regrade all, and a `diff` run as a `diff` run.
 
 ## Install

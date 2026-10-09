@@ -3,7 +3,7 @@ import { unkeep } from '../hooks/kept'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Verdict } from '../types'
 import type { Engine, On } from './helpers'
-import { askGrades, buttonsOf, mount, project, verdictsDrawn, nodesOf, holdsKey, appended, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, ASKED, seedState, BRANCH, branchGit } from './helpers'
+import { askGrades, buttonsOf, mount, ok, project, verdictsDrawn, nodesOf, holdsKey, appended, E_TEST, E_FILE, sendEvidence, MUTATION, swayed, ASKED, seedState, BRANCH, branchGit } from './helpers'
 
 test('Grade all tests grades every case of every test file git tracks, in batches of 10, and lists the flagged worst first', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -547,6 +547,30 @@ test('a new session lists the grades saved for its project, and Grade all tests 
   expect(prompts[0]).toContain('src/a.test.ts')
   tree = JSON.stringify(await ui.drawn())
   expect(tree).toContain('2 graded · 1 remembered')
+})
+
+
+test('a grade given to a test Claude wrote is kept with the saved grades, for its text, so it is not graded again as new', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const content = "it('a shallow check', () => { expect(f).toBeDefined() })\n"
+  const files: Record<string, string> = { 'src/c.test.ts': content }
+  const { prompts, store } = project(on, files)
+  on('tool.call', async () => ok as never)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await $.tool.call({ tool: 'Write', file_path: '/proj/src/c.test.ts', content } as never)
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+
+  // what a later session reads back: the grade, for the test's text as graded
+  const saved = unkeep(store['grades:/proj'] as never).results.filter(t => t.file === '/proj/src/c.test.ts')
+  expect(saved.map(t => [t.name, t.verdict, t.reason])).toEqual([['a shallow check', 'shallow', 'shallow because. It would miss: a wrong edge.']])
+  expect(saved[0]!.textOf).toBe(fingerprint(content.trimEnd()))
+  // its text unchanged, Grade all tests keeps the grade rather than grading it as new
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  expect(prompts).toHaveLength(1)
+  expect(JSON.stringify(await ui.drawn())).toContain('0 graded · 1 remembered')
 })
 
 

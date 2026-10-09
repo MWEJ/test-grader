@@ -663,11 +663,32 @@ const evaluateNow = async ($: EngineInterface, file: string, ids: Map<string, st
       }),
     )
     const mine = (await read($, tests)).filter(t => [...ids.keys()].some(id => t.id === id || t.id.startsWith(`${id}-`)))
+    await keepTracked($, file, text, mine).catch(() => undefined)
     await reportGrades($, mine)
   } catch (err) {
     await noteFailed($, file, [...ids.values()], err)
     await fail()
   }
+}
+
+// A grade given to a test Claude wrote goes into the saved grades too, for the text it read, so
+// it outlives the session: the session's own list does not, and a later one would list the test
+// ungraded and grade it again as new
+const keepTracked = async ($: EngineInterface, file: string, text: string, graded: TrackedTest[]): Promise<void> => {
+  // one outside the project is graded and told, not listed: nor kept with the project's grades
+  const cwd = await projectDir($)
+  if (cwd === '' || !file.startsWith(`${cwd}/`)) return
+  const own = ownTexts(text, file)
+  const suites = suitesOf(text, file)
+  const rows: ExistingTest[] = graded.flatMap(t =>
+    t.status === 'done' && t.verdict
+      ? [{ file, name: t.name, verdict: t.verdict, summary: t.summary, reason: t.reason, ...(t.confidence ? { confidence: t.confidence } : {}), ...(suites.has(t.name) ? { suite: suites.get(t.name) } : {}), ...(t.before ? { before: t.before } : {}), textOf: own(t.name) }]
+      : [],
+  )
+  if (rows.length === 0) return
+  const names = new Set(rows.map(r => r.name))
+  await updateRun($, r => ({ ...r, results: [...r.results.filter(t => !(t.file === file && names.has(t.name))), ...rows] }))
+  await saveGrades($)
 }
 
 const mtime = async ($: EngineInterface, path: string): Promise<number | null> => {
@@ -3201,7 +3222,12 @@ export const register: Register = (on, options) => {
               <Box flexDirection="row" justifyContent="space-between">
                 <Text bold>Coverage</Text>
                 {/* a project of parts names each part's source under its own heading */}
-                <Text color={MUTED}>{cov ? [...(parts ? [] : [cov.source]), ...(age !== null ? [`${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago`] : [])].join(' – ') : 'no report found'}</Text>
+                {/* while a run is under way the figures drawn are the last run's, and say so */}
+                <Text color={running.state === 'running' && cov ? AMBER : MUTED}>
+                  {cov
+                    ? [...(running.state === 'running' ? ['previous run, a new one under way'] : []), ...(parts ? [] : [cov.source]), ...(age !== null ? [`${age < 60 ? `${age}m` : `${Math.round(age / 60)}h`} ago`] : [])].join(' – ')
+                    : 'no report found'}
+                </Text>
               </Box>
               {/* a project of parts: the whole project's statements, its parts' added up, then each
                   part's figures, and its packages, under its folder */}
