@@ -884,10 +884,11 @@ for (const list of ['.gitignore', '.test-grader-ignore']) {
   test(`a root ${list} rule with no slash before its end leaves a part's folder of that name out at any depth`, async ($, on) => {
     const clock = mock.clock(on, { now: 1_000_000 })
     const files: Record<string, string> = { ...PARTS, [list]: 'tmp/\n' }
-    // pkg/a 10 of 10; backend/tmp and backend/tmp/coverage-audit 0 of 90, both ignored
+    // pkg/a 10 of 10; backend/tmp, backend/tmp/coverage-audit and the deeper backend/pkg/tmp 0 of
+    // 110, all ignored: a rule anchored to the part's root would leave pkg/tmp in, at 8.3%
     const { notes } = project(on, files, {
       editor: (argv: string[]) => {
-        if (argv[0] === 'go') files['backend/.test-grader-go-cover.out'] = ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/tmp/test_fs.go:1.1,2.2 40 0', 'example.com/shop/tmp/coverage-audit/main.go:1.1,2.2 50 0', ''].join('\n')
+        if (argv[0] === 'go') files['backend/.test-grader-go-cover.out'] = ['mode: set', 'example.com/shop/pkg/a/a.go:1.1,2.2 10 1', 'example.com/shop/tmp/test_fs.go:1.1,2.2 40 0', 'example.com/shop/tmp/coverage-audit/main.go:1.1,2.2 50 0', 'example.com/shop/pkg/tmp/t.go:1.1,2.2 20 0', ''].join('\n')
         else files['mobile/coverage/lcov.info'] = 'SF:src/x.ts\nLF:10\nLH:6\nend_of_record\n'
         return { stdout: '', exitCode: 0 }
       },
