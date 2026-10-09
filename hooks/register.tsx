@@ -1598,6 +1598,11 @@ const readAt = new Map<string, number>()
 // each listed test file's text as last read, in this load of the module: a change made by other
 // means is compared with it test by test, so only the tests it touched are graded again
 const lastText = new Map<string, string>()
+// A file changed by other means is taken up once its text has stood QUIET_MS, not while it is
+// still being written: another agent or an editor saving in bursts would have each half-done
+// state graded. Each file's text, by fingerprint, and when a check first saw it
+const QUIET_MS = 10_000
+const settling = new Map<string, { fp: string; at: number }>()
 const catchUp = async ($: EngineInterface): Promise<void> => {
   const cwd = await projectDir($)
   const run = await readRun($)
@@ -1617,10 +1622,21 @@ const catchUp = async ($: EngineInterface): Promise<void> => {
       layerCache.set(file, layer)
       layersChanged = true
     }
-    const prior = lastText.get(file)
-    lastText.set(file, text)
     const now = fingerprint(text)
     const before = last[file] ?? run.hashes?.[file]
+    if (before !== undefined && before !== now) {
+      const since = settling.get(file)
+      const at = await $.clock.now()
+      if (since?.fp !== now) settling.set(file, { fp: now, at })
+      // read again next check, though its modification time stays: it is not taken up yet
+      if (since?.fp !== now || at - since.at < QUIET_MS) {
+        readAt.delete(file)
+        continue
+      }
+    }
+    settling.delete(file)
+    const prior = lastText.get(file)
+    lastText.set(file, text)
     if (before === now) continue
     await update($, seen, all => ({ ...all, [file]: now }))
     if (before === undefined) continue

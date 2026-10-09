@@ -64,7 +64,7 @@ test('at a turn\'s end, a listed test file changed by other means is updated as 
 
   files['src/c.test.ts'] = SUM_AFTER
   await $.turn.complete(TURN)
-  await clock.advance(10)
+  await clock.advance(12_000)
 
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).not.toContain('"a shallow check"')
@@ -100,7 +100,7 @@ test('at a turn\'s end, unchanged files cost no grader call, nor does one Claude
 
 
 // The pane follows the files as they change, not only at a turn's end
-test('a listed test file changed by other means shows its new tests within one watch period, with no turn ending', async ($, on) => {
+test('a listed test file changed by other means shows its new tests once it has stood still a quiet period, with no turn ending', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const files: Record<string, string> = { 'src/c.test.ts': SUM_BEFORE }
   project(on, files)
@@ -111,7 +111,7 @@ test('a listed test file changed by other means shows its new tests within one w
 
   expect(JSON.stringify(await ui.drawn())).toContain('"a shallow check"')
   files['src/c.test.ts'] = SUM_AFTER
-  await clock.advance(2_000)
+  await clock.advance(12_000)
 
   const tree = JSON.stringify(await ui.drawn())
   expect(tree).not.toContain('"a shallow check"')
@@ -281,8 +281,32 @@ test('a file changed by other means has only the tests whose text changed graded
 
   // the shell rewrites one test's body, and adds one
   files['src/c.test.ts'] = files['src/c.test.ts']!.replace('expect(sum).toBeDefined()', 'expect(sum(0, 0)).toBe(0)') + "it('subtracts', () => { expect(sum(3, -1)).toBe(2) })\n"
-  await clock.advance(2_000)
+  await clock.advance(12_000)
 
   expect(ASKED(prompts)).toEqual(['a shallow check', 'subtracts'])
   expect(JSON.stringify(await ui.drawn())).toContain('4 tests')
+})
+
+
+test('a file another program is still writing is graded once it has stood still, on its last text only', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const files: Record<string, string> = { 'src/c.test.ts': "it('adds', () => { expect(sum(1, 2)).toBe(3) })\n" }
+  const { prompts } = project(on, files)
+  await $.session.start({ source: 'startup', cwd: '/proj', surface: null, isInteractive: true } as never)
+  const ui = await mount($)
+  await ui.press({ key: 'gradeAll' })
+  await clock.advance(10)
+  prompts.length = 0
+
+  // half way through: a test begun, its assertion not written yet
+  files['src/c.test.ts'] += "it('subtracts', () => { expect(sum(3, -1)) })\n"
+  await clock.advance(6_000)
+  files['src/c.test.ts'] = files['src/c.test.ts']!.replace('expect(sum(3, -1)) })', 'expect(sum(3, -1)).toBe(2) })')
+  await clock.advance(8_000)
+  // ten seconds since the first change, but only eight since the last: still not graded
+  expect(prompts).toHaveLength(0)
+
+  await clock.advance(4_000)
+  expect(ASKED(prompts)).toEqual(['subtracts'])
+  expect(prompts[0]).toContain('expect(sum(3, -1)).toBe(2)')
 })
