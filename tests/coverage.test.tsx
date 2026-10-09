@@ -764,7 +764,7 @@ test('a test behind a build tag the coverage run was not given is not built, tol
   expect(notes.at(-1)).not.toContain('never ran')
   // the line is muted, not the amber of a test that should have run
   const line = (await ui.findAll({ type: 'Text' })).find(t => t.text === 'The last coverage run (0m ago): 1 not built (no -tags integration)')
-  expect(line?.props?.color).not.toBe('#fbbf24')
+  expect(line?.props?.color).toBe('#8b90a0')
   const listed = await $.tool.call({ tool: 'mcp__test-grader__test_grades', ran: 'not built' } as never).then(r => String((r as { result: unknown }).result))
   expect(listed).toContain('- pkg/store/store_test.go:5 "TestStore": ungraded (integration, not built)')
   expect(listed).not.toContain('TestA')
